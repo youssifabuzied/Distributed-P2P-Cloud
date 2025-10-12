@@ -1,21 +1,19 @@
 // =======================================
-// client.rs
+// client.rs - Async Version
 // Cloud P2P Controlled Image Sharing Project
 // =======================================
 //
-// Responsibilities:
-// 1. Maintain client metadata (username, peer list, etc.)
-// 2. Send encryption/decryption requests to client middleware
-// 3. Provide basic CLI / UI interface for testing
+// Now supports background request processing!
+// You can submit multiple requests without waiting.
 //
-
-use std::io::{self, Write};
-use std::net::{TcpStream};
+use std::io::{self, Write, BufRead, BufReader};
+use std::net::TcpStream;
 use std::path::Path;
-use std::fs::File;
-use std::io::Read;
 use serde::{Serialize, Deserialize};
 use std::error::Error;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::collections::HashMap;
 
 // ---------------------------------------
 // Data Structures
@@ -28,19 +26,91 @@ pub struct ClientMetadata {
     pub port: u16,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientRequest {
-    EncryptImage { image_path: String },
-    DecryptImage { image_path: String },
+    EncryptImage { 
+        request_id: u64,
+        image_path: String 
+    },
+    DecryptImage { 
+        request_id: u64,
+        image_path: String 
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MiddlewareResponse {
+    pub request_id: u64,
+    pub status: String,
+    pub message: Option<String>,
+    pub output_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RequestStatus {
+    Pending,
+    InProgress,
+    Completed(MiddlewareResponse),
+    Failed(String),
 }
 
 // ---------------------------------------
-// Client Definition
+// Request Tracker
+// ---------------------------------------
+
+pub struct RequestTracker {
+    requests: Arc<Mutex<HashMap<u64, RequestStatus>>>,
+    next_id: Arc<Mutex<u64>>,
+}
+
+impl RequestTracker {
+    pub fn new() -> Self {
+        RequestTracker {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    pub fn create_request(&self) -> u64 {
+        let mut id = self.next_id.lock().unwrap();
+        let request_id = *id;
+        *id += 1;
+        
+        self.requests.lock().unwrap().insert(request_id, RequestStatus::Pending);
+        request_id
+    }
+
+    pub fn update_status(&self, id: u64, status: RequestStatus) {
+        self.requests.lock().unwrap().insert(id, status);
+    }
+
+    pub fn get_status(&self, id: u64) -> Option<RequestStatus> {
+        self.requests.lock().unwrap().get(&id).cloned()
+    }
+
+    pub fn list_all(&self) -> Vec<(u64, RequestStatus)> {
+        self.requests.lock().unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.requests.lock().unwrap()
+            .values()
+            .filter(|s| matches!(s, RequestStatus::Pending | RequestStatus::InProgress))
+            .count()
+    }
+}
+
+// ---------------------------------------
+// Async Client Definition
 // ---------------------------------------
 
 pub struct Client {
     pub metadata: ClientMetadata,
-    pub middleware_addr: String, // e.g., "127.0.0.1:9000"
+    pub middleware_addr: String,
+    pub tracker: RequestTracker,
 }
 
 impl Client {
@@ -52,33 +122,181 @@ impl Client {
                 port,
             },
             middleware_addr: middleware_addr.to_string(),
+            tracker: RequestTracker::new(),
         }
     }
 
-    /// Send request to client middleware
-    pub fn send_request(&self, request: &ClientRequest) -> Result<(), Box<dyn Error>> {
-        let mut stream = TcpStream::connect(&self.middleware_addr)?;
-        let serialized = serde_json::to_string(request)?;
-        stream.write_all(serialized.as_bytes())?;
-        println!("[Client] Request sent to middleware: {:?}", request);
-        Ok(())
+    /// Send request in background thread (non-blocking)
+    pub fn send_request_async(&self, request: ClientRequest) -> u64 {
+        let request_id = match &request {
+            ClientRequest::EncryptImage { request_id, .. } => *request_id,
+            ClientRequest::DecryptImage { request_id, .. } => *request_id,
+        };
+
+        let middleware_addr = self.middleware_addr.clone();
+        let tracker = self.tracker.requests.clone();
+
+        // Update status to in-progress
+        self.tracker.update_status(request_id, RequestStatus::InProgress);
+
+        // Spawn background thread
+        thread::spawn(move || {
+            println!("[Client] [Req #{}] Sending request in background...", request_id);
+            
+            match Self::send_request_sync(&middleware_addr, &request) {
+                Ok(response) => {
+                    println!("[Client] [Req #{}] ✓ Completed", request_id);
+                    tracker.lock().unwrap().insert(request_id, RequestStatus::Completed(response));
+                }
+                Err(e) => {
+                    eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
+                    tracker.lock().unwrap().insert(request_id, RequestStatus::Failed(e.to_string()));
+                }
+            }
+        });
+
+        request_id
     }
 
-    /// Request encryption of an image
-    pub fn request_encryption(&self, image_path: &str) -> Result<(), Box<dyn Error>> {
+    /// Internal: Synchronous request (runs in background thread)
+    fn send_request_sync(
+        middleware_addr: &str, 
+        request: &ClientRequest
+    ) -> Result<MiddlewareResponse, Box<dyn Error>> {
+        // Connect to middleware
+        let stream = TcpStream::connect(middleware_addr)?;
+        let mut reader = BufReader::new(&stream);
+        let mut writer = stream.try_clone()?;
+        
+        // Serialize and send request
+        let serialized = serde_json::to_string(request)?;
+        writer.write_all(serialized.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        
+        // Read response
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line)?;
+        
+        // Parse response
+        let response: MiddlewareResponse = serde_json::from_str(response_line.trim())?;
+        Ok(response)
+    }
+
+    /// Request encryption (async)
+    pub fn request_encryption(&self, image_path: &str) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
+        
+        let request_id = self.tracker.create_request();
         let request = ClientRequest::EncryptImage {
+            request_id,
             image_path: image_path.to_string(),
         };
-        self.send_request(&request)
+        
+        let id = self.send_request_async(request);
+        println!("[Client] Queued encryption request #{} for '{}'", id, image_path);
+        Ok(id)
     }
 
-    /// Simple CLI interface for testing
+    /// Request decryption (async)
+    pub fn request_decryption(&self, image_path: &str) -> Result<u64, Box<dyn Error>> {
+        if !Path::new(image_path).exists() {
+            return Err("Image file not found".into());
+        }
+        
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::DecryptImage {
+            request_id,
+            image_path: image_path.to_string(),
+        };
+        
+        let id = self.send_request_async(request);
+        println!("[Client] Queued decryption request #{} for '{}'", id, image_path);
+        Ok(id)
+    }
+
+    /// Check status of a specific request
+    pub fn check_status(&self, request_id: u64) {
+        match self.tracker.get_status(request_id) {
+            Some(RequestStatus::Pending) => {
+                println!("Request #{}: ⏳ Pending", request_id);
+            }
+            Some(RequestStatus::InProgress) => {
+                println!("Request #{}: 🔄 In Progress", request_id);
+            }
+            Some(RequestStatus::Completed(response)) => {
+                println!("Request #{}: ✓ Completed", request_id);
+                println!("  Status: {}", response.status);
+                if let Some(msg) = &response.message {
+                    println!("  Message: {}", msg);
+                }
+                if let Some(path) = &response.output_path {
+                    println!("  Output: {}", path);
+                }
+            }
+            Some(RequestStatus::Failed(err)) => {
+                println!("Request #{}: ✗ Failed - {}", request_id, err);
+            }
+            None => {
+                println!("Request #{}: Not found", request_id);
+            }
+        }
+    }
+
+    /// List all requests
+    pub fn list_requests(&self) {
+        let requests = self.tracker.list_all();
+        
+        if requests.is_empty() {
+            println!("No requests yet.");
+            return;
+        }
+
+        println!("\n========================================");
+        println!("Request History");
+        println!("========================================");
+        
+        for (id, status) in requests {
+            match status {
+                RequestStatus::Pending => {
+                    println!("#{:3} | ⏳ Pending", id);
+                }
+                RequestStatus::InProgress => {
+                    println!("#{:3} | 🔄 In Progress", id);
+                }
+                RequestStatus::Completed(ref response) => {
+                    println!("#{:3} | ✓ Completed - {}", id, 
+                             response.output_path.as_ref().unwrap_or(&"N/A".to_string()));
+                }
+                RequestStatus::Failed(ref err) => {
+                    println!("#{:3} | ✗ Failed - {}", id, err);
+                }
+            }
+        }
+        
+        let pending = self.tracker.pending_count();
+        println!("========================================");
+        println!("Pending/In-Progress: {}", pending);
+        println!();
+    }
+
+    /// Interactive CLI
     pub fn start_ui(&self) {
+        println!("========================================");
+        println!("Cloud P2P Image Sharing Client (Async)");
+        println!("========================================");
         println!("Welcome, {}!", self.metadata.username);
-        println!("Enter 'encrypt <image_path>' or 'decrypt <image_path>' or 'exit'.");
+        println!("Middleware: {}", self.middleware_addr);
+        println!("\nCommands:");
+        println!("  encrypt <image_path>     - Queue encryption (returns immediately)");
+        println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
+        println!("  status <request_id>      - Check request status");
+        println!("  list                     - List all requests");
+        println!("  pending                  - Show pending count");
+        println!("  exit                     - Exit the client");
+        println!("========================================\n");
 
         loop {
             print!("> ");
@@ -87,26 +305,60 @@ impl Client {
             let mut input = String::new();
             io::stdin().read_line(&mut input).unwrap();
             let tokens: Vec<&str> = input.trim().split_whitespace().collect();
+
             if tokens.is_empty() {
                 continue;
             }
 
             match tokens[0] {
                 "encrypt" if tokens.len() == 2 => {
-                    if let Err(e) = self.request_encryption(tokens[1]) {
-                        eprintln!("Error: {}", e);
+                    match self.request_encryption(tokens[1]) {
+                        Ok(id) => {
+                            println!("✓ Request #{} queued (background processing)", id);
+                        }
+                        Err(e) => eprintln!("✗ Error: {}", e),
                     }
                 }
                 "decrypt" if tokens.len() == 2 => {
-                    let request = ClientRequest::DecryptImage {
-                        image_path: tokens[1].to_string(),
-                    };
-                    if let Err(e) = self.send_request(&request) {
-                        eprintln!("Error: {}", e);
+                    match self.request_decryption(tokens[1]) {
+                        Ok(id) => {
+                            println!("✓ Request #{} queued (background processing)", id);
+                        }
+                        Err(e) => eprintln!("✗ Error: {}", e),
                     }
                 }
-                "exit" => break,
-                _ => println!("Invalid command."),
+                "status" if tokens.len() == 2 => {
+                    if let Ok(id) = tokens[1].parse::<u64>() {
+                        self.check_status(id);
+                    } else {
+                        println!("Invalid request ID");
+                    }
+                }
+                "list" => {
+                    self.list_requests();
+                }
+                "pending" => {
+                    let count = self.tracker.pending_count();
+                    println!("Pending/In-Progress requests: {}", count);
+                }
+                "exit" => {
+                    let pending = self.tracker.pending_count();
+                    if pending > 0 {
+                        println!("Warning: {} request(s) still pending!", pending);
+                        print!("Exit anyway? (y/n): ");
+                        io::stdout().flush().unwrap();
+                        
+                        let mut confirm = String::new();
+                        io::stdin().read_line(&mut confirm).unwrap();
+                        
+                        if confirm.trim().to_lowercase() != "y" {
+                            continue;
+                        }
+                    }
+                    println!("Goodbye!");
+                    break;
+                }
+                _ => println!("Invalid command. Type 'help' for available commands."),
             }
         }
     }
