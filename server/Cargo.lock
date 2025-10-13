@@ -2411,6 +2411,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "bincode",
  "hex",
  "image",
@@ -2418,6 +2419,7 @@ dependencies = [
  "serde",
  "show-image",
  "stegano-core",
+ "tempfile",
 ]
 
 [[package]]

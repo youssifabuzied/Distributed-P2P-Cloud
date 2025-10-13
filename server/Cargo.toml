@@ -17,3 +17,6 @@ serde = { version = "1.0", features = ["derive"] }
 image = "0.25"
 hex = "0.4"
 show-image = "0.14"
+
+tempfile = "3"
+anyhow = "1.0"
