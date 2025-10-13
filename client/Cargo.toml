@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+reqwest = { version = "0.11", features = ["blocking", "multipart", "json"] }
+base64 = "0.22"
 
 [[bin]]
 name = "client"
