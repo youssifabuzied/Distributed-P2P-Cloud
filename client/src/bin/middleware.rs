@@ -66,6 +66,13 @@ pub struct ServerResponse {
     pub file_data: Option<String>,  // Base64 encoded
     pub file_size: Option<usize>,
 }
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
+struct HiddenPayload {
+    message: String,
+    views: u32,
+    extra: Option<String>,
+    image_bytes: Vec<u8>,
+}
 
 // ---------------------------------------
 // Client Middleware
@@ -188,48 +195,88 @@ impl ClientMiddleware {
 
         println!("[ClientMiddleware] [Req #{}] Decrypting locally: {}", request_id, image_path);
 
-        // Read file
-        let file_data = match fs::read(image_path) {
-            Ok(data) => data,
+        let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
+            Ok(dir) => dir,
             Err(e) => {
                 return MiddlewareResponse::error(
-                    request_id, 
-                    &format!("Failed to read file: {}", e)
+                    request_id,
+                    &format!("Failed to create temp folder: {}", e),
                 );
             }
         };
+        println!("Temporary extraction folder: {}", tmp_extract_dir.path().display());
 
-        println!("[ClientMiddleware] [Req #{}] Read {} bytes", request_id, file_data.len());
+        //println!("[ClientMiddleware] [Req #{}] Read {} bytes", request_id, file_data.len());
 
-        // TODO: Implement actual decryption
-        // For now, just return the same image data (dummy implementation)
-        let decrypted_data = file_data;
-
-        // Determine output filename
-        let output_filename = if image_path.ends_with(".encrypted") {
-            image_path.strip_suffix(".encrypted").unwrap().to_string()
-        } else {
-            format!("{}.decrypted", image_path)
+        let secret_key = b"supersecretkey_supersecretkey_32";
+        let key = Key::<Aes256Gcm>::from_slice(secret_key);
+        let password_hex = hex::encode(key);
+        if let Err(e) = extract_prepare()
+            .using_password(password_hex.as_str())
+            .from_secret_file(image_path)
+            .into_output_folder(tmp_extract_dir.path())
+            .execute()
+        {
+            return MiddlewareResponse::error(
+                request_id,
+                &format!("Failed to extract hidden data: {}", e),
+            );
+        }
+        println!("Extracted payload to {}", tmp_extract_dir.path().display());
+        let extracted_file_path = match fs::read_dir(tmp_extract_dir.path())
+            .and_then(|mut rd| rd.next().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "No extracted file found")
+            })?.map(|e| e.path()))
+        {
+            Ok(path) => path,
+            Err(e) => {
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to locate extracted file: {}", e),
+                );
+            }
         };
-
-        // Save decrypted file locally
-        match fs::write(&output_filename, decrypted_data) {
+        println!("Found extracted file: {}", extracted_file_path.display());
+        let extracted_bytes = match fs::read(&extracted_file_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to read extracted file: {}", e),
+                );
+            }
+        };
+        let recovered: HiddenPayload = match bincode::deserialize(&extracted_bytes) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to deserialize payload: {}", e),
+                );
+            }
+        };
+        println!("Recovered message: {}", recovered.message);
+        println!("Views: {}", recovered.views);
+        if let Some(extra) = &recovered.extra {
+            println!("Extra: {}", extra);
+        }
+        let output_path = format!("{}_recovered.png", image_path);
+        match fs::write(&output_path, &recovered.image_bytes) {
             Ok(_) => {
-                println!("[ClientMiddleware] [Req #{}] Decryption complete: {}", 
-                        request_id, output_filename);
-                
+                println!(
+                    "[ClientMiddleware] [Req #{}] Decryption complete → saved hidden image as: {}",
+                    request_id, output_path
+                );
                 MiddlewareResponse::success(
                     request_id,
-                    "Image decrypted successfully (locally)",
-                    Some(output_filename)
+                    &format!("Image successfully decrypted and saved to {}", output_path),
+                    Some(output_path),
                 )
             }
-            Err(e) => {
-                MiddlewareResponse::error(
-                    request_id, 
-                    &format!("Failed to save decrypted file: {}", e)
-                )
-            }
+            Err(e) => MiddlewareResponse::error(
+                request_id,
+                &format!("Failed to save recovered image: {}", e),
+            ),
         }
     }
     fn send_encrypt_request(
