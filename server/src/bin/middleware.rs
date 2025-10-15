@@ -381,7 +381,7 @@ async fn decrypt_handler(
 
     println!("[Server] [Req #{}] Decrypting: {} ({} bytes)", 
              request_id, filename, file_data.len());
-
+    
     // TODO: Implement actual decryption
     // For now, just return the same image data (as requested)
     let decrypted_data = file_data.clone();

@@ -1,36 +1,17 @@
-// =======================================
-// server.rs
-// Cloud P2P Controlled Image Sharing Project
-// =======================================
-//
-// Responsibilities:
-// - Receive encryption requests from server middleware via TCP
-// - Process requests asynchronously
-// - Return encrypted (gibberish) data back to middleware
-//
-use std::net::{TcpListener, TcpStream};
-use std::io::{BufRead, BufReader, Write};
+use std::{fs, error::Error, path::PathBuf};
 use serde::{Serialize, Deserialize};
-use std::error::Error;
-use std::thread;
-use rand::Rng;
-use std::fs;
+use std::io::{Write};
+use std::env;
 use image::io::Reader as ImageReader;
 use image::{DynamicImage, ImageFormat,GenericImageView};
+use image::imageops::FilterType;
 use hex;
-use std::fs::File;
 use aes_gcm::{Aes256Gcm, Key};
-use image::imageops::FilterType
 use bincode;
 use std::io::Cursor;
 use stegano_core::api::hide::prepare as hide_prepare;
 use stegano_core::api::unveil::prepare as extract_prepare;
-use std::path::PathBuf;
 use tempfile::Builder;
-
-// =======================================
-// Data Structures
-// =======================================
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EncryptionRequest {
@@ -55,129 +36,6 @@ struct HiddenPayload {
     image_bytes: Vec<u8>, // PNG or JPEG bytes
     extra: Option<String>,
 }
-
-impl EncryptionResponse {
-    pub fn success(
-        request_id: u64,
-        encrypted_data: Vec<u8>,
-        original_size: usize,
-    ) -> Self {
-        let encrypted_size = encrypted_data.len();
-        EncryptionResponse {
-            request_id,
-            status: "OK".to_string(),
-            message: "Encryption completed successfully".to_string(),
-            encrypted_data: Some(encrypted_data),
-            original_size,
-            encrypted_size,
-        }
-    }
-
-    pub fn error(request_id: u64, message: &str) -> Self {
-        EncryptionResponse {
-            request_id,
-            status: "ERROR".to_string(),
-            message: message.to_string(),
-            encrypted_data: None,
-            original_size: 0,
-            encrypted_size: 0,
-        }
-    }
-}
-
-// =======================================
-// Server
-// =======================================
-
-pub struct Server {
-    pub ip: String,
-    pub port: u16,
-}
-
-impl Server {
-    pub fn new(ip: &str, port: u16) -> Self {
-        Server {
-            ip: ip.to_string(),
-            port,
-        }
-    }
-
-    pub fn start(&self) -> Result<(), Box<dyn Error>> {
-        let addr = format!("{}:{}", self.ip, self.port);
-        let listener = TcpListener::bind(&addr)?;
-        
-        println!("========================================");
-        println!("Cloud P2P Server");
-        println!("========================================");
-        println!("[Server] Listening on {}", addr);
-        println!("[Server] Ready to process encryption requests...\n");
-
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let peer_addr = stream.peer_addr()
-                        .map(|addr| addr.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    
-                    println!("[Server] New connection from: {}", peer_addr);
-                    
-                    // Spawn new thread for async processing
-                    thread::spawn(move || {
-                        if let Err(e) = Self::handle_request(stream) {
-                            eprintln!("[Server] Error handling request: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("[Server] Connection error: {}", e);
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    fn handle_request(stream: TcpStream) -> Result<(), Box<dyn Error>> {
-        let mut reader = BufReader::new(&stream);
-        let mut writer = stream.try_clone()?;
-        
-        // Read request line (JSON)
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
-        
-        if request_line.trim().is_empty() {
-            return Ok(());
-        }
-
-        println!("[Server] Received request: {} bytes", request_line.len());
-
-        // Parse request
-        let response = match serde_json::from_str::<EncryptionRequest>(request_line.trim()) {
-            Ok(request) => {
-                println!("[Server] [Req #{}] Processing encryption for: {} ({} bytes)", 
-                         request.request_id, request.filename, request.file_data.len());
-                
-                // Process encryption asynchronously (in this thread)
-                Self::encrypt_data(request)
-            }
-            Err(e) => {
-                eprintln!("[Server] Invalid request format: {}", e);
-                EncryptionResponse::error(0, "Invalid request format")
-            }
-        };
-
-        // Send response back
-        let response_json = serde_json::to_string(&response)?;
-        writer.write_all(response_json.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-
-        println!("[Server] [Req #{}] Sent response ({} bytes encrypted)\n", 
-                 response.request_id, response.encrypted_size);
-        
-        Ok(())
-    }
-
     fn encrypt_data(request: EncryptionRequest) -> EncryptionResponse {
 
         println!("[Server] [Req #{}] Starting encryption...", request.request_id);
@@ -215,7 +73,7 @@ impl Server {
         };
 
         let cover_image_path = PathBuf::from("../resources/default_image.png");
-        //let output_path = PathBuf::from("../../resources/output_stego.png");
+        //let output_path = PathBuf::from("../resources/output_stego.png");
 
         let mut tmp_payload = match tempfile::NamedTempFile::new_in(&tmp_dir) {
         Ok(f) => f,
@@ -378,15 +236,92 @@ impl Server {
         encrypted_size: stego_bytes.len(),
         }
     }
-    
-}
 
-// =======================================
-// Entry Point
-// =======================================
+    fn main() -> Result<(), Box<dyn Error>> {
+    // 1️⃣ Load a sample image
+    let path = env::current_dir()?;
+    println!("Current directory: {}", path.display());
+    let test_image_path = "../resources/input.jpg";
+    println!("Loading input image");
+    let image_bytes = fs::read(test_image_path)?;
+    println!("Loaded input image: {} ({} bytes)", test_image_path, image_bytes.len());
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let server = Server::new("127.0.0.1", 7000);
-    server.start()?;
+    // 2️⃣ Build request
+    let req = EncryptionRequest {
+        request_id: 101,
+        filename: "input.png".to_string(),
+        file_data: image_bytes,
+    };
+
+    // 3️⃣ Call encryption
+    let res: EncryptionResponse = encrypt_data(req);
+
+    // 4️⃣ Validate response
+    assert_eq!(res.status, "success", "Encryption did not return success");
+
+    println!("\n--- Encryption Response ---");
+    println!("Request ID: {}", res.request_id);
+    println!("Status: {}", res.status);
+    println!("Message: {}", res.message);
+    println!("Original Size: {} bytes", res.original_size);
+    println!("Encrypted Size: {} bytes", res.encrypted_size);
+
+    // 5️⃣ Save embedded image to check manually
+    if let Some(stego_bytes) = res.encrypted_data {
+        println!("Stego size before save: {}", stego_bytes.len());
+        let tmp_path = PathBuf::from("/tmp/test_stego_output.png");
+        fs::write(&tmp_path, &stego_bytes)?;
+        let tmp_path2 = PathBuf::from("server_storage/extracted_payloads.png");
+        fs::write(&tmp_path2, &stego_bytes)?;
+        let read_back = fs::read(&tmp_path2)?;
+        println!("Stego size after save: {}", read_back.len());
+        println!("✅ Stego image written to {}", tmp_path.display());
+
+        let tmp_extract_dir = tempfile::tempdir_in("/tmp")?;
+        println!("Temporary extraction folder: {}", tmp_extract_dir.path().display());
+
+        //let output_dir = PathBuf::from("./extracted_payloads");
+        //fs::create_dir_all(&output_dir)?; // create if not exists
+        //println!("Extraction folder: {}", output_dir.display());
+
+        let secret_key = b"supersecretkey_supersecretkey_32";
+        let key = Key::<Aes256Gcm>::from_slice(secret_key);
+        let password_hex = hex::encode(key);
+        extract_prepare()
+        .using_password(password_hex.as_str())
+        .from_secret_file(&tmp_path)
+        .into_output_folder(tmp_extract_dir.path())
+        //.into_output_folder(&output_dir)
+        .execute()
+        .expect("Failed to unveil message from image");
+        println!("Extracted payload to {}", tmp_extract_dir.path().display());
+        //println!("Extracted payload to {}", &output_dir.display());
+
+    // 3️⃣ Find the extracted payload file
+    let extracted_file_path = fs::read_dir(tmp_extract_dir.path())?
+    //let extracted_file_path = fs::read_dir(&output_dir)?
+        .next()
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No extracted file found",
+        ))??
+        .path();
+        println!("Found extracted file: {}", extracted_file_path.display());
+
+        // 4️⃣ Read and deserialize payload
+        let extracted_bytes = fs::read(&extracted_file_path)?;
+        let recovered: HiddenPayload = bincode::deserialize(&extracted_bytes)?;
+
+        println!("\n--- Extracted Payload ---");
+        println!("Recovered message: {}", recovered.message);
+        println!("Views: {}", recovered.views);
+        if let Some(extra) = &recovered.extra {
+            println!("Extra: {}", extra);
+        }
+
+    } else {
+        println!("⚠️ No encrypted data found in response");
+    }
+
     Ok(())
 }
