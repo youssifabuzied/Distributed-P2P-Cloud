@@ -7,12 +7,12 @@ use stegano_core::api::unveil::prepare as extract_prepare;
 use std::{fs};
 use serde::{Serialize, Deserialize};
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct HiddenPayload {
     message: String,
-    views: u32,
+    views: i32,
+    image_bytes: Vec<u8>, // PNG or JPEG bytes
     extra: Option<String>,
-    image_bytes: Vec<u8>,
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MiddlewareResponse {
@@ -138,7 +138,7 @@ fn decrypt_image_locally(request_id: u64, image_path: &str) -> MiddlewareRespons
         }
     }
 fn main() {
-    let image_path = "../../resources/output_stego.png"; // <-- replace with your encrypted image
+    let image_path = "../resources/extracted_payloads.png"; // <-- replace with your encrypted image
     let res = decrypt_image_locally(42, image_path);
 
     println!("\n==== Result ====");

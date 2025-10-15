@@ -214,7 +214,7 @@ impl Server {
         }
         };
 
-        let cover_image_path = PathBuf::from("../../resources/default_image.png");
+        let cover_image_path = PathBuf::from("../resources/default_image.png");
         //let output_path = PathBuf::from("../../resources/output_stego.png");
 
         let mut tmp_payload = match tempfile::NamedTempFile::new_in(&tmp_dir) {

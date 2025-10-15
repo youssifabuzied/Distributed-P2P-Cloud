@@ -13,6 +13,11 @@ use std::thread;
 use std::path::Path;
 use std::fs;
 use base64::{Engine as _, engine::general_purpose};
+use aes_gcm::{Aes256Gcm, Key};
+use hex;
+use bincode;
+use stegano_core::api::unveil::prepare as extract_prepare;
+
 // ---------------------------------------
 // Shared Structures
 // ---------------------------------------
@@ -66,12 +71,12 @@ pub struct ServerResponse {
     pub file_data: Option<String>,  // Base64 encoded
     pub file_size: Option<usize>,
 }
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct HiddenPayload {
     message: String,
-    views: u32,
+    views: i32,
+    image_bytes: Vec<u8>, // PNG or JPEG bytes
     extra: Option<String>,
-    image_bytes: Vec<u8>,
 }
 
 // ---------------------------------------
@@ -222,6 +227,7 @@ impl ClientMiddleware {
                 &format!("Failed to extract hidden data: {}", e),
             );
         }
+
         println!("Extracted payload to {}", tmp_extract_dir.path().display());
         let extracted_file_path = match fs::read_dir(tmp_extract_dir.path())
             .and_then(|mut rd| rd.next().ok_or_else(|| {
@@ -246,6 +252,9 @@ impl ClientMiddleware {
                 );
             }
         };
+        println!("Extracted size: {} bytes", extracted_bytes.len());
+        println!("First 32 bytes: {:?}", &extracted_bytes[..32.min(extracted_bytes.len())]);
+
         let recovered: HiddenPayload = match bincode::deserialize(&extracted_bytes) {
             Ok(payload) => payload,
             Err(e) => {

@@ -40,7 +40,6 @@ struct HiddenPayload {
 
         println!("[Server] [Req #{}] Starting encryption...", request.request_id);
         let tmp_dir = PathBuf::from("/tmp/");
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
         if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         return EncryptionResponse {
             request_id: request.request_id,
@@ -51,14 +50,14 @@ struct HiddenPayload {
             encrypted_size: 0,
         };
         }
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
+
         let payload = HiddenPayload {
         message: format!("Hidden from file: {}", request.filename),
         views: 42,
         image_bytes: request.file_data.clone(),
         extra: Some("Metadata info".to_string()),
         };
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
+
         let serialized = match bincode::serialize(&payload) {
         Ok(s) => s,
         Err(e) => {
@@ -72,10 +71,10 @@ struct HiddenPayload {
             };
         }
         };
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
-        let cover_image_path = PathBuf::from("../../resources/default_image.png");
-        //let output_path = PathBuf::from("../../resources/output_stego.png");
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
+
+        let cover_image_path = PathBuf::from("../resources/default_image.png");
+        //let output_path = PathBuf::from("../resources/output_stego.png");
+
         let mut tmp_payload = match tempfile::NamedTempFile::new_in(&tmp_dir) {
         Ok(f) => f,
         Err(e) => {
@@ -89,7 +88,6 @@ struct HiddenPayload {
             };
         }
         };
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
         if let Err(e) = tmp_payload.write_all(&serialized).and_then(|_| tmp_payload.flush()) {
         return EncryptionResponse {
             request_id: request.request_id,
@@ -100,7 +98,6 @@ struct HiddenPayload {
             encrypted_size: 0,
         };
         }
-        //println!("[Server] [Req #{}] Starting encryption...", request.request_id);
         let cover = match ImageReader::open(&cover_image_path) {
             Ok(reader) => match reader.decode() {
                 Ok(img) => img,
@@ -126,7 +123,6 @@ struct HiddenPayload {
                 };
             }
         };
-        println!("[Server] [Req #{}] Starting encryption...", request.request_id);
         let (cw, ch) = cover.dimensions();
         let payload_size = serialized.len();
         // your cover capacity heuristic from main()
@@ -245,14 +241,10 @@ struct HiddenPayload {
     // 1️⃣ Load a sample image
     let path = env::current_dir()?;
     println!("Current directory: {}", path.display());
-    let test_image_path = path
-    .join("..")
-    .join("resources")
-    .join("input.jpg")
-    .canonicalize()?; // optional: resolves symlinks and .. segments
-    println!("Resolved resource path: {:?}", test_image_path.display());
-    let image_bytes = fs::read(&test_image_path)?;
-    println!("Loaded input image: {:?} ({} bytes)", test_image_path, image_bytes.len());
+    let test_image_path = "../resources/input.jpg";
+    println!("Loading input image");
+    let image_bytes = fs::read(test_image_path)?;
+    println!("Loaded input image: {} ({} bytes)", test_image_path, image_bytes.len());
 
     // 2️⃣ Build request
     let req = EncryptionRequest {
@@ -276,16 +268,21 @@ struct HiddenPayload {
 
     // 5️⃣ Save embedded image to check manually
     if let Some(stego_bytes) = res.encrypted_data {
+        println!("Stego size before save: {}", stego_bytes.len());
         let tmp_path = PathBuf::from("/tmp/test_stego_output.png");
         fs::write(&tmp_path, &stego_bytes)?;
+        let tmp_path2 = PathBuf::from("server_storage/extracted_payloads.png");
+        fs::write(&tmp_path2, &stego_bytes)?;
+        let read_back = fs::read(&tmp_path2)?;
+        println!("Stego size after save: {}", read_back.len());
         println!("✅ Stego image written to {}", tmp_path.display());
 
-        //let tmp_extract_dir = tempfile::tempdir_in("/tmp")?;
-        //println!("Temporary extraction folder: {}", tmp_extract_dir.path().display());
+        let tmp_extract_dir = tempfile::tempdir_in("/tmp")?;
+        println!("Temporary extraction folder: {}", tmp_extract_dir.path().display());
 
-        let output_dir = PathBuf::from("./extracted_payloads");
-        fs::create_dir_all(&output_dir)?; // create if not exists
-        println!("Extraction folder: {}", output_dir.display());
+        //let output_dir = PathBuf::from("./extracted_payloads");
+        //fs::create_dir_all(&output_dir)?; // create if not exists
+        //println!("Extraction folder: {}", output_dir.display());
 
         let secret_key = b"supersecretkey_supersecretkey_32";
         let key = Key::<Aes256Gcm>::from_slice(secret_key);
@@ -293,16 +290,16 @@ struct HiddenPayload {
         extract_prepare()
         .using_password(password_hex.as_str())
         .from_secret_file(&tmp_path)
-        //.into_output_folder(tmp_extract_dir.path())
-        .into_output_folder(&output_dir)
+        .into_output_folder(tmp_extract_dir.path())
+        //.into_output_folder(&output_dir)
         .execute()
         .expect("Failed to unveil message from image");
-        //println!("Extracted payload to {}", tmp_extract_dir.path().display());
-        println!("Extracted payload to {}", &output_dir.display());
+        println!("Extracted payload to {}", tmp_extract_dir.path().display());
+        //println!("Extracted payload to {}", &output_dir.display());
 
     // 3️⃣ Find the extracted payload file
-    //let extracted_file_path = fs::read_dir(tmp_extract_dir.path())?
-    let extracted_file_path = fs::read_dir(&output_dir)?
+    let extracted_file_path = fs::read_dir(tmp_extract_dir.path())?
+    //let extracted_file_path = fs::read_dir(&output_dir)?
         .next()
         .ok_or_else(|| std::io::Error::new(
             std::io::ErrorKind::NotFound,
