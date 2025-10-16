@@ -137,14 +137,18 @@ impl Server {
     }
 
     fn handle_request(stream: TcpStream) -> Result<(), Box<dyn Error>> {
+        println!("[DEBUG] handle_request: START");
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
+        println!("[DEBUG] handle_request: Stream cloned successfully");
 
         // Read request line (JSON)
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
+        println!("[DEBUG] handle_request: Read line - length: {}", request_line.len());
 
         if request_line.trim().is_empty() {
+            println!("[DEBUG] handle_request: Empty request, returning");
             return Ok(());
         }
 
@@ -169,11 +173,25 @@ impl Server {
             }
         };
 
+        println!("[DEBUG] handle_request: Response status: {}", response.status);
+        println!("[DEBUG] handle_request: Response encrypted_size: {}", response.encrypted_size);
+        println!("[DEBUG] handle_request: Response encrypted_data is_some: {}", response.encrypted_data.is_some());
+        if let Some(ref data) = response.encrypted_data {
+            println!("[DEBUG] handle_request: Actual encrypted_data length: {}", data.len());
+        }
+
         // Send response back
         let response_json = serde_json::to_string(&response)?;
+        println!("[DEBUG] handle_request: Response JSON length: {}", response_json.len());
+        
         writer.write_all(response_json.as_bytes())?;
+        println!("[DEBUG] handle_request: Wrote JSON to stream");
+        
         writer.write_all(b"\n")?;
+        println!("[DEBUG] handle_request: Wrote newline to stream");
+        
         writer.flush()?;
+        println!("[DEBUG] handle_request: Flushed stream");
 
         println!(
             "[Server] [Req #{}] Sent response ({} bytes encrypted)\n",
@@ -182,14 +200,16 @@ impl Server {
 
         Ok(())
     }
-
+    
     fn encrypt_data(request: EncryptionRequest) -> EncryptionResponse {
         println!(
-            "[Server] [Req #{}] Starting encryption...",
-            request.request_id
+            "[DEBUG] encrypt_data: START - Request ID: {}, File: {}, Size: {}",
+            request.request_id, request.filename, request.file_data.len()
         );
+        
         let tmp_dir = PathBuf::from("/tmp/");
         if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+            eprintln!("[DEBUG] encrypt_data: Failed to create tmp dir: {}", e);
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
@@ -199,6 +219,7 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!("[DEBUG] encrypt_data: Temp dir created/verified");
 
         let payload = HiddenPayload {
             message: format!("Hidden from file: {}", request.filename),
@@ -206,10 +227,15 @@ impl Server {
             image_bytes: request.file_data.clone(),
             extra: Some("Metadata info".to_string()),
         };
+        println!("[DEBUG] encrypt_data: Payload struct created");
 
         let serialized = match bincode::serialize(&payload) {
-            Ok(s) => s,
+            Ok(s) => {
+                println!("[DEBUG] encrypt_data: Serialized payload size: {}", s.len());
+                s
+            },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Serialization failed: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -221,12 +247,16 @@ impl Server {
             }
         };
 
-        let cover_image_path = PathBuf::from("../resources/default_image.png");
-        //let output_path = PathBuf::from("../../resources/output_stego.png");
-
+        let cover_image_path = PathBuf::from("resources/default_image.png");
+        println!("[DEBUG] encrypt_data: Cover image path: {}", cover_image_path.display());
+        
         let mut tmp_payload = match tempfile::NamedTempFile::new_in(&tmp_dir) {
-            Ok(f) => f,
+            Ok(f) => {
+                println!("[DEBUG] encrypt_data: Created temp payload file: {:?}", f.path());
+                f
+            },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Failed to create temp payload file: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -237,10 +267,12 @@ impl Server {
                 };
             }
         };
+        
         if let Err(e) = tmp_payload
             .write_all(&serialized)
             .and_then(|_| tmp_payload.flush())
         {
+            eprintln!("[DEBUG] encrypt_data: Failed to write temp payload: {}", e);
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
@@ -250,25 +282,35 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!("[DEBUG] encrypt_data: Written serialized data to temp payload file");
+        
         let cover = match ImageReader::open(&cover_image_path) {
-            Ok(reader) => match reader.decode() {
-                Ok(img) => img,
-                Err(e) => {
-                    return EncryptionResponse {
-                        request_id: request.request_id,
-                        status: "error".into(),
-                        message: format!(
-                            "Failed to decode image {}: {}",
-                            cover_image_path.display(),
-                            e
-                        ),
-                        encrypted_data: None,
-                        original_size: request.file_data.len(),
-                        encrypted_size: 0,
-                    };
+            Ok(reader) => {
+                println!("[DEBUG] encrypt_data: Opened cover image reader");
+                match reader.decode() {
+                    Ok(img) => {
+                        println!("[DEBUG] encrypt_data: Decoded cover image - dimensions: {:?}", img.dimensions());
+                        img
+                    },
+                    Err(e) => {
+                        eprintln!("[DEBUG] encrypt_data: Failed to decode image: {}", e);
+                        return EncryptionResponse {
+                            request_id: request.request_id,
+                            status: "error".into(),
+                            message: format!(
+                                "Failed to decode image {}: {}",
+                                cover_image_path.display(),
+                                e
+                            ),
+                            encrypted_data: None,
+                            original_size: request.file_data.len(),
+                            encrypted_size: 0,
+                        };
+                    }
                 }
             },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Failed to open image: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -279,21 +321,26 @@ impl Server {
                 };
             }
         };
+        
         let (cw, ch) = cover.dimensions();
         let payload_size = serialized.len();
-        // your cover capacity heuristic from main()
         let cover_capacity = (cw as f32 * ch as f32) * 0.375f32;
+        println!("[DEBUG] encrypt_data: Cover capacity: {}, Payload size: {}", cover_capacity, payload_size);
 
         let cover_final: DynamicImage = if (payload_size as f32) > cover_capacity {
             let scale_factor = ((payload_size as f32 / cover_capacity).sqrt()).ceil();
             let new_w = (cw as f32 * scale_factor) as u32;
             let new_h = (ch as f32 * scale_factor) as u32;
+            println!("[DEBUG] encrypt_data: Resizing cover - scale: {}, new dimensions: {}x{}", scale_factor, new_w, new_h);
             cover.resize(new_w, new_h, FilterType::Lanczos3)
         } else {
+            println!("[DEBUG] encrypt_data: Cover size sufficient, no resize needed");
             cover
         };
+        
         let mut cover_buf = Vec::new();
         if let Err(e) = cover_final.write_to(&mut Cursor::new(&mut cover_buf), ImageFormat::Png) {
+            eprintln!("[DEBUG] encrypt_data: Failed to encode resized cover: {}", e);
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
@@ -303,9 +350,15 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!("[DEBUG] encrypt_data: Encoded cover image to buffer: {} bytes", cover_buf.len());
+        
         let mut tmp_cover = match Builder::new().suffix(".png").tempfile_in(&tmp_dir) {
-            Ok(f) => f,
+            Ok(f) => {
+                println!("[DEBUG] encrypt_data: Created temp cover file: {:?}", f.path());
+                f
+            },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Failed to create temp cover file: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -316,10 +369,12 @@ impl Server {
                 };
             }
         };
+        
         if let Err(e) = tmp_cover
             .write_all(&cover_buf)
             .and_then(|_| tmp_cover.flush())
         {
+            eprintln!("[DEBUG] encrypt_data: Failed to write temp cover: {}", e);
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
@@ -329,14 +384,21 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!("[DEBUG] encrypt_data: Written cover buffer to temp file");
+        
         let original_size = request.file_data.len();
         let secret_key = b"supersecretkey_supersecretkey_32";
         let key = Key::<Aes256Gcm>::from_slice(secret_key);
         let password_hex = hex::encode(key);
+        println!("[DEBUG] encrypt_data: Generated password hex");
 
         let mut tmp_output = match Builder::new().suffix(".png").tempfile_in(&tmp_dir) {
-            Ok(f) => f,
+            Ok(f) => {
+                println!("[DEBUG] encrypt_data: Created temp output file: {:?}", f.path());
+                f
+            },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Failed to create temp output file: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -347,6 +409,12 @@ impl Server {
                 };
             }
         };
+        
+        println!("[DEBUG] encrypt_data: About to execute steganography...");
+        println!("[DEBUG] encrypt_data: Payload path: {:?}", tmp_payload.path());
+        println!("[DEBUG] encrypt_data: Cover path: {:?}", tmp_cover.path());
+        println!("[DEBUG] encrypt_data: Output path: {:?}", tmp_output.path());
+        
         if let Err(e) = hide_prepare()
             .with_file(tmp_payload.path())
             .with_image(tmp_cover.path())
@@ -354,6 +422,7 @@ impl Server {
             .using_password(password_hex.as_str())
             .execute()
         {
+            eprintln!("[DEBUG] encrypt_data: Steganography execution failed: {}", e);
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
@@ -363,9 +432,15 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!("[DEBUG] encrypt_data: Steganography execute() completed successfully");
+        
         let stego_bytes = match fs::read(tmp_output.path()) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                println!("[DEBUG] encrypt_data: Read stego output file: {} bytes", bytes.len());
+                bytes
+            },
             Err(e) => {
+                eprintln!("[DEBUG] encrypt_data: Failed to read stego output: {}", e);
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
@@ -376,14 +451,16 @@ impl Server {
                 };
             }
         };
+        
         println!(
             "[Server] [Req #{}] Stego encryption complete: {} bytes → {} bytes",
             request.request_id,
             original_size,
             stego_bytes.len()
         );
+        println!("[DEBUG] encrypt_data: Creating success response with {} bytes", stego_bytes.len());
 
-        EncryptionResponse {
+        let response = EncryptionResponse {
             request_id: request.request_id,
             status: "success".into(),
             message: format!(
@@ -393,13 +470,16 @@ impl Server {
             encrypted_data: Some(stego_bytes.clone()),
             original_size,
             encrypted_size: stego_bytes.len(),
+        };
+        
+        println!("[DEBUG] encrypt_data: Response created - encrypted_data.is_some(): {}", response.encrypted_data.is_some());
+        if let Some(ref data) = response.encrypted_data {
+            println!("[DEBUG] encrypt_data: Response encrypted_data actual length: {}", data.len());
         }
+        
+        response
     }
 }
-
-// =======================================
-// Entry Point
-// =======================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

@@ -111,9 +111,9 @@ impl ServerMiddleware {
         println!("========================================");
         println!("Cloud P2P Server Middleware");
         println!("========================================");
-        println!("[Server] Storage path: {}", self.storage_path);
-        println!("[Server] Client middleware port: {}", self.client_port);
-        println!("[Server] Server-to-server port: {} (reserved for future)", self.server_port);
+        println!("[Server Middleware] Storage path: {}", self.storage_path);
+        println!("[Server Middleware] Client middleware port: {}", self.client_port);
+        println!("[Server Middleware] Server-to-server port: {} (reserved for future)", self.server_port);
         println!("========================================\n");
 
         // Create application state
@@ -131,8 +131,8 @@ impl ServerMiddleware {
 
         // Start server
         let addr = format!("0.0.0.0:{}", self.client_port);
-        println!("[Server] Starting client middleware listener on {}", addr);
-        println!("[Server] Ready to accept requests!\n");
+        println!("[Server Middleware] Starting client middleware listener on {}", addr);
+        println!("[Server Middleware] Ready to accept requests!\n");
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
@@ -172,7 +172,7 @@ async fn upload_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<ImageResponse>, StatusCode> {
-    println!("[Server] Received upload request");
+    println!("[Server Middleware] Received upload request");
 
     let mut request_id = 0u64;
     let mut filename = String::new();
@@ -198,7 +198,7 @@ async fn upload_handler(
     }
 
     if filename.is_empty() || file_data.is_empty() {
-        eprintln!("[Server] Missing filename or file data");
+        eprintln!("[Server Middleware] Missing filename or file data");
         return Ok(Json(ImageResponse::error(request_id, "Missing filename or file data")));
     }
 
@@ -207,7 +207,7 @@ async fn upload_handler(
     
     match fs::write(&file_path, &file_data).await {
         Ok(_) => {
-            println!("[Server] [Req #{}] Saved file: {} ({} bytes)", 
+            println!("[Server Middleware] [Req #{}] Saved file: {} ({} bytes)", 
                      request_id, filename, file_data.len());
             
             Ok(Json(ImageResponse::success(
@@ -217,7 +217,7 @@ async fn upload_handler(
             )))
         }
         Err(e) => {
-            eprintln!("[Server] [Req #{}] Failed to save file: {}", request_id, e);
+            eprintln!("[Server Middleware] [Req #{}] Failed to save file: {}", request_id, e);
             Ok(Json(ImageResponse::error(request_id, &format!("Failed to save file: {}", e))))
         }
     }
@@ -228,7 +228,7 @@ async fn encrypt_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    println!("[Server] Received encrypt request");
+    println!("[Server Middleware] Received encrypt request");
 
     let mut request_id = 0u64;
     let mut filename = String::new();
@@ -260,7 +260,7 @@ async fn encrypt_handler(
         })));
     }
 
-    println!("[Server] [Req #{}] Forwarding encryption request to server: {} ({} bytes)", request_id, filename, file_data.len());
+    println!("[Server Middleware] [Req #{}] Forwarding encryption request to server: {} ({} bytes)", request_id, filename, file_data.len());
 
     // Build EncryptionRequest
     let encryption_request = serde_json::json!({
@@ -313,7 +313,7 @@ async fn encrypt_handler(
                     })))
                 }
                 Err(e) => {
-                    eprintln!("[Server] [Req #{}] Failed to parse server response: {}", request_id, e);
+                    eprintln!("[Server Middleware] [Req #{}] Failed to parse server response: {}", request_id, e);
                     Ok(Json(serde_json::json!({
                         "request_id": request_id,
                         "status": "ERROR",
@@ -323,7 +323,7 @@ async fn encrypt_handler(
             }
         }
         Ok(Err(e)) => {
-            eprintln!("[Server] [Req #{}] Server communication error: {}", request_id, e);
+            eprintln!("[Server Middleware] [Req #{}] Server communication error: {}", request_id, e);
             Ok(Json(serde_json::json!({
                 "request_id": request_id,
                 "status": "ERROR",
@@ -331,7 +331,7 @@ async fn encrypt_handler(
             })))
         }
         Err(e) => {
-            eprintln!("[Server] [Req #{}] Server communication error: {}", request_id, e);
+            eprintln!("[Server Middleware] [Req #{}] Server communication error: {}", request_id, e);
             Ok(Json(serde_json::json!({
                 "request_id": request_id,
                 "status": "ERROR",
@@ -346,7 +346,7 @@ async fn decrypt_handler(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    println!("[Server] Received decrypt request");
+    println!("[Server Middleware] Received decrypt request");
 
     let mut request_id = 0u64;
     let mut filename = String::new();
@@ -379,7 +379,7 @@ async fn decrypt_handler(
         })));
     }
 
-    println!("[Server] [Req #{}] Decrypting: {} ({} bytes)", 
+    println!("[Server Middleware] [Req #{}] Decrypting: {} ({} bytes)", 
              request_id, filename, file_data.len());
     
     // TODO: Implement actual decryption
@@ -396,7 +396,7 @@ async fn decrypt_handler(
     let output_path = format!("{}/{}", state.storage_path, output_filename);
     match fs::write(&output_path, &decrypted_data).await {
         Ok(_) => {
-            println!("[Server] [Req #{}] Decryption complete: {}", request_id, output_filename);
+            println!("[Server Middleware] [Req #{}] Decryption complete: {}", request_id, output_filename);
             
             // Encode file as base64 for JSON response
             let base64_data = base64_helper::encode(&decrypted_data);
@@ -411,7 +411,7 @@ async fn decrypt_handler(
             })))
         }
         Err(e) => {
-            eprintln!("[Server] [Req #{}] Failed to save decrypted file: {}", request_id, e);
+            eprintln!("[Server Middleware] [Req #{}] Failed to save decrypted file: {}", request_id, e);
             Ok(Json(serde_json::json!({
                 "request_id": request_id,
                 "status": "ERROR",

@@ -369,7 +369,7 @@ impl ClientMiddleware {
                             request_id, server_resp.status
                         );
 
-                        if server_resp.status == "OK" {
+                        if server_resp.status == "success" {
                             // Save returned file if present
                             if let (Some(file_data_b64), Some(output_filename)) =
                                 (&server_resp.file_data, &server_resp.output_filename)
