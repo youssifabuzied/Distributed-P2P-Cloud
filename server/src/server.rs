@@ -27,6 +27,8 @@ use std::thread;
 use stegano_core::api::hide::prepare as hide_prepare;
 use stegano_core::api::unveil::prepare as extract_prepare;
 use tempfile::Builder;
+mod middleware;
+use middleware::ServerMiddleware;
 
 // =======================================
 // Data Structures
@@ -399,8 +401,31 @@ impl Server {
 // Entry Point
 // =======================================
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize tracing/logging for the async HTTP server
+    tracing_subscriber::fmt::init();
+
+    // Start the blocking TCP Server in a background thread
     let server = Server::new("127.0.0.1", 7000);
-    server.start()?;
+    let server_handle = std::thread::spawn(move || {
+        if let Err(e) = server.start() {
+            eprintln!("[Server] blocking TCP server exited with error: {}", e);
+        }
+    });
+
+    // Start the async ServerMiddleware (HTTP) in this tokio runtime
+    let server_middleware = ServerMiddleware::new(
+        8000,    // client middleware port
+        8001,    // server-to-server port
+        "./server_storage",
+    );
+
+    // This will run until ServerMiddleware completes (or errors)
+    server_middleware.start().await?;
+
+    // Join the blocking server thread before exiting (best-effort)
+    let _ = server_handle.join();
+
     Ok(())
 }

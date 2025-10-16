@@ -40,7 +40,3 @@ path = "client/src/client_app.rs"
 [[bin]]
 name = "server"
 path = "server/src/server.rs"
-
-[[bin]]
-name = "middleware"
-path = "server/src/middleware.rs"

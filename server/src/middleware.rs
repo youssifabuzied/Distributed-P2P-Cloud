@@ -431,21 +431,8 @@ async fn decrypt_handler(
 // Main Entry Point
 // =======================================
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
-    let server = ServerMiddleware::new(
-        8000,                    // Client middleware port
-        8001,                    // Server-to-server port (future)
-        "./server_storage"       // Storage directory
-    );
-
-    server.start().await?;
-
-    Ok(())
-}
+// NOTE: main removed — use `server/src/server.rs` as the single entry point which starts both
+// the blocking TCP server and the async ServerMiddleware.
 
 // Add base64 dependency
 // Base64 helper functions
