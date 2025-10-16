@@ -8,24 +8,24 @@
 // - Process requests asynchronously
 // - Return encrypted (gibberish) data back to middleware
 //
-use std::net::{TcpListener, TcpStream};
-use std::io::{BufRead, BufReader, Write};
-use serde::{Serialize, Deserialize};
-use std::error::Error;
-use std::thread;
-use rand::Rng;
-use std::fs;
-use image::io::Reader as ImageReader;
-use image::{DynamicImage, ImageFormat,GenericImageView};
-use hex;
-use std::fs::File;
 use aes_gcm::{Aes256Gcm, Key};
-use image::imageops::FilterType
 use bincode;
+use hex;
+use image::imageops::FilterType;
+use image::io::Reader as ImageReader;
+use image::{DynamicImage, GenericImageView, ImageFormat};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fs;
+use std::fs::File;
 use std::io::Cursor;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::thread;
 use stegano_core::api::hide::prepare as hide_prepare;
 use stegano_core::api::unveil::prepare as extract_prepare;
-use std::path::PathBuf;
 use tempfile::Builder;
 
 // =======================================
@@ -36,7 +36,7 @@ use tempfile::Builder;
 pub struct EncryptionRequest {
     pub request_id: u64,
     pub filename: String,
-    pub file_data: Vec<u8>,  // Raw image bytes
+    pub file_data: Vec<u8>, // Raw image bytes
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -57,11 +57,7 @@ struct HiddenPayload {
 }
 
 impl EncryptionResponse {
-    pub fn success(
-        request_id: u64,
-        encrypted_data: Vec<u8>,
-        original_size: usize,
-    ) -> Self {
+    pub fn success(request_id: u64, encrypted_data: Vec<u8>, original_size: usize) -> Self {
         let encrypted_size = encrypted_data.len();
         EncryptionResponse {
             request_id,
@@ -105,7 +101,7 @@ impl Server {
     pub fn start(&self) -> Result<(), Box<dyn Error>> {
         let addr = format!("{}:{}", self.ip, self.port);
         let listener = TcpListener::bind(&addr)?;
-        
+
         println!("========================================");
         println!("Cloud P2P Server");
         println!("========================================");
@@ -115,12 +111,13 @@ impl Server {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let peer_addr = stream.peer_addr()
+                    let peer_addr = stream
+                        .peer_addr()
                         .map(|addr| addr.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
-                    
+
                     println!("[Server] New connection from: {}", peer_addr);
-                    
+
                     // Spawn new thread for async processing
                     thread::spawn(move || {
                         if let Err(e) = Self::handle_request(stream) {
@@ -133,18 +130,18 @@ impl Server {
                 }
             }
         }
-        
+
         Ok(())
     }
 
     fn handle_request(stream: TcpStream) -> Result<(), Box<dyn Error>> {
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
-        
+
         // Read request line (JSON)
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
-        
+
         if request_line.trim().is_empty() {
             return Ok(());
         }
@@ -154,9 +151,13 @@ impl Server {
         // Parse request
         let response = match serde_json::from_str::<EncryptionRequest>(request_line.trim()) {
             Ok(request) => {
-                println!("[Server] [Req #{}] Processing encryption for: {} ({} bytes)", 
-                         request.request_id, request.filename, request.file_data.len());
-                
+                println!(
+                    "[Server] [Req #{}] Processing encryption for: {} ({} bytes)",
+                    request.request_id,
+                    request.filename,
+                    request.file_data.len()
+                );
+
                 // Process encryption asynchronously (in this thread)
                 Self::encrypt_data(request)
             }
@@ -172,73 +173,80 @@ impl Server {
         writer.write_all(b"\n")?;
         writer.flush()?;
 
-        println!("[Server] [Req #{}] Sent response ({} bytes encrypted)\n", 
-                 response.request_id, response.encrypted_size);
-        
+        println!(
+            "[Server] [Req #{}] Sent response ({} bytes encrypted)\n",
+            response.request_id, response.encrypted_size
+        );
+
         Ok(())
     }
 
     fn encrypt_data(request: EncryptionRequest) -> EncryptionResponse {
-
-        println!("[Server] [Req #{}] Starting encryption...", request.request_id);
+        println!(
+            "[Server] [Req #{}] Starting encryption...",
+            request.request_id
+        );
         let tmp_dir = PathBuf::from("/tmp/");
         if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-        return EncryptionResponse {
-            request_id: request.request_id,
-            status: "error".into(),
-            message: format!("Failed to create tmp dir: {}", e),
-            encrypted_data: None,
-            original_size: request.file_data.len(),
-            encrypted_size: 0,
-        };
-        }
-
-        let payload = HiddenPayload {
-        message: format!("Hidden from file: {}", request.filename),
-        views: 42,
-        image_bytes: request.file_data.clone(),
-        extra: Some("Metadata info".to_string()),
-        };
-
-        let serialized = match bincode::serialize(&payload) {
-        Ok(s) => s,
-        Err(e) => {
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
-                message: format!("Failed to serialize payload: {}", e),
+                message: format!("Failed to create tmp dir: {}", e),
                 encrypted_data: None,
                 original_size: request.file_data.len(),
                 encrypted_size: 0,
             };
         }
+
+        let payload = HiddenPayload {
+            message: format!("Hidden from file: {}", request.filename),
+            views: 42,
+            image_bytes: request.file_data.clone(),
+            extra: Some("Metadata info".to_string()),
+        };
+
+        let serialized = match bincode::serialize(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to serialize payload: {}", e),
+                    encrypted_data: None,
+                    original_size: request.file_data.len(),
+                    encrypted_size: 0,
+                };
+            }
         };
 
         let cover_image_path = PathBuf::from("../resources/default_image.png");
         //let output_path = PathBuf::from("../../resources/output_stego.png");
 
         let mut tmp_payload = match tempfile::NamedTempFile::new_in(&tmp_dir) {
-        Ok(f) => f,
-        Err(e) => {
+            Ok(f) => f,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to create tmp payload file: {}", e),
+                    encrypted_data: None,
+                    original_size: request.file_data.len(),
+                    encrypted_size: 0,
+                };
+            }
+        };
+        if let Err(e) = tmp_payload
+            .write_all(&serialized)
+            .and_then(|_| tmp_payload.flush())
+        {
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
-                message: format!("Failed to create tmp payload file: {}", e),
+                message: format!("Failed to write tmp payload: {}", e),
                 encrypted_data: None,
                 original_size: request.file_data.len(),
                 encrypted_size: 0,
             };
-        }
-        };
-        if let Err(e) = tmp_payload.write_all(&serialized).and_then(|_| tmp_payload.flush()) {
-        return EncryptionResponse {
-            request_id: request.request_id,
-            status: "error".into(),
-            message: format!("Failed to write tmp payload: {}", e),
-            encrypted_data: None,
-            original_size: request.file_data.len(),
-            encrypted_size: 0,
-        };
         }
         let cover = match ImageReader::open(&cover_image_path) {
             Ok(reader) => match reader.decode() {
@@ -247,7 +255,11 @@ impl Server {
                     return EncryptionResponse {
                         request_id: request.request_id,
                         status: "error".into(),
-                        message: format!("Failed to decode image {}: {}", cover_image_path.display(), e),
+                        message: format!(
+                            "Failed to decode image {}: {}",
+                            cover_image_path.display(),
+                            e
+                        ),
                         encrypted_data: None,
                         original_size: request.file_data.len(),
                         encrypted_size: 0,
@@ -290,52 +302,55 @@ impl Server {
             };
         }
         let mut tmp_cover = match Builder::new().suffix(".png").tempfile_in(&tmp_dir) {
-        Ok(f) => f,
-        Err(e) => {
+            Ok(f) => f,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to create tmp cover file: {}", e),
+                    encrypted_data: None,
+                    original_size: request.file_data.len(),
+                    encrypted_size: 0,
+                };
+            }
+        };
+        if let Err(e) = tmp_cover
+            .write_all(&cover_buf)
+            .and_then(|_| tmp_cover.flush())
+        {
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
-                message: format!("Failed to create tmp cover file: {}", e),
+                message: format!("Failed to write tmp cover file: {}", e),
                 encrypted_data: None,
                 original_size: request.file_data.len(),
                 encrypted_size: 0,
             };
         }
-        };
-        if let Err(e) = tmp_cover.write_all(&cover_buf).and_then(|_| tmp_cover.flush()) {
-        return EncryptionResponse {
-            request_id: request.request_id,
-            status: "error".into(),
-            message: format!("Failed to write tmp cover file: {}", e),
-            encrypted_data: None,
-            original_size: request.file_data.len(),
-            encrypted_size: 0,
-        };
-        }
         let original_size = request.file_data.len();
         let secret_key = b"supersecretkey_supersecretkey_32";
         let key = Key::<Aes256Gcm>::from_slice(secret_key);
         let password_hex = hex::encode(key);
-        
+
         let mut tmp_output = match Builder::new().suffix(".png").tempfile_in(&tmp_dir) {
-        Ok(f) => f,
-        Err(e) => {
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to create temp output file: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
+            Ok(f) => f,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to create temp output file: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
         };
         if let Err(e) = hide_prepare()
-        .with_file(tmp_payload.path())
-        .with_image(tmp_cover.path())
-        .with_output(tmp_output.path())
-        .using_password(password_hex.as_str())
-        .execute()
+            .with_file(tmp_payload.path())
+            .with_image(tmp_cover.path())
+            .with_output(tmp_output.path())
+            .using_password(password_hex.as_str())
+            .execute()
         {
             return EncryptionResponse {
                 request_id: request.request_id,
@@ -347,38 +362,37 @@ impl Server {
             };
         }
         let stego_bytes = match fs::read(tmp_output.path()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to read stego output: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to read stego output: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
         };
         println!(
-        "[Server] [Req #{}] Stego encryption complete: {} bytes → {} bytes",
-        request.request_id,
-        original_size,
-        stego_bytes.len()
+            "[Server] [Req #{}] Stego encryption complete: {} bytes → {} bytes",
+            request.request_id,
+            original_size,
+            stego_bytes.len()
         );
 
         EncryptionResponse {
-        request_id: request.request_id,
-        status: "success".into(),
-        message: format!(
-            "Stego image successfully generated ({} bytes)",
-            stego_bytes.len()
-        ),
-        encrypted_data: Some(stego_bytes.clone()),
-        original_size,
-        encrypted_size: stego_bytes.len(),
+            request_id: request.request_id,
+            status: "success".into(),
+            message: format!(
+                "Stego image successfully generated ({} bytes)",
+                stego_bytes.len()
+            ),
+            encrypted_data: Some(stego_bytes.clone()),
+            original_size,
+            encrypted_size: stego_bytes.len(),
         }
     }
-    
 }
 
 // =======================================

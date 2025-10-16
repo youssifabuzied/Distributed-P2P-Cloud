@@ -6,14 +6,14 @@
 // Now supports background request processing!
 // You can submit multiple requests without waiting.
 //
-use std::io::{self, Write, BufRead, BufReader};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::error::Error;
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use serde::{Serialize, Deserialize};
-use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::collections::HashMap;
 
 // ---------------------------------------
 // Data Structures
@@ -28,14 +28,8 @@ pub struct ClientMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientRequest {
-    EncryptImage { 
-        request_id: u64,
-        image_path: String 
-    },
-    DecryptImage { 
-        request_id: u64,
-        image_path: String 
-    },
+    EncryptImage { request_id: u64, image_path: String },
+    DecryptImage { request_id: u64, image_path: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -75,8 +69,11 @@ impl RequestTracker {
         let mut id = self.next_id.lock().unwrap();
         let request_id = *id;
         *id += 1;
-        
-        self.requests.lock().unwrap().insert(request_id, RequestStatus::Pending);
+
+        self.requests
+            .lock()
+            .unwrap()
+            .insert(request_id, RequestStatus::Pending);
         request_id
     }
 
@@ -89,14 +86,18 @@ impl RequestTracker {
     }
 
     pub fn list_all(&self) -> Vec<(u64, RequestStatus)> {
-        self.requests.lock().unwrap()
+        self.requests
+            .lock()
+            .unwrap()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
 
     pub fn pending_count(&self) -> usize {
-        self.requests.lock().unwrap()
+        self.requests
+            .lock()
+            .unwrap()
             .values()
             .filter(|s| matches!(s, RequestStatus::Pending | RequestStatus::InProgress))
             .count()
@@ -137,20 +138,30 @@ impl Client {
         let tracker = self.tracker.requests.clone();
 
         // Update status to in-progress
-        self.tracker.update_status(request_id, RequestStatus::InProgress);
+        self.tracker
+            .update_status(request_id, RequestStatus::InProgress);
 
         // Spawn background thread
         thread::spawn(move || {
-            println!("[Client] [Req #{}] Sending request in background...", request_id);
-            
+            println!(
+                "[Client] [Req #{}] Sending request in background...",
+                request_id
+            );
+
             match Self::send_request_sync(&middleware_addr, &request) {
                 Ok(response) => {
                     println!("[Client] [Req #{}] ✓ Completed", request_id);
-                    tracker.lock().unwrap().insert(request_id, RequestStatus::Completed(response));
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Completed(response));
                 }
                 Err(e) => {
                     eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
-                    tracker.lock().unwrap().insert(request_id, RequestStatus::Failed(e.to_string()));
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Failed(e.to_string()));
                 }
             }
         });
@@ -160,24 +171,24 @@ impl Client {
 
     /// Internal: Synchronous request (runs in background thread)
     fn send_request_sync(
-        middleware_addr: &str, 
-        request: &ClientRequest
+        middleware_addr: &str,
+        request: &ClientRequest,
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // Connect to middleware
         let stream = TcpStream::connect(middleware_addr)?;
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
-        
+
         // Serialize and send request
         let serialized = serde_json::to_string(request)?;
         writer.write_all(serialized.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        
+
         // Read response
         let mut response_line = String::new();
         reader.read_line(&mut response_line)?;
-        
+
         // Parse response
         let response: MiddlewareResponse = serde_json::from_str(response_line.trim())?;
         Ok(response)
@@ -188,15 +199,18 @@ impl Client {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
-        
+
         let request_id = self.tracker.create_request();
         let request = ClientRequest::EncryptImage {
             request_id,
             image_path: image_path.to_string(),
         };
-        
+
         let id = self.send_request_async(request);
-        println!("[Client] Queued encryption request #{} for '{}'", id, image_path);
+        println!(
+            "[Client] Queued encryption request #{} for '{}'",
+            id, image_path
+        );
         Ok(id)
     }
 
@@ -205,15 +219,18 @@ impl Client {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
-        
+
         let request_id = self.tracker.create_request();
         let request = ClientRequest::DecryptImage {
             request_id,
             image_path: image_path.to_string(),
         };
-        
+
         let id = self.send_request_async(request);
-        println!("[Client] Queued decryption request #{} for '{}'", id, image_path);
+        println!(
+            "[Client] Queued decryption request #{} for '{}'",
+            id, image_path
+        );
         Ok(id)
     }
 
@@ -248,7 +265,7 @@ impl Client {
     /// List all requests
     pub fn list_requests(&self) {
         let requests = self.tracker.list_all();
-        
+
         if requests.is_empty() {
             println!("No requests yet.");
             return;
@@ -257,7 +274,7 @@ impl Client {
         println!("\n========================================");
         println!("Request History");
         println!("========================================");
-        
+
         for (id, status) in requests {
             match status {
                 RequestStatus::Pending => {
@@ -267,15 +284,18 @@ impl Client {
                     println!("#{:3} | 🔄 In Progress", id);
                 }
                 RequestStatus::Completed(ref response) => {
-                    println!("#{:3} | ✓ Completed - {}", id, 
-                             response.output_path.as_ref().unwrap_or(&"N/A".to_string()));
+                    println!(
+                        "#{:3} | ✓ Completed - {}",
+                        id,
+                        response.output_path.as_ref().unwrap_or(&"N/A".to_string())
+                    );
                 }
                 RequestStatus::Failed(ref err) => {
                     println!("#{:3} | ✗ Failed - {}", id, err);
                 }
             }
         }
-        
+
         let pending = self.tracker.pending_count();
         println!("========================================");
         println!("Pending/In-Progress: {}", pending);
@@ -311,22 +331,18 @@ impl Client {
             }
 
             match tokens[0] {
-                "encrypt" if tokens.len() == 2 => {
-                    match self.request_encryption(tokens[1]) {
-                        Ok(id) => {
-                            println!("✓ Request #{} queued (background processing)", id);
-                        }
-                        Err(e) => eprintln!("✗ Error: {}", e),
+                "encrypt" if tokens.len() == 2 => match self.request_encryption(tokens[1]) {
+                    Ok(id) => {
+                        println!("✓ Request #{} queued (background processing)", id);
                     }
-                }
-                "decrypt" if tokens.len() == 2 => {
-                    match self.request_decryption(tokens[1]) {
-                        Ok(id) => {
-                            println!("✓ Request #{} queued (background processing)", id);
-                        }
-                        Err(e) => eprintln!("✗ Error: {}", e),
+                    Err(e) => eprintln!("✗ Error: {}", e),
+                },
+                "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
+                    Ok(id) => {
+                        println!("✓ Request #{} queued (background processing)", id);
                     }
-                }
+                    Err(e) => eprintln!("✗ Error: {}", e),
+                },
                 "status" if tokens.len() == 2 => {
                     if let Ok(id) = tokens[1].parse::<u64>() {
                         self.check_status(id);
@@ -347,10 +363,10 @@ impl Client {
                         println!("Warning: {} request(s) still pending!", pending);
                         print!("Exit anyway? (y/n): ");
                         io::stdout().flush().unwrap();
-                        
+
                         let mut confirm = String::new();
                         io::stdin().read_line(&mut confirm).unwrap();
-                        
+
                         if confirm.trim().to_lowercase() != "y" {
                             continue;
                         }
@@ -362,13 +378,4 @@ impl Client {
             }
         }
     }
-}
-
-// ---------------------------------------
-// Entry point
-// ---------------------------------------
-
-fn main() {
-    let client = Client::new("user1", "127.0.0.1", 8080, "127.0.0.1:9000");
-    client.start_ui();
 }
