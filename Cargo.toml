@@ -35,7 +35,7 @@ rand = "0.8"
 
 [[bin]]
 name = "client_app"
-path = "client/src/main.rs"
+path = "client/src/client_app.rs"
 
 [[bin]]
 name = "server"
