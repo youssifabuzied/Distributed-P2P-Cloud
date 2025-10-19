@@ -466,16 +466,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ✨ Server configuration
     // Change these values for different server instances
     let config = ServerConfig {
-        server_id: 1,               // ← Unique server ID
-        priority: 10,               // ← Election priority (higher wins)
+        server_id: 2,               // ← Unique server ID
+        priority: 9,                // ← Election priority (higher wins)
         client_port: 8000,          // ← HTTP port for client middleware
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
         peers: vec![
             // Add other server instances here
             PeerInfo {
-                server_id: 2,
-                address: "127.0.0.1:8101".to_string(), // Server 2's peer port
+                server_id: 1,
+                address: "10.40.40.202:8001".to_string(), // Server 2's peer port
             },
             // PeerInfo {
             //     server_id: 3,
@@ -483,7 +483,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // },
         ],
         election_timeout_ms: 2000, // Wait 2 seconds for election responses
-        election_wait_range: (100, 500), // Random delay before starting election
     };
 
     println!("\n========================================");

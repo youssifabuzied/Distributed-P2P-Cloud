@@ -1,12 +1,13 @@
 // =======================================
-// middleware.rs - Fixed Version
+// middleware.rs - Simplified Election
 // Cloud P2P Controlled Image Sharing Project
 // =======================================
 //
-// Responsibilities:
-// - Listen for HTTP requests from client middlewares (Port 8000)
-// - Process image encryption requests with election algorithm
-// - Communicate with peer servers for election (Port 8001)
+// Election Algorithm:
+// 1. Each server broadcasts its priority to all peers (no response expected)
+// 2. Each server listens for 5 seconds for higher priority announcements
+// 3. If higher priority received -> drop request
+// 4. If no higher priority after 5 seconds -> process request
 
 use axum::{
     Router,
@@ -15,7 +16,6 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,11 +48,8 @@ pub struct ServerConfig {
     /// List of peer server middlewares (for election)
     pub peers: Vec<PeerInfo>,
 
-    /// Election timeout in milliseconds
-    pub election_timeout_ms: u64, // e.g., 2000
-
-    /// Random wait before election (min, max) in milliseconds
-    pub election_wait_range: (u64, u64), // e.g., (100, 500)
+    /// Election timeout in milliseconds (listen period)
+    pub election_timeout_ms: u64, // 5000 (5 seconds)
 }
 
 /// Information about a peer server
@@ -66,26 +63,12 @@ pub struct PeerInfo {
 // Election Data Structures
 // =======================================
 
-/// Election-related message types for peer-to-peer communication
+/// Priority announcement message (broadcast only, no response)
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ElectionMessage {
-    /// Election initiation message
-    Election {
-        request_id: u64,      // Client request being processed
-        initiator_id: u64,    // Server that started election
-        sender_id: u64,       // Current sender's ID
-        sender_priority: u32, // Current sender's priority
-    },
-
-    /// Response to election (only from higher priority servers)
-    ElectionResponse {
-        request_id: u64,
-        responder_id: u64,
-        responder_priority: u32,
-    },
-
-    /// Leader announcement (optional, for confirmation)
-    Leader { request_id: u64, leader_id: u64 },
+pub struct PriorityAnnouncement {
+    pub request_id: u64,
+    pub server_id: u64,
+    pub priority: u32,
 }
 
 /// Result of an election process
@@ -93,7 +76,7 @@ pub enum ElectionMessage {
 pub struct ElectionResult {
     pub request_id: u64,
     pub is_leader: bool,
-    pub leader_id: u64,
+    pub highest_priority_seen: u32,
 }
 
 /// Tracks ongoing elections
@@ -106,8 +89,9 @@ pub struct ElectionTracker {
 struct ElectionState {
     request_id: u64,
     initiated_at: Instant,
-    received_responses: Vec<(u64, u32)>, // (server_id, priority)
-    has_sent_election: bool,
+    my_priority: u32,
+    highest_priority_seen: u32, // Track highest priority announcement received
+    should_process: bool,
 }
 
 impl ElectionTracker {
@@ -118,42 +102,44 @@ impl ElectionTracker {
     }
 
     /// Start tracking a new election
-    pub fn start_election(&self, request_id: u64) {
+    pub fn start_election(&self, request_id: u64, my_priority: u32) {
         let mut elections = self.active_elections.lock().unwrap();
         elections.insert(
             request_id,
             ElectionState {
                 request_id,
                 initiated_at: Instant::now(),
-                received_responses: Vec::new(),
-                has_sent_election: false,
+                my_priority,
+                highest_priority_seen: my_priority,
+                should_process: true, // Assume true until higher priority received
             },
         );
     }
 
-    /// Record a response to an election
-    pub fn add_response(&self, request_id: u64, server_id: u64, priority: u32) {
+    /// Record a priority announcement from a peer
+    /// Returns true if we should immediately drop the request
+    pub fn record_announcement(&self, request_id: u64, peer_priority: u32) -> bool {
         let mut elections = self.active_elections.lock().unwrap();
         if let Some(state) = elections.get_mut(&request_id) {
-            state.received_responses.push((server_id, priority));
+            // If peer has HIGHER priority, we should drop
+            if peer_priority > state.my_priority {
+                println!(
+                    "[Election] [Req #{}] Received higher priority {} (mine: {})",
+                    request_id, peer_priority, state.my_priority
+                );
+                state.highest_priority_seen = peer_priority;
+                state.should_process = false;
+                return true; // Drop immediately
+            }
         }
+        false // Continue
     }
 
-    /// Check if election timed out
-    pub fn is_timeout(&self, request_id: u64, timeout_ms: u64) -> bool {
+    /// Check if we should process this request (after timeout)
+    pub fn should_process(&self, request_id: u64) -> bool {
         let elections = self.active_elections.lock().unwrap();
         if let Some(state) = elections.get(&request_id) {
-            state.initiated_at.elapsed().as_millis() > timeout_ms as u128
-        } else {
-            false
-        }
-    }
-
-    /// Get election result (if leader)
-    pub fn has_responses(&self, request_id: u64) -> bool {
-        let elections = self.active_elections.lock().unwrap();
-        if let Some(state) = elections.get(&request_id) {
-            !state.received_responses.is_empty()
+            state.should_process
         } else {
             false
         }
@@ -226,7 +212,7 @@ impl AppState {
 // Server Middleware
 // =======================================
 
-/// Main server middleware struct with election support
+/// Main server middleware struct with simplified election support
 #[derive(Clone)]
 pub struct ServerMiddleware {
     pub config: ServerConfig,
@@ -254,7 +240,11 @@ impl ServerMiddleware {
         println!("[Server] Priority: {}", self.config.priority);
         println!("[Server] Client port: {}", self.config.client_port);
         println!("[Server] Peer port: {}", self.config.peer_port);
-        println!("[Server] Peers: {} connected", self.config.peers.len());
+        println!("[Server] Peers: {}", self.config.peers.len());
+        println!(
+            "[Server] Election timeout: {}ms",
+            self.config.election_timeout_ms
+        );
         println!("========================================\n");
 
         // Clone self for the peer listener
@@ -277,14 +267,14 @@ impl ServerMiddleware {
         Ok(())
     }
 
-    /// Start listener for peer-to-peer election messages (Port 8001)
+    /// Start listener for peer-to-peer priority announcements (Port 8001)
     async fn start_peer_listener(&self) -> Result<(), Box<dyn std::error::Error>> {
         let addr = format!("0.0.0.0:{}", self.config.peer_port);
 
         let state = Arc::new(self.clone());
 
         let app = Router::new()
-            .route("/election", post(handle_election_message))
+            .route("/announce", post(handle_priority_announcement))
             .with_state(state);
 
         println!("[Server] Peer listener started on {}", addr);
@@ -315,55 +305,45 @@ impl ServerMiddleware {
     }
 
     /// Start election process for a request
+    /// Broadcasts priority to all peers and waits for higher priority announcements
     pub async fn start_election(&self, request_id: u64) -> ElectionResult {
-        // Random wait before starting election
-        let wait_ms = {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(self.config.election_wait_range.0..=self.config.election_wait_range.1)
-        };
-
         println!(
-            "[Election] [Req #{}] Waiting {}ms before starting election",
-            request_id, wait_ms
+            "[Election] [Req #{}] Starting election (Server {}, Priority {})",
+            request_id, self.config.server_id, self.config.priority
         );
-
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
 
         // Start tracking this election
-        self.election_tracker.start_election(request_id);
+        self.election_tracker
+            .start_election(request_id, self.config.priority);
+
+        // Broadcast priority to all peers (no response expected)
+        self.broadcast_priority(request_id).await;
 
         println!(
-            "[Election] [Req #{}] Starting election (priority {})",
-            request_id, self.config.priority
+            "[Election] [Req #{}] Listening for {}ms for higher priority announcements...",
+            request_id, self.config.election_timeout_ms
         );
 
-        // Send election message to all peers
-        self.broadcast_election(request_id).await;
-
-        // Wait for responses or timeout
+        // Wait for the election timeout period
         tokio::time::sleep(Duration::from_millis(self.config.election_timeout_ms)).await;
 
-        // Check if we're the leader
-        let is_leader = !self.election_tracker.has_responses(request_id);
+        // Check if we should process (no higher priority received)
+        let should_process = self.election_tracker.should_process(request_id);
 
         let result = ElectionResult {
             request_id,
-            is_leader,
-            leader_id: if is_leader {
-                self.config.server_id
-            } else {
-                0 // Unknown (would need to track)
-            },
+            is_leader: should_process,
+            highest_priority_seen: self.config.priority,
         };
 
-        if is_leader {
+        if should_process {
             println!(
-                "[Election] [Req #{}] ✓ I AM THE LEADER (Server {})",
-                request_id, self.config.server_id
+                "[Election] [Req #{}] ✓ I AM THE LEADER (Server {}, Priority {})",
+                request_id, self.config.server_id, self.config.priority
             );
         } else {
             println!(
-                "[Election] [Req #{}] ✗ Not leader (received higher priority responses)",
+                "[Election] [Req #{}] ✗ Not leader (higher priority received)",
                 request_id
             );
         }
@@ -373,27 +353,29 @@ impl ServerMiddleware {
         result
     }
 
-    /// Broadcast election message to all peers
-    async fn broadcast_election(&self, request_id: u64) {
+    /// Broadcast priority announcement to all peers (fire and forget, no response)
+    async fn broadcast_priority(&self, request_id: u64) {
         let client = reqwest::Client::new();
 
-        let msg = ElectionMessage::Election {
+        let announcement = PriorityAnnouncement {
             request_id,
-            initiator_id: self.config.server_id,
-            sender_id: self.config.server_id,
-            sender_priority: self.config.priority,
+            server_id: self.config.server_id,
+            priority: self.config.priority,
         };
 
         for peer in &self.config.peers {
-            let url = format!("http://{}/election", peer.address);
-            let msg = msg.clone();
+            let url = format!("http://{}/announce", peer.address);
+            let announcement = announcement.clone();
             let client = client.clone();
             let peer_id = peer.server_id;
 
             tokio::spawn(async move {
-                match client.post(&url).json(&msg).send().await {
-                    Ok(resp) => {
-                        println!("[Election] Sent to peer {}: {:?}", peer_id, resp.status());
+                match client.post(&url).json(&announcement).send().await {
+                    Ok(_) => {
+                        println!(
+                            "[Election] Broadcasted priority to peer {} (no response expected)",
+                            peer_id
+                        );
                     }
                     Err(e) => {
                         eprintln!("[Election] Failed to send to peer {}: {}", peer_id, e);
@@ -408,80 +390,33 @@ impl ServerMiddleware {
 // HTTP Handlers - Peer Communication
 // =======================================
 
-/// Handle incoming election messages from peers
-async fn handle_election_message(
+/// Handle incoming priority announcements from peers
+/// This is a one-way broadcast - no response is sent back
+async fn handle_priority_announcement(
     State(middleware): State<Arc<ServerMiddleware>>,
-    Json(msg): Json<ElectionMessage>,
+    Json(announcement): Json<PriorityAnnouncement>,
 ) -> Json<serde_json::Value> {
-    match msg {
-        ElectionMessage::Election {
-            request_id,
-            initiator_id,
-            sender_id,
-            sender_priority,
-        } => {
-            // Only respond if we have HIGHER priority
-            if middleware.config.priority > sender_priority {
-                println!(
-                    "[Election] [Req #{}] Received election from Server {} (priority {}), responding with priority {}",
-                    request_id, sender_id, sender_priority, middleware.config.priority
-                );
+    println!(
+        "[Election] [Req #{}] Received priority announcement from Server {} (priority: {})",
+        announcement.request_id, announcement.server_id, announcement.priority
+    );
 
-                // Send response back to sender
-                let _response = ElectionMessage::ElectionResponse {
-                    request_id,
-                    responder_id: middleware.config.server_id,
-                    responder_priority: middleware.config.priority,
-                };
+    // Record the announcement - if higher priority, drop our request
+    let should_drop = middleware
+        .election_tracker
+        .record_announcement(announcement.request_id, announcement.priority);
 
-                // Also start our own election (if not already started)
-                let middleware_clone = middleware.clone();
-                tokio::spawn(async move {
-                    middleware_clone.start_election(request_id).await;
-                });
-
-                Json(serde_json::json!({
-                    "status": "responded",
-                    "priority": middleware.config.priority
-                }))
-            } else {
-                println!(
-                    "[Election] [Req #{}] Ignoring election from Server {} (lower/equal priority)",
-                    request_id, sender_id
-                );
-
-                Json(serde_json::json!({
-                    "status": "ignored"
-                }))
-            }
-        }
-
-        ElectionMessage::ElectionResponse {
-            request_id,
-            responder_id,
-            responder_priority,
-        } => {
-            // Record this response
-            middleware
-                .election_tracker
-                .add_response(request_id, responder_id, responder_priority);
-
-            Json(serde_json::json!({
-                "status": "received"
-            }))
-        }
-
-        ElectionMessage::Leader {
-            request_id,
-            leader_id,
-        } => {
-            println!(
-                "[Election] [Req #{}] Leader is Server {}",
-                request_id, leader_id
-            );
-            Json(serde_json::json!({"status": "acknowledged"}))
-        }
+    if should_drop {
+        println!(
+            "[Election] [Req #{}] ⚠️ Dropping request due to higher priority announcement",
+            announcement.request_id
+        );
     }
+
+    // Simple acknowledgment (peers don't wait for this)
+    Json(serde_json::json!({
+        "status": "received"
+    }))
 }
 
 // =======================================
@@ -492,10 +427,11 @@ async fn handle_election_message(
 async fn root_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "service": "Cloud P2P Server Middleware",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "health": "/health",
-            "encrypt": "/encrypt (POST multipart/form-data)"
+            "encrypt": "/encrypt (POST multipart/form-data)",
+            "announce": "/announce (POST - peer priority announcements)"
         }
     }))
 }
@@ -513,10 +449,11 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-/// Encrypt image endpoint with election algorithm
-/// This handler receives encryption requests from client middleware,
-/// runs an election to determine if this server should process the request,
-/// and only processes if elected as leader
+/// Encrypt image endpoint with simplified election algorithm
+/// 1. Broadcast priority to all peers
+/// 2. Listen for 5 seconds for higher priority
+/// 3. If higher priority received -> drop request
+/// 4. If no higher priority -> process request
 async fn encrypt_handler(
     State(middleware): State<Arc<ServerMiddleware>>,
     mut multipart: Multipart,
@@ -570,13 +507,13 @@ async fn encrypt_handler(
         request_id, middleware.config.server_id, middleware.config.priority
     );
 
-    // Start election to determine if this server should process the request
+    // Start election: broadcast priority and wait for higher priority announcements
     let election_result = middleware.start_election(request_id).await;
 
     // If not elected as leader, ignore this request
     if !election_result.is_leader {
         println!(
-            "[Server Middleware] [Req #{}] Not elected as leader - ignoring request",
+            "[Server Middleware] [Req #{}] Not elected as leader - dropping request",
             request_id
         );
 
@@ -584,7 +521,7 @@ async fn encrypt_handler(
             "request_id": request_id,
             "status": "ignored",
             "message": format!(
-                "Not the elected leader for this request (Server {} lost election)",
+                "Not the elected leader for this request (Server {} received higher priority)",
                 middleware.config.server_id
             )
         })));
@@ -606,7 +543,7 @@ async fn encrypt_handler(
         "file_data": file_data,
     });
 
-    // Forward to internal server (TCP, port 7000)
+    // Forward to internal server (TCP)
     let server_addr = format!("127.0.0.1:{}", middleware.config.internal_server_port);
 
     println!(
