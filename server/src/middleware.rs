@@ -19,10 +19,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tower_http::trace::TraceLayer;
-
 // =======================================
 // Configuration Structures
 // =======================================
@@ -501,6 +501,7 @@ async fn encrypt_handler(
     // ========================================
     // ELECTION PHASE
     // ========================================
+    std::thread::sleep(std::time::Duration::from_millis(2000));
 
     println!(
         "[Server Middleware] [Req #{}] Starting election (Server ID: {}, Priority: {})",

@@ -467,7 +467,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Change these values for different server instances
     let config = ServerConfig {
         server_id: 2,               // ← Unique server ID
-        priority: 9,                // ← Election priority (higher wins)
+        priority: 20,               // ← Election priority (higher wins)
         client_port: 8000,          // ← HTTP port for client middleware
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
@@ -482,7 +482,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             //     address: "192.168.1.10:8001".to_string(),
             // },
         ],
-        election_timeout_ms: 2000, // Wait 2 seconds for election responses
+        election_timeout_ms: 7000, // Wait 2 seconds for election responses
     };
 
     println!("\n========================================");
