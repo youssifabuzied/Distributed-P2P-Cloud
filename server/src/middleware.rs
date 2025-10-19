@@ -122,10 +122,7 @@ impl ServerMiddleware {
         // Build router for client middleware communication
         let app = Router::new()
             .route("/", get(root_handler))
-            .route("/health", get(health_handler))
-            .route("/upload", post(upload_handler))
             .route("/encrypt", post(encrypt_handler))
-            .route("/decrypt", post(decrypt_handler))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
@@ -153,74 +150,9 @@ async fn root_handler() -> Json<serde_json::Value> {
         "endpoints": {
             "health": "/health",
             "upload": "/upload (POST multipart/form-data)",
-            "encrypt": "/encrypt (POST multipart/form-data)",
-            "decrypt": "/decrypt (POST multipart/form-data)"
+            "encrypt": "/encrypt (POST multipart/form-data)"
         }
     }))
-}
-
-/// Health check endpoint
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "healthy",
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
-}
-
-/// Upload image endpoint
-async fn upload_handler(
-    State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> Result<Json<ImageResponse>, StatusCode> {
-    println!("[Server Middleware] Received upload request");
-
-    let mut request_id = 0u64;
-    let mut filename = String::new();
-    let mut file_data: Vec<u8> = Vec::new();
-
-    // Parse multipart form data
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let field_name = field.name().unwrap_or("").to_string();
-
-        match field_name.as_str() {
-            "request_id" => {
-                let data = field.text().await.unwrap();
-                request_id = data.parse().unwrap_or(0);
-            }
-            "filename" => {
-                filename = field.text().await.unwrap();
-            }
-            "file" => {
-                file_data = field.bytes().await.unwrap().to_vec();
-            }
-            _ => {}
-        }
-    }
-
-    if filename.is_empty() || file_data.is_empty() {
-        eprintln!("[Server Middleware] Missing filename or file data");
-        return Ok(Json(ImageResponse::error(request_id, "Missing filename or file data")));
-    }
-
-    // Save file to storage
-    let file_path = format!("{}/{}", state.storage_path, filename);
-    
-    match fs::write(&file_path, &file_data).await {
-        Ok(_) => {
-            println!("[Server Middleware] [Req #{}] Saved file: {} ({} bytes)", 
-                     request_id, filename, file_data.len());
-            
-            Ok(Json(ImageResponse::success(
-                request_id,
-                "File uploaded successfully",
-                filename,
-            )))
-        }
-        Err(e) => {
-            eprintln!("[Server Middleware] [Req #{}] Failed to save file: {}", request_id, e);
-            Ok(Json(ImageResponse::error(request_id, &format!("Failed to save file: {}", e))))
-        }
-    }
 }
 
 /// Encrypt image endpoint
@@ -298,7 +230,7 @@ async fn encrypt_handler(
                 Ok(resp_json) => {
                     let status = resp_json["status"].as_str().unwrap_or("ERROR");
                     let message = resp_json["message"].as_str().unwrap_or("");
-                    let output_filename = format!("{}.encrypted", filename);
+                    let output_filename = format!("encrypted_{}", filename);
                     let encrypted_data = resp_json["encrypted_data"].as_array()
                         .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|b| b as u8)).collect::<Vec<u8>>())
                         .unwrap_or_default();
@@ -341,85 +273,6 @@ async fn encrypt_handler(
     }
 }
 
-/// Decrypt image endpoint
-async fn decrypt_handler(
-    State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    println!("[Server Middleware] Received decrypt request");
-
-    let mut request_id = 0u64;
-    let mut filename = String::new();
-    let mut file_data: Vec<u8> = Vec::new();
-
-    // Parse multipart form data
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let field_name = field.name().unwrap_or("").to_string();
-
-        match field_name.as_str() {
-            "request_id" => {
-                let data = field.text().await.unwrap();
-                request_id = data.parse().unwrap_or(0);
-            }
-            "filename" => {
-                filename = field.text().await.unwrap();
-            }
-            "file" => {
-                file_data = field.bytes().await.unwrap().to_vec();
-            }
-            _ => {}
-        }
-    }
-
-    if filename.is_empty() || file_data.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "request_id": request_id,
-            "status": "ERROR",
-            "message": "Missing filename or file data"
-        })));
-    }
-
-    println!("[Server Middleware] [Req #{}] Decrypting: {} ({} bytes)", 
-             request_id, filename, file_data.len());
-    
-    // TODO: Implement actual decryption
-    // For now, just return the same image data (as requested)
-    let decrypted_data = file_data.clone();
-    
-    let output_filename = if filename.ends_with(".encrypted") {
-        filename.strip_suffix(".encrypted").unwrap().to_string()
-    } else {
-        format!("{}.decrypted", filename)
-    };
-
-    // Save decrypted file
-    let output_path = format!("{}/{}", state.storage_path, output_filename);
-    match fs::write(&output_path, &decrypted_data).await {
-        Ok(_) => {
-            println!("[Server Middleware] [Req #{}] Decryption complete: {}", request_id, output_filename);
-            
-            // Encode file as base64 for JSON response
-            let base64_data = base64_helper::encode(&decrypted_data);
-            
-            Ok(Json(serde_json::json!({
-                "request_id": request_id,
-                "status": "OK",
-                "message": "Image decrypted successfully",
-                "output_filename": output_filename,
-                "file_data": base64_data,
-                "file_size": decrypted_data.len()
-            })))
-        }
-        Err(e) => {
-            eprintln!("[Server Middleware] [Req #{}] Failed to save decrypted file: {}", request_id, e);
-            Ok(Json(serde_json::json!({
-                "request_id": request_id,
-                "status": "ERROR",
-                "message": format!("Failed to save decrypted file: {}", e)
-            })))
-        }
-    }
-}
 
 // =======================================
 // Server-to-Server Communication
