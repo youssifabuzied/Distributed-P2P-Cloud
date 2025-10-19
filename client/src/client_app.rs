@@ -14,10 +14,15 @@ fn main() {
     let client_port = 8080u16;
     let middleware_ip = "127.0.0.1";
     let middleware_port = 9000u16;
-    let server_url = "http://127.0.0.1:8000";
 
-    // Start middleware in background thread
-    let middleware = ClientMiddleware::new(middleware_ip, middleware_port, server_url);
+    // ✨ NEW: Define multiple server URLs
+    let server_urls = vec![
+        "http://127.0.0.1:8000".to_string(),    // Server 1
+        "http://10.40.40.202:8000".to_string(), // Server 2 (if running)
+    ];
+
+    // Start middleware with multiple servers
+    let middleware = ClientMiddleware::new(middleware_ip, middleware_port, server_urls);
     let handle = thread::spawn(move || {
         if let Err(e) = middleware.start() {
             eprintln!("[main] middleware error: {}", e);
@@ -27,11 +32,10 @@ fn main() {
     // Give middleware a moment to bind
     thread::sleep(Duration::from_millis(150));
 
-    // Start client UI (blocks until user exits)
+    // Start client UI
     let middleware_addr = format!("{}:{}", middleware_ip, middleware_port);
     let client = Client::new(username, client_ip, client_port, &middleware_addr);
     client.start_ui();
 
-    // When client exits, try to join middleware thread (may block until listener closes)
     let _ = handle.join();
 }

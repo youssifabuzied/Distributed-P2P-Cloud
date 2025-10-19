@@ -6,7 +6,7 @@
 // Forwards encryption/decryption requests to server middleware via HTTP
 //
 use aes_gcm::{Aes256Gcm, Key};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use bincode;
 use hex;
 use serde::{Deserialize, Serialize};
@@ -15,9 +15,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use stegano_core::api::unveil::prepare as extract_prepare;
-
 // ---------------------------------------
 // Shared Structures
 // ---------------------------------------
@@ -28,7 +29,7 @@ pub enum ClientRequest {
     DecryptImage { request_id: u64, image_path: String },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MiddlewareResponse {
     pub request_id: u64,
     pub status: String,
@@ -80,27 +81,30 @@ struct HiddenPayload {
 pub struct ClientMiddleware {
     pub ip: String,
     pub port: u16,
-    pub server_url: String, // Server middleware HTTP URL
+    pub server_urls: Vec<String>, // Server middleware HTTP URL
 }
 
 impl ClientMiddleware {
-    pub fn new(ip: &str, port: u16, server_url: &str) -> Self {
+    pub fn new(ip: &str, port: u16, server_urls: Vec<String>) -> Self {
         ClientMiddleware {
             ip: ip.to_string(),
             port,
-            server_url: server_url.to_string(),
+            server_urls,
         }
     }
 
-    pub fn start(&self) -> Result<(), Box<dyn Error>> {
+    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.ip, self.port);
-        let listener = TcpListener::bind(&addr)?;
+        let listener = std::net::TcpListener::bind(&addr)?;
 
         println!("========================================");
-        println!("Cloud P2P Client Middleware");
+        println!("Cloud P2P Client Middleware (Multi-Server)");
         println!("========================================");
         println!("[ClientMiddleware] Listening on {}", addr);
-        println!("[ClientMiddleware] Server URL: {}", self.server_url);
+        println!("[ClientMiddleware] Available servers:");
+        for (i, url) in self.server_urls.iter().enumerate() {
+            println!("  [{}] {}", i + 1, url);
+        }
         println!("[ClientMiddleware] Ready to forward requests...\n");
 
         for stream in listener.incoming() {
@@ -113,9 +117,9 @@ impl ClientMiddleware {
 
                     println!("[ClientMiddleware] New connection from: {}", peer_addr);
 
-                    let server_url = self.server_url.clone();
+                    let server_urls = self.server_urls.clone();
                     thread::spawn(move || {
-                        if let Err(e) = Self::handle_client_request(stream, &server_url) {
+                        if let Err(e) = Self::handle_client_request(stream, &server_urls) {
                             eprintln!("[ClientMiddleware] Error handling request: {}", e);
                         }
                     });
@@ -129,7 +133,12 @@ impl ClientMiddleware {
         Ok(())
     }
 
-    fn handle_client_request(stream: TcpStream, server_url: &str) -> Result<(), Box<dyn Error>> {
+    fn handle_client_request(
+        stream: std::net::TcpStream,
+        server_urls: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{BufRead, BufReader, Write};
+
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
 
@@ -155,12 +164,12 @@ impl ClientMiddleware {
                 };
 
                 println!(
-                    "[ClientMiddleware] [Req #{}] Forwarding to server middleware...",
+                    "[ClientMiddleware] [Req #{}] Processing request...",
                     request_id
                 );
 
-                // Forward to server middleware (blocks until response)
-                Self::forward_to_server(server_url, request)
+                // Forward to appropriate handler
+                Self::forward_to_servers(server_urls, request)
             }
             Err(e) => {
                 eprintln!("[ClientMiddleware] Invalid request format: {}", e);
@@ -182,22 +191,200 @@ impl ClientMiddleware {
         Ok(())
     }
 
-    fn forward_to_server(server_url: &str, request: ClientRequest) -> MiddlewareResponse {
+    fn forward_to_servers(server_urls: &[String], request: ClientRequest) -> MiddlewareResponse {
         match request {
             ClientRequest::EncryptImage {
                 request_id,
                 image_path,
             } => {
-                // Forward encryption to server
-                Self::send_encrypt_request(server_url, request_id, &image_path)
+                // Forward encryption to ALL servers and wait for first response
+                Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path)
             }
             ClientRequest::DecryptImage {
                 request_id,
                 image_path,
             } => {
-                // Handle decryption locally (don't forward to server)
+                // Handle decryption locally (no server needed)
                 Self::decrypt_image_locally(request_id, &image_path)
             }
+        }
+    }
+    /// Send encryption request to ALL servers simultaneously
+    /// Returns the FIRST successful response
+    fn send_encrypt_to_multiple_servers(
+        server_urls: &[String],
+        request_id: u64,
+        image_path: &str,
+    ) -> MiddlewareResponse {
+        use std::fs;
+        use std::path::Path;
+
+        // Validate file exists
+        if !Path::new(image_path).exists() {
+            return MiddlewareResponse::error(request_id, "Image file not found");
+        }
+
+        // Read file once (shared by all threads)
+        let file_data = match fs::read(image_path) {
+            Ok(data) => data,
+            Err(e) => {
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to read file: {}", e),
+                );
+            }
+        };
+
+        let filename = Path::new(image_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes)",
+            request_id,
+            server_urls.len(),
+            file_data.len()
+        );
+
+        // Shared response container (first successful response wins)
+        let response: Arc<Mutex<Option<MiddlewareResponse>>> = Arc::new(Mutex::new(None));
+        let mut handles = vec![];
+
+        // Launch parallel requests to all servers
+        for (index, server_url) in server_urls.iter().enumerate() {
+            let server_url = server_url.clone();
+            let file_data = file_data.clone();
+            let filename = filename.clone();
+            let response = Arc::clone(&response);
+
+            let handle = thread::spawn(move || {
+                println!(
+                    "[ClientMiddleware] [Req #{}] [Server {}] Sending to {}",
+                    request_id,
+                    index + 1,
+                    server_url
+                );
+
+                // Try to send to this server
+                match Self::send_encrypt_to_single_server(
+                    &server_url,
+                    request_id,
+                    &filename,
+                    &file_data,
+                ) {
+                    Ok(server_response) => {
+                        // Try to set as the winning response
+                        let mut response_lock = response.lock().unwrap();
+                        if response_lock.is_none() {
+                            println!(
+                                "[ClientMiddleware] [Req #{}] [Server {}] ✓ FIRST RESPONSE (Winner!)",
+                                request_id,
+                                index + 1
+                            );
+                            *response_lock = Some(server_response);
+                        } else {
+                            println!(
+                                "[ClientMiddleware] [Req #{}] [Server {}] ✓ Success (but too late)",
+                                request_id,
+                                index + 1
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ClientMiddleware] [Req #{}] [Server {}] ✗ Failed: {}",
+                            request_id,
+                            index + 1,
+                            e
+                        );
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete (with timeout)
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        // Return the first successful response, or error if all failed
+        let final_response = response.lock().unwrap();
+        match final_response.as_ref() {
+            Some(resp) => {
+                println!(
+                    "[ClientMiddleware] [Req #{}] Broadcasting complete - got response!",
+                    request_id
+                );
+                resp.clone()
+            }
+            None => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] All servers failed to respond",
+                    request_id
+                );
+                MiddlewareResponse::error(request_id, "All servers failed to process the request")
+            }
+        }
+    }
+
+    fn send_encrypt_to_single_server(
+        server_url: &str,
+        request_id: u64,
+        filename: &str,
+        file_data: &[u8],
+    ) -> Result<MiddlewareResponse, Box<dyn std::error::Error>> {
+        use base64::{Engine as _, engine::general_purpose};
+
+        // Create multipart form using reqwest blocking client
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30)) // 30 second timeout
+            .build()?;
+
+        let url = format!("{}/encrypt", server_url);
+
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("request_id", request_id.to_string())
+            .text("filename", filename.to_string())
+            .part(
+                "file",
+                reqwest::blocking::multipart::Part::bytes(file_data.to_vec())
+                    .file_name(filename.to_string()),
+            );
+
+        // Send HTTP POST request
+        let response = client.post(&url).multipart(form).send()?;
+
+        // Parse response
+        let server_resp: ServerResponse = response.json()?;
+
+        if server_resp.status == "success" {
+            // Save returned file if present
+            if let (Some(file_data_b64), Some(output_filename)) =
+                (&server_resp.file_data, &server_resp.output_filename)
+            {
+                let file_data = general_purpose::STANDARD.decode(file_data_b64)?;
+                let output_path = format!("./{}", output_filename);
+
+                std::fs::write(&output_path, file_data)?;
+
+                return Ok(MiddlewareResponse::success(
+                    request_id,
+                    &server_resp.message,
+                    Some(output_path),
+                ));
+            }
+
+            Ok(MiddlewareResponse::success(
+                request_id,
+                &server_resp.message,
+                server_resp.output_filename.clone(),
+            ))
+        } else {
+            Err(format!("Server returned error: {}", server_resp.message).into())
         }
     }
 
@@ -384,8 +571,10 @@ impl ClientMiddleware {
                                                 e
                                             );
                                         } else {
-                                            println!("[ClientMiddleware] [Req #{}] Saved encrypted file: {}", 
-                                                     request_id, output_path);
+                                            println!(
+                                                "[ClientMiddleware] [Req #{}] Saved encrypted file: {}",
+                                                request_id, output_path
+                                            );
                                         }
 
                                         return MiddlewareResponse::success(
@@ -421,6 +610,4 @@ impl ClientMiddleware {
             ),
         }
     }
-
-    
 }
