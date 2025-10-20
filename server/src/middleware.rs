@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use sysinfo::System;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
 // =======================================
@@ -303,21 +304,22 @@ impl ServerMiddleware {
 
         Ok(())
     }
-
-    /// Start election process for a request
-    /// Broadcasts priority to all peers and waits for higher priority announcements
     pub async fn start_election(&self, request_id: u64) -> ElectionResult {
+        // Calculate dynamic priority based on system resources
+        let dynamic_priority = self.calculate_dynamic_priority();
+
         println!(
-            "[Election] [Req #{}] Starting election (Server {}, Priority {})",
-            request_id, self.config.server_id, self.config.priority
+            "[Election] [Req #{}] Starting election (Server {}, Base Priority: {}, Dynamic Priority: {})",
+            request_id, self.config.server_id, self.config.priority, dynamic_priority
         );
 
-        // Start tracking this election
+        // Start tracking this election with dynamic priority
         self.election_tracker
-            .start_election(request_id, self.config.priority);
+            .start_election(request_id, dynamic_priority);
 
         // Broadcast priority to all peers (no response expected)
-        self.broadcast_priority(request_id).await;
+        self.broadcast_priority_with_value(request_id, dynamic_priority)
+            .await;
 
         println!(
             "[Election] [Req #{}] Listening for {}ms for higher priority announcements...",
@@ -333,13 +335,13 @@ impl ServerMiddleware {
         let result = ElectionResult {
             request_id,
             is_leader: should_process,
-            highest_priority_seen: self.config.priority,
+            highest_priority_seen: dynamic_priority,
         };
 
         if should_process {
             println!(
                 "[Election] [Req #{}] ✓ I AM THE LEADER (Server {}, Priority {})",
-                request_id, self.config.server_id, self.config.priority
+                request_id, self.config.server_id, dynamic_priority
             );
         } else {
             println!(
@@ -353,14 +355,53 @@ impl ServerMiddleware {
         result
     }
 
+    /// Calculate dynamic priority based on system resources
+    /// Priority = (Available Memory %) * 50 + (100 - CPU Load %) * 50
+    /// Higher value = better performance = higher priority
+    fn calculate_dynamic_priority(&self) -> u32 {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        // Get available memory percentage (0-100)
+        let total_memory = sys.total_memory() as f32;
+        let available_memory = sys.available_memory() as f32;
+        let memory_percent = if total_memory > 0.0 {
+            (available_memory / total_memory) * 100.0
+        } else {
+            0.0
+        };
+
+        // Get CPU load (average across all CPUs)
+        sys.refresh_cpu();
+        std::thread::sleep(std::time::Duration::from_millis(200)); // Wait for CPU stats
+        sys.refresh_cpu();
+
+        let cpu_usage: f32 =
+            sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32;
+
+        // CPU availability = 100 - usage
+        let cpu_availability = 100.0 - cpu_usage.min(100.0);
+
+        // Calculate weighted priority (50% memory, 50% CPU)
+        let priority = (memory_percent * 0.5 + cpu_availability * 0.5) as u32;
+
+        println!(
+            "[System] Server {}: Memory: {:.1}% available, CPU: {:.1}% available, Priority: {}",
+            self.config.server_id, memory_percent, cpu_availability, priority
+        );
+
+        priority
+    }
+    /// Start election process for a request
+    /// Broadcasts priority to all peers and waits for higher priority announcements
     /// Broadcast priority announcement to all peers (fire and forget, no response)
-    async fn broadcast_priority(&self, request_id: u64) {
+    async fn broadcast_priority_with_value(&self, request_id: u64, priority: u32) {
         let client = reqwest::Client::new();
 
         let announcement = PriorityAnnouncement {
             request_id,
             server_id: self.config.server_id,
-            priority: self.config.priority,
+            priority,
         };
 
         for peer in &self.config.peers {
@@ -373,8 +414,8 @@ impl ServerMiddleware {
                 match client.post(&url).json(&announcement).send().await {
                     Ok(_) => {
                         println!(
-                            "[Election] Broadcasted priority to peer {} (no response expected)",
-                            peer_id
+                            "[Election] Broadcasted priority {} to peer {} (no response expected)",
+                            announcement.priority, peer_id
                         );
                     }
                     Err(e) => {
