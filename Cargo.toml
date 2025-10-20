@@ -33,6 +33,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Random for gibberish encryption
 rand = "0.8"
 
+# System information
+sysinfo = "0.30"
+
+
+
 [[bin]]
 name = "client_app"
 path = "client/src/client_app.rs"
