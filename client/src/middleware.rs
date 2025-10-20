@@ -93,19 +93,18 @@ impl ClientMiddleware {
         }
     }
 
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&self) -> Result<(), Box<dyn Error>> {
         let addr = format!("{}:{}", self.ip, self.port);
-        let listener = std::net::TcpListener::bind(&addr)?;
+        let listener = TcpListener::bind(&addr)?;
 
         println!("========================================");
-        println!("Cloud P2P Client Middleware (Multi-Server)");
+        println!("Client Middleware ");
         println!("========================================");
-        println!("[ClientMiddleware] Listening on {}", addr);
+        println!("[ClientMiddleware] Listening on {}]\n", addr);
         println!("[ClientMiddleware] Available servers:");
         for (i, url) in self.server_urls.iter().enumerate() {
             println!("  [{}] {}", i + 1, url);
         }
-        println!("[ClientMiddleware] Ready to forward requests...\n");
 
         for stream in listener.incoming() {
             match stream {
@@ -134,11 +133,9 @@ impl ClientMiddleware {
     }
 
     fn handle_client_request(
-        stream: std::net::TcpStream,
+        stream: TcpStream,
         server_urls: &[String],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::{BufRead, BufReader, Write};
-
+    ) -> Result<(), Box<dyn Error>> {
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
 
@@ -279,14 +276,14 @@ impl ClientMiddleware {
                         let mut response_lock = response.lock().unwrap();
                         if response_lock.is_none() {
                             println!(
-                                "[ClientMiddleware] [Req #{}] [Server {}] ✓ FIRST RESPONSE (Winner!)",
+                                "[ClientMiddleware] [Req #{}] [Server {}] FIRST RESPONSE (Winner!)",
                                 request_id,
                                 index + 1
                             );
                             *response_lock = Some(server_response);
                         } else {
                             println!(
-                                "[ClientMiddleware] [Req #{}] [Server {}] ✓ Success (but too late)",
+                                "[ClientMiddleware] [Req #{}] [Server {}] Success (but too late)",
                                 request_id,
                                 index + 1
                             );
@@ -294,7 +291,7 @@ impl ClientMiddleware {
                     }
                     Err(e) => {
                         eprintln!(
-                            "[ClientMiddleware] [Req #{}] [Server {}] ✗ Failed: {}",
+                            "[ClientMiddleware] [Req #{}] [Server {}] Failed: {}",
                             request_id,
                             index + 1,
                             e
@@ -336,9 +333,7 @@ impl ClientMiddleware {
         request_id: u64,
         filename: &str,
         file_data: &[u8],
-    ) -> Result<MiddlewareResponse, Box<dyn std::error::Error>> {
-        use base64::{Engine as _, engine::general_purpose};
-
+    ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // Create multipart form using reqwest blocking client
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30)) // 30 second timeout
@@ -493,120 +488,6 @@ impl ClientMiddleware {
             Err(e) => MiddlewareResponse::error(
                 request_id,
                 &format!("Failed to save recovered image: {}", e),
-            ),
-        }
-    }
-    fn send_encrypt_request(
-        server_url: &str,
-        request_id: u64,
-        image_path: &str,
-    ) -> MiddlewareResponse {
-        // Validate file exists
-        if !Path::new(image_path).exists() {
-            return MiddlewareResponse::error(request_id, "Image file not found");
-        }
-
-        println!(
-            "[ClientMiddleware] [Req #{}] Reading file: {}",
-            request_id, image_path
-        );
-
-        // Read file
-        let file_data = match fs::read(image_path) {
-            Ok(data) => data,
-            Err(e) => {
-                return MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to read file: {}", e),
-                );
-            }
-        };
-
-        let filename = Path::new(image_path)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-
-        println!(
-            "[ClientMiddleware] [Req #{}] Sending {} bytes to server",
-            request_id,
-            file_data.len()
-        );
-
-        // Create multipart form using reqwest blocking client
-        let client = reqwest::blocking::Client::new();
-        let url = format!("{}/encrypt", server_url);
-
-        let form = reqwest::blocking::multipart::Form::new()
-            .text("request_id", request_id.to_string())
-            .text("filename", filename.clone())
-            .part(
-                "file",
-                reqwest::blocking::multipart::Part::bytes(file_data).file_name(filename),
-            );
-
-        // Send HTTP POST request (blocks until response)
-        match client.post(&url).multipart(form).send() {
-            Ok(response) => {
-                match response.json::<ServerResponse>() {
-                    Ok(server_resp) => {
-                        println!(
-                            "[ClientMiddleware] [Req #{}] Received response from server: {}",
-                            request_id, server_resp.status
-                        );
-
-                        if server_resp.status == "success" {
-                            // Save returned file if present
-                            if let (Some(file_data_b64), Some(output_filename)) =
-                                (&server_resp.file_data, &server_resp.output_filename)
-                            {
-                                match general_purpose::STANDARD.decode(file_data_b64) {
-                                    Ok(file_data) => {
-                                        let output_path = format!("./{}", output_filename);
-
-                                        if let Err(e) = fs::write(&output_path, file_data) {
-                                            eprintln!(
-                                                "[ClientMiddleware] Failed to save file: {}",
-                                                e
-                                            );
-                                        } else {
-                                            println!(
-                                                "[ClientMiddleware] [Req #{}] Saved encrypted file: {}",
-                                                request_id, output_path
-                                            );
-                                        }
-
-                                        return MiddlewareResponse::success(
-                                            request_id,
-                                            &server_resp.message,
-                                            Some(output_path),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[ClientMiddleware] Base64 decode error: {}", e);
-                                    }
-                                }
-                            }
-
-                            MiddlewareResponse::success(
-                                request_id,
-                                &server_resp.message,
-                                server_resp.output_filename.clone(),
-                            )
-                        } else {
-                            MiddlewareResponse::error(request_id, &server_resp.message)
-                        }
-                    }
-                    Err(e) => MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to parse server response: {}", e),
-                    ),
-                }
-            }
-            Err(e) => MiddlewareResponse::error(
-                request_id,
-                &format!("Failed to send request to server: {}", e),
             ),
         }
     }

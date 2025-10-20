@@ -1,11 +1,3 @@
-// =======================================
-// client.rs - Async Version
-// Cloud P2P Controlled Image Sharing Project
-// =======================================
-//
-// Now supports background request processing!
-// You can submit multiple requests without waiting.
-//
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -15,9 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// ---------------------------------------
 // Data Structures
-// ---------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientMetadata {
@@ -48,9 +38,7 @@ pub enum RequestStatus {
     Failed(String),
 }
 
-// ---------------------------------------
 // Request Tracker
-// ---------------------------------------
 
 pub struct RequestTracker {
     requests: Arc<Mutex<HashMap<u64, RequestStatus>>>,
@@ -104,9 +92,7 @@ impl RequestTracker {
     }
 }
 
-// ---------------------------------------
 // Async Client Definition
-// ---------------------------------------
 
 pub struct Client {
     pub metadata: ClientMetadata,
@@ -305,7 +291,7 @@ impl Client {
     /// Interactive CLI
     pub fn start_ui(&self) {
         println!("========================================");
-        println!("Cloud P2P Image Sharing Client (Async)");
+        println!("Client ");
         println!("========================================");
         println!("Welcome, {}!", self.metadata.username);
         println!("Middleware: {}", self.middleware_addr);
@@ -316,7 +302,7 @@ impl Client {
         println!("  list                     - List all requests");
         println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
-        println!("========================================\n");
+        println!("========================================");
 
         loop {
             print!("> ");
@@ -333,15 +319,15 @@ impl Client {
             match tokens[0] {
                 "encrypt" if tokens.len() == 2 => match self.request_encryption(tokens[1]) {
                     Ok(id) => {
-                        println!("✓ Request #{} queued (background processing)", id);
+                        println!("Request #{id} queued (background processing)");
                     }
-                    Err(e) => eprintln!("✗ Error: {}", e),
+                    Err(e) => eprintln!("Error: {e}"),
                 },
                 "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
                     Ok(id) => {
-                        println!("✓ Request #{} queued (background processing)", id);
+                        println!("Request #{id} queued (background processing)");
                     }
-                    Err(e) => eprintln!("✗ Error: {}", e),
+                    Err(e) => eprintln!("Error: {e}"),
                 },
                 "status" if tokens.len() == 2 => {
                     if let Ok(id) = tokens[1].parse::<u64>() {
@@ -355,12 +341,12 @@ impl Client {
                 }
                 "pending" => {
                     let count = self.tracker.pending_count();
-                    println!("Pending/In-Progress requests: {}", count);
+                    println!("Pending/In-Progress requests: {count}");
                 }
                 "exit" => {
                     let pending = self.tracker.pending_count();
                     if pending > 0 {
-                        println!("Warning: {} request(s) still pending!", pending);
+                        println!("Warning: {pending} request(s) still pending!");
                         print!("Exit anyway? (y/n): ");
                         io::stdout().flush().unwrap();
 
