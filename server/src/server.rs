@@ -475,7 +475,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Add other server instances here
             PeerInfo {
                 server_id: 1,
-                address: "10.40.40.202:8001".to_string(), // Server 2's peer port
+                address: "10.40.50.186:8001".to_string(), // Server 2's peer port
             },
             // PeerInfo {
             //     server_id: 3,

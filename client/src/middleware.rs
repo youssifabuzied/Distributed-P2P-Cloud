@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use stegano_core::api::unveil::prepare as extract_prepare;
 // ---------------------------------------
 // Shared Structures
@@ -245,86 +245,100 @@ impl ClientMiddleware {
             file_data.len()
         );
 
-        // Shared response container (first successful response wins)
-        let response: Arc<Mutex<Option<MiddlewareResponse>>> = Arc::new(Mutex::new(None));
-        let mut handles = vec![];
+        // Keep retrying until success
+        loop {
+            let start_time = Instant::now();
+            let response: Arc<Mutex<Option<MiddlewareResponse>>> = Arc::new(Mutex::new(None));
+            let mut handles = vec![];
 
-        // Launch parallel requests to all servers
-        for (index, server_url) in server_urls.iter().enumerate() {
-            let server_url = server_url.clone();
-            let file_data = file_data.clone();
-            let filename = filename.clone();
-            let response = Arc::clone(&response);
+            // Launch parallel requests to all servers
+            for (index, server_url) in server_urls.iter().enumerate() {
+                let server_url = server_url.clone();
+                let file_data = file_data.clone();
+                let filename = filename.clone();
+                let response = Arc::clone(&response);
 
-            let handle = thread::spawn(move || {
-                println!(
-                    "[ClientMiddleware] [Req #{}] [Server {}] Sending to {}",
-                    request_id,
-                    index + 1,
-                    server_url
-                );
+                let handle = thread::spawn(move || {
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [Server {}] Sending to {}",
+                        request_id,
+                        index + 1,
+                        server_url
+                    );
 
-                // Try to send to this server
-                match Self::send_encrypt_to_single_server(
-                    &server_url,
-                    request_id,
-                    &filename,
-                    &file_data,
-                ) {
-                    Ok(server_response) => {
-                        // Try to set as the winning response
-                        let mut response_lock = response.lock().unwrap();
-                        if response_lock.is_none() {
-                            println!(
-                                "[ClientMiddleware] [Req #{}] [Server {}] FIRST RESPONSE (Winner!)",
+                    match Self::send_encrypt_to_single_server(
+                        &server_url,
+                        request_id,
+                        &filename,
+                        &file_data,
+                    ) {
+                        Ok(server_response) => {
+                            if server_response.status == "OK" {
+                                let mut response_lock = response.lock().unwrap();
+                                if response_lock.is_none() {
+                                    println!(
+                                        "[ClientMiddleware] [Req #{}] [Server {}] FIRST OK RESPONSE (Winner!)",
+                                        request_id,
+                                        index + 1
+                                    );
+                                    *response_lock = Some(server_response);
+                                } else {
+                                    println!(
+                                        "[ClientMiddleware] [Req #{}] [Server {}] OK (but too late)",
+                                        request_id,
+                                        index + 1
+                                    );
+                                }
+                            } else {
+                                println!(
+                                    "[ClientMiddleware] [Req #{}] [Server {}] Response not OK",
+                                    request_id,
+                                    index + 1
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ClientMiddleware] [Req #{}] [Server {}] Failed: {}",
                                 request_id,
-                                index + 1
-                            );
-                            *response_lock = Some(server_response);
-                        } else {
-                            println!(
-                                "[ClientMiddleware] [Req #{}] [Server {}] Success (but too late)",
-                                request_id,
-                                index + 1
+                                index + 1,
+                                e
                             );
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[ClientMiddleware] [Req #{}] [Server {}] Failed: {}",
-                            request_id,
-                            index + 1,
-                            e
+                });
+
+                handles.push(handle);
+            }
+
+            // Wait for threads or 40s timeout
+            while start_time.elapsed() < Duration::from_secs(30) {
+                {
+                    let response_lock = response.lock().unwrap();
+                    if let Some(resp) = response_lock.as_ref() {
+                        println!(
+                            "[ClientMiddleware] [Req #{}] Broadcasting complete - got response!",
+                            request_id
                         );
+                        return resp.clone();
                     }
                 }
-            });
-
-            handles.push(handle);
-        }
-
-        // Wait for all threads to complete (with timeout)
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        // Return the first successful response, or error if all failed
-        let final_response = response.lock().unwrap();
-        match final_response.as_ref() {
-            Some(resp) => {
-                println!(
-                    "[ClientMiddleware] [Req #{}] Broadcasting complete - got response!",
-                    request_id
-                );
-                resp.clone()
+                thread::sleep(Duration::from_millis(500)); // check every 0.5s
             }
-            None => {
-                eprintln!(
-                    "[ClientMiddleware] [Req #{}] All servers failed to respond",
-                    request_id
-                );
-                MiddlewareResponse::error(request_id, "All servers failed to process the request")
+
+            // Timeout: no OK response
+            println!(
+                "[ClientMiddleware] [Req #{}] Timeout after 40s - retrying broadcast...",
+                request_id
+            );
+
+            // Make sure all threads finish cleanly before retry
+            for handle in handles {
+                let _ = handle.join();
             }
+
+            // Wait briefly before retrying (optional)
+            thread::sleep(Duration::from_secs(2));
         }
     }
 
