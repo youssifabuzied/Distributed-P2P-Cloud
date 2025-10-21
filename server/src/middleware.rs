@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
+use rand::Rng;
 // =======================================
 // Configuration Structures
 // =======================================
@@ -51,6 +52,17 @@ pub struct ServerConfig {
 
     /// Election timeout in milliseconds (listen period)
     pub election_timeout_ms: u64, // 5000 (5 seconds)
+
+    /// Failure simulation port (for Port 8002)
+    pub failure_port: u16,
+
+    /// Failure check interval in seconds
+    pub failure_check_interval_secs: u64,
+
+    /// Recovery timeout in seconds
+    pub recovery_timeout_secs: u64,
+
+    pub enable_failure_simulation: bool,
 }
 
 /// Information about a peer server
@@ -210,6 +222,80 @@ impl AppState {
 }
 
 // =======================================
+// Failure Simulation Structures
+// =======================================
+
+/// Failure announcement message for Port 8002
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FailureAnnouncement {
+    pub server_id: u64,
+    pub failure_score: u32,
+    pub timestamp: u64,
+}
+
+/// Tracks failure state of this server
+#[derive(Debug, Clone)]
+pub struct FailureState {
+    pub is_failed: bool,
+    pub failed_at: Option<Instant>,
+}
+
+/// Tracks failure elections
+pub struct FailureElectionTracker {
+    /// Current failure scores from all servers
+    scores: Arc<Mutex<HashMap<u64, u32>>>,
+    /// This server's failure state
+    state: Arc<Mutex<FailureState>>,
+}
+
+impl FailureElectionTracker {
+    pub fn new() -> Self {
+        FailureElectionTracker {
+            scores: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(FailureState {
+                is_failed: false,
+                failed_at: None,
+            })),
+        }
+    }
+
+    /// Record a failure score from a peer
+    pub fn record_score(&self, server_id: u64, score: u32) {
+        self.scores.lock().unwrap().insert(server_id, score);
+    }
+
+    /// Check if this server is currently failed
+    pub fn is_failed(&self) -> bool {
+        self.state.lock().unwrap().is_failed
+    }
+
+    /// Mark this server as failed
+    pub fn mark_failed(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.is_failed = true;
+        state.failed_at = Some(Instant::now());
+    }
+
+    /// Mark this server as recovered
+    pub fn mark_recovered(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.is_failed = false;
+        state.failed_at = None;
+        // Clear old scores
+        self.scores.lock().unwrap().clear();
+    }
+
+    /// Get the highest failure score among all servers
+    pub fn get_highest_score(&self) -> (u64, u32) {
+        let scores = self.scores.lock().unwrap();
+        scores
+            .iter()
+            .max_by_key(|&(_, &score)| score)
+            .map(|(&id, &score)| (id, score))
+            .unwrap_or((0, 0))
+    }
+}
+// =======================================
 // Server Middleware
 // =======================================
 
@@ -218,6 +304,7 @@ impl AppState {
 pub struct ServerMiddleware {
     pub config: ServerConfig,
     pub election_tracker: Arc<ElectionTracker>,
+    pub failure_tracker: Arc<FailureElectionTracker>,
 }
 
 impl ServerMiddleware {
@@ -226,6 +313,7 @@ impl ServerMiddleware {
         ServerMiddleware {
             config,
             election_tracker: Arc::new(ElectionTracker::new()),
+            failure_tracker: Arc::new(FailureElectionTracker::new()),  // ADD THIS LINE
         }
     }
 
@@ -233,7 +321,7 @@ impl ServerMiddleware {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Create storage directory
         fs::create_dir_all("./server_storage").await?;
-
+    
         println!("========================================");
         println!("Cloud P2P Server Middleware");
         println!("========================================");
@@ -241,13 +329,16 @@ impl ServerMiddleware {
         println!("[Server] Priority: {}", self.config.priority);
         println!("[Server] Client port: {}", self.config.client_port);
         println!("[Server] Peer port: {}", self.config.peer_port);
+        println!("[Server] Failure port: {}", self.config.failure_port);
+        println!("[Server] Failure simulation: {}", 
+            if self.config.enable_failure_simulation { "ENABLED" } else { "DISABLED" });
         println!("[Server] Peers: {}", self.config.peers.len());
         println!(
             "[Server] Election timeout: {}ms",
             self.config.election_timeout_ms
         );
         println!("========================================\n");
-
+    
         // Clone self for the peer listener
         let peer_self = self.clone();
         let peer_listener = tokio::spawn(async move {
@@ -255,16 +346,45 @@ impl ServerMiddleware {
                 eprintln!("[Server] Peer listener error: {}", e);
             }
         });
-
-        // Start client listener in main task
+    
+        // Start client listener
         let client_listener = self.start_client_listener();
-
-        // Wait for client listener (peer listener runs in background)
-        tokio::select! {
-            result = client_listener => result?,
-            _ = peer_listener => {},
+    
+        // Conditionally start failure simulation
+        if self.config.enable_failure_simulation {
+            println!("[Server] Starting failure simulation subsystem...\n");
+            
+            // Clone self for failure listener
+            let failure_self = self.clone();
+            let failure_listener = tokio::spawn(async move {
+                if let Err(e) = failure_self.start_failure_listener().await {
+                    eprintln!("[Server] Failure listener error: {}", e);
+                }
+            });
+    
+            // Start failure election loop
+            let election_self = Arc::new(self.clone());
+            let failure_election = tokio::spawn(async move {
+                election_self.run_failure_election_loop().await;
+            });
+    
+            // Wait for any task to complete (all run in background)
+            tokio::select! {
+                result = client_listener => result?,
+                _ = peer_listener => {},
+                _ = failure_listener => {},
+                _ = failure_election => {},
+            }
+        } else {
+            println!("[Server] Failure simulation disabled - running normal mode\n");
+            
+            // Only run client and peer listeners
+            tokio::select! {
+                result = client_listener => result?,
+                _ = peer_listener => {},
+            }
         }
-
+    
         Ok(())
     }
 
@@ -425,6 +545,169 @@ impl ServerMiddleware {
             });
         }
     }
+        /// Calculate failure score (higher = more likely to fail)
+    /// Formula: (CPU Load × 0.3) + (Memory Usage × 0.3) + (Random × 0.4)
+    fn calculate_failure_score(&self) -> u32 {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        // Get CPU usage
+        sys.refresh_cpu();
+        thread::sleep(Duration::from_millis(200));
+        sys.refresh_cpu();
+        let cpu_usage: f32 =
+            sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32;
+
+        // Get memory usage percentage
+        let total_memory = sys.total_memory() as f32;
+        let used_memory = sys.used_memory() as f32;
+        let memory_usage_percent = if total_memory > 0.0 {
+            (used_memory / total_memory) * 100.0
+        } else {
+            0.0
+        };
+
+        // Add random factor for unpredictability
+        let mut rng = rand::thread_rng();
+        let random_factor: f32 = rng.gen_range(0.0..100.0);
+
+        // Calculate weighted failure score
+        let failure_score =
+            (cpu_usage * 0.3) + (memory_usage_percent * 0.3) + (random_factor * 0.4);
+
+        println!(
+            "[Failure] Server {}: CPU: {:.1}%, Memory: {:.1}%, Random: {:.1}, Score: {:.0}",
+            self.config.server_id, cpu_usage, memory_usage_percent, random_factor, failure_score
+        );
+
+        failure_score as u32
+    }
+
+    /// Start failure election listener (Port 8002)
+    async fn start_failure_listener(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = format!("0.0.0.0:{}", self.config.failure_port);
+
+        let state = Arc::new(self.clone());
+
+        let app = Router::new()
+            .route("/announce_failure", post(handle_failure_announcement))
+            .with_state(state);
+
+        println!("[Server] Failure listener started on {}", addr);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+
+    /// Run failure election loop in background
+    async fn run_failure_election_loop(self: Arc<Self>) {
+        loop {
+            // Wait for the interval
+            tokio::time::sleep(Duration::from_secs(
+                self.config.failure_check_interval_secs,
+            ))
+            .await;
+    
+            // REMOVED: Skip if already failed
+            // Now server participates in elections even when failed
+    
+            println!(
+                "\n[Failure Election] Starting failure check (Server {})",
+                self.config.server_id
+            );
+    
+            // Calculate my failure score
+            let my_score = self.calculate_failure_score();
+    
+            // Record my own score
+            self.failure_tracker
+                .record_score(self.config.server_id, my_score);
+    
+            // Broadcast to all peers
+            self.broadcast_failure_score(my_score).await;
+    
+            // Wait for announcements
+            println!("[Failure Election] Listening for 3 seconds...");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+    
+            // Check if I have the highest score
+            let (winner_id, highest_score) = self.failure_tracker.get_highest_score();
+    
+            // Only initiate failure if not already failed
+            if winner_id == self.config.server_id && !self.failure_tracker.is_failed() {
+                println!(
+                    "\n[Failure Election] ⚠️  I AM FAILING (Server {}, Score: {})",
+                    self.config.server_id, my_score
+                );
+                println!("[Failure Election] Initiating controlled failure...\n");
+    
+                // Mark as failed
+                self.failure_tracker.mark_failed();
+    
+                // Spawn recovery task
+                let recovery_self = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(
+                        recovery_self.config.recovery_timeout_secs,
+                    ))
+                    .await;
+    
+                    println!(
+                        "\n[Recovery] ✓ Server {} recovering after {} seconds",
+                        recovery_self.config.server_id, recovery_self.config.recovery_timeout_secs
+                    );
+                    recovery_self.failure_tracker.mark_recovered();
+                    println!("[Recovery] Server {} back online\n", recovery_self.config.server_id);
+                });
+            } else if winner_id == self.config.server_id && self.failure_tracker.is_failed() {
+                println!(
+                    "[Failure Election] I would fail again (Score: {}), but already in failed state",
+                    my_score
+                );
+            } else {
+                println!(
+                    "[Failure Election] Server {} will fail (Score: {}), I'm safe (Score: {})",
+                    winner_id, highest_score, my_score
+                );
+            }
+        }
+    }
+
+/// Broadcast failure score to all peers
+async fn broadcast_failure_score(&self, score: u32) {
+    let client = reqwest::Client::new();
+
+    let announcement = FailureAnnouncement {
+        server_id: self.config.server_id,
+        failure_score: score,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+
+    for peer in &self.config.peers {
+        let url = format!("http://{}/announce_failure", peer.address.replace(":8001", ":8002"));
+        let announcement = announcement.clone();
+        let client = client.clone();
+        let peer_id = peer.server_id;
+
+        tokio::spawn(async move {
+            match client.post(&url).json(&announcement).send().await {
+                Ok(_) => {
+                    println!(
+                        "[Failure Election] Sent score {} to peer {}",
+                        announcement.failure_score, peer_id
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[Failure Election] Failed to send to peer {}: {}", peer_id, e);
+                }
+            }
+        });
+    }
+    }
 }
 
 // =======================================
@@ -523,6 +806,19 @@ async fn encrypt_handler(
         }
     }
 
+    // CHECK IF SERVER IS FAILED - DO THIS AFTER PARSING BUT BEFORE ANY PROCESSING
+    if middleware.failure_tracker.is_failed() {
+        println!(
+            "[Server Middleware] [Req #{}] ⚠️  Server is currently failed - rejecting request",
+            request_id
+        );
+        return Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "ERROR",
+            "message": "Server is currently in failed state"
+        })));
+    }
+
     // Validate request
     if filename.is_empty() || file_data.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -544,6 +840,19 @@ async fn encrypt_handler(
     // ========================================
     std::thread::sleep(std::time::Duration::from_millis(2000));
 
+    // CHECK AGAIN BEFORE ELECTION (request might have been queued before failure)
+    if middleware.failure_tracker.is_failed() {
+        println!(
+            "[Server Middleware] [Req #{}] ⚠️  Server failed during processing - aborting",
+            request_id
+        );
+        return Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "ERROR",
+            "message": "Server entered failed state during processing"
+        })));
+    }
+
     println!(
         "[Server Middleware] [Req #{}] Starting election (Server ID: {}, Priority: {})",
         request_id, middleware.config.server_id, middleware.config.priority
@@ -551,6 +860,19 @@ async fn encrypt_handler(
 
     // Start election: broadcast priority and wait for higher priority announcements
     let election_result = middleware.start_election(request_id).await;
+
+    // CHECK AGAIN AFTER ELECTION (server might have failed during election)
+    if middleware.failure_tracker.is_failed() {
+        println!(
+            "[Server Middleware] [Req #{}] ⚠️  Server failed during election - aborting",
+            request_id
+        );
+        return Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "ERROR",
+            "message": "Server entered failed state during election"
+        })));
+    }
 
     // If not elected as leader, ignore this request
     if !election_result.is_leader {
@@ -577,6 +899,19 @@ async fn encrypt_handler(
         "[Server Middleware] [Req #{}] ✓ ELECTED AS LEADER - processing request",
         request_id
     );
+
+    // CHECK ONE FINAL TIME BEFORE FORWARDING TO INTERNAL SERVER
+    if middleware.failure_tracker.is_failed() {
+        println!(
+            "[Server Middleware] [Req #{}] ⚠️  Server failed after winning election - aborting",
+            request_id
+        );
+        return Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "ERROR",
+            "message": "Server entered failed state after winning election"
+        })));
+    }
 
     // Build EncryptionRequest for internal server
     let encryption_request = serde_json::json!({
@@ -705,6 +1040,25 @@ async fn encrypt_handler(
             })))
         }
     }
+}
+/// Handle incoming failure announcements from peers (Port 8002)
+async fn handle_failure_announcement(
+    State(middleware): State<Arc<ServerMiddleware>>,
+    Json(announcement): Json<FailureAnnouncement>,
+) -> Json<serde_json::Value> {
+    println!(
+        "[Failure Election] Received score {} from Server {}",
+        announcement.failure_score, announcement.server_id
+    );
+
+    // Record the score
+    middleware
+        .failure_tracker
+        .record_score(announcement.server_id, announcement.failure_score);
+
+    Json(serde_json::json!({
+        "status": "received"
+    }))
 }
 
 // =======================================
