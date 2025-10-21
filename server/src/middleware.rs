@@ -25,6 +25,8 @@ use sysinfo::System;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
 use rand::Rng;
+use serde_json::json;
+use tokio::task;
 // =======================================
 // Configuration Structures
 // =======================================
@@ -628,8 +630,8 @@ impl ServerMiddleware {
             self.broadcast_failure_score(my_score).await;
     
             // Wait for announcements
-            println!("[Failure Election] Listening for 3 seconds...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            println!("[Failure Election] Listening for 40 seconds...");
+            tokio::time::sleep(Duration::from_secs(40)).await;
     
             // Check if I have the highest score
             let (winner_id, highest_score) = self.failure_tracker.get_highest_score();
@@ -778,17 +780,14 @@ async fn health_handler() -> Json<serde_json::Value> {
 /// 2. Listen for 5 seconds for higher priority
 /// 3. If higher priority received -> drop request
 /// 4. If no higher priority -> process request
-async fn encrypt_handler(
+pub async fn encrypt_handler(
     State(middleware): State<Arc<ServerMiddleware>>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     println!("[Server Middleware] Received encrypt request");
-
     let mut request_id = 0u64;
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
-
-    // Parse multipart form data
     while let Some(field) = multipart.next_field().await.unwrap() {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
@@ -806,22 +805,60 @@ async fn encrypt_handler(
         }
     }
 
-    // CHECK IF SERVER IS FAILED - DO THIS AFTER PARSING BUT BEFORE ANY PROCESSING
     if middleware.failure_tracker.is_failed() {
         println!(
-            "[Server Middleware] [Req #{}] ⚠️  Server is currently failed - rejecting request",
-            request_id
+            "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+            request_id, middleware.config.server_id
         );
-        return Ok(Json(serde_json::json!({
-            "request_id": request_id,
-            "status": "ERROR",
-            "message": "Server is currently in failed state"
-        })));
+        
+        // Hang indefinitely
+        std::future::pending::<()>().await;
+        
+        // Never reached
+        unreachable!();
+    }
+    
+    // ========================================
+    // 1. Parse multipart form data
+    // ========================================
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "request_id" => {
+                let data = field.text().await.unwrap();
+                request_id = data.parse().unwrap_or(0);
+            }
+            "filename" => {
+                filename = field.text().await.unwrap();
+            }
+            "file" => {
+                file_data = field.bytes().await.unwrap().to_vec();
+            }
+            _ => {}
+        }
     }
 
-    // Validate request
+    // ========================================
+    // 2. Check if server is failed before processing
+    // ========================================
+    if middleware.failure_tracker.is_failed() {
+        println!(
+            "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+            request_id, middleware.config.server_id
+        );
+        
+        // Hang indefinitely
+        std::future::pending::<()>().await;
+        
+        // Never reached
+        unreachable!();
+    }
+
+    // ========================================
+    // 3. Validate input
+    // ========================================
     if filename.is_empty() || file_data.is_empty() {
-        return Ok(Json(serde_json::json!({
+        return Ok(Json(json!({
             "request_id": request_id,
             "status": "ERROR",
             "message": "Missing filename or file data"
@@ -836,21 +873,21 @@ async fn encrypt_handler(
     );
 
     // ========================================
-    // ELECTION PHASE
+    // 4. Election Phase
     // ========================================
     std::thread::sleep(std::time::Duration::from_millis(2000));
 
-    // CHECK AGAIN BEFORE ELECTION (request might have been queued before failure)
     if middleware.failure_tracker.is_failed() {
         println!(
-            "[Server Middleware] [Req #{}] ⚠️  Server failed during processing - aborting",
-            request_id
+            "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+            request_id, middleware.config.server_id
         );
-        return Ok(Json(serde_json::json!({
-            "request_id": request_id,
-            "status": "ERROR",
-            "message": "Server entered failed state during processing"
-        })));
+        
+        // Hang indefinitely
+        std::future::pending::<()>().await;
+        
+        // Never reached
+        unreachable!();
     }
 
     println!(
@@ -858,30 +895,27 @@ async fn encrypt_handler(
         request_id, middleware.config.server_id, middleware.config.priority
     );
 
-    // Start election: broadcast priority and wait for higher priority announcements
     let election_result = middleware.start_election(request_id).await;
 
-    // CHECK AGAIN AFTER ELECTION (server might have failed during election)
     if middleware.failure_tracker.is_failed() {
         println!(
-            "[Server Middleware] [Req #{}] ⚠️  Server failed during election - aborting",
-            request_id
+            "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+            request_id, middleware.config.server_id
         );
-        return Ok(Json(serde_json::json!({
-            "request_id": request_id,
-            "status": "ERROR",
-            "message": "Server entered failed state during election"
-        })));
+        
+        // Hang indefinitely
+        std::future::pending::<()>().await;
+        
+        // Never reached
+        unreachable!();
     }
 
-    // If not elected as leader, ignore this request
     if !election_result.is_leader {
         println!(
             "[Server Middleware] [Req #{}] Not elected as leader - dropping request",
             request_id
         );
-
-        return Ok(Json(serde_json::json!({
+        return Ok(Json(json!({
             "request_id": request_id,
             "status": "ignored",
             "message": format!(
@@ -892,55 +926,85 @@ async fn encrypt_handler(
     }
 
     // ========================================
-    // PROCESSING PHASE (Leader Only)
+    // 5. Processing Phase (Leader Only)
     // ========================================
-
     println!(
         "[Server Middleware] [Req #{}] ✓ ELECTED AS LEADER - processing request",
         request_id
     );
 
-    // CHECK ONE FINAL TIME BEFORE FORWARDING TO INTERNAL SERVER
+    // ✅ Added failure check before forwarding
     if middleware.failure_tracker.is_failed() {
         println!(
-            "[Server Middleware] [Req #{}] ⚠️  Server failed after winning election - aborting",
-            request_id
+            "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+            request_id, middleware.config.server_id
         );
-        return Ok(Json(serde_json::json!({
-            "request_id": request_id,
-            "status": "ERROR",
-            "message": "Server entered failed state after winning election"
-        })));
+        
+        // Hang indefinitely
+        std::future::pending::<()>().await;
+        
+        // Never reached
+        unreachable!();
     }
 
-    // Build EncryptionRequest for internal server
-    let encryption_request = serde_json::json!({
+    let encryption_request = json!({
         "request_id": request_id,
         "filename": filename,
         "file_data": file_data,
     });
 
-    // Forward to internal server (TCP)
     let server_addr = format!("127.0.0.1:{}", middleware.config.internal_server_port);
+    let server_id = middleware.config.server_id;
+    let failure_tracker = middleware.failure_tracker.clone(); // ✅ Clone tracker for use in blocking task
 
     println!(
         "[Server Middleware] [Req #{}] Forwarding to internal server at {}",
         request_id, server_addr
     );
 
-    let server_id = middleware.config.server_id;
-
-    match tokio::task::spawn_blocking(move || {
+    // ========================================
+    // 6. Forward to Internal Server (with extra failure checks)
+    // ========================================
+    match task::spawn_blocking(move || {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpStream;
 
-        // Connect to internal server
+        // ✅ Check before connecting
+        if failure_tracker.is_failed() {
+            println!(
+                "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+                request_id, middleware.config.server_id
+            );
+            
+            // Hang indefinitely
+            loop {
+                std::thread::park();
+            }            
+            // Never reached
+            unreachable!();
+        }
+
         let mut stream = match TcpStream::connect(&server_addr) {
             Ok(s) => s,
             Err(e) => return Err(format!("Failed to connect to internal server: {}", e)),
         };
 
-        // Serialize and send request
+        // ✅ Check before sending
+        if failure_tracker.is_failed() {
+            println!(
+                "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+                request_id, middleware.config.server_id
+            );
+            
+            // Hang indefinitely
+            loop {
+                std::thread::park();
+            }            
+            // Never reached
+            unreachable!();
+        }
+
+        // Send JSON request
         let req_str = serde_json::to_string(&encryption_request).unwrap();
         if let Err(e) = stream.write_all(req_str.as_bytes()) {
             return Err(format!("Failed to send request: {}", e));
@@ -949,7 +1013,22 @@ async fn encrypt_handler(
             return Err(format!("Failed to send newline: {}", e));
         }
 
-        // Read response
+        // ✅ Check again before reading response
+        if failure_tracker.is_failed() {
+            println!(
+                "[Failure] [Req #{}] Server {} FAILED - hanging connection",
+                request_id, middleware.config.server_id
+            );
+            
+            // Hang indefinitely
+            loop {
+                std::thread::park();
+            }            
+            // Never reached
+            unreachable!();
+        }
+
+        // Read response from internal server
         let mut reader = BufReader::new(stream);
         let mut response_line = String::new();
         if let Err(e) = reader.read_line(&mut response_line) {
@@ -961,14 +1040,12 @@ async fn encrypt_handler(
     .await
     {
         Ok(Ok(response_line)) => {
-            // Parse EncryptionResponse from internal server
             match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
                 Ok(resp_json) => {
                     let status = resp_json["status"].as_str().unwrap_or("ERROR");
                     let message = resp_json["message"].as_str().unwrap_or("");
                     let output_filename = format!("encrypted_{}", filename);
 
-                    // Extract encrypted data from response
                     let encrypted_data = resp_json["encrypted_data"]
                         .as_array()
                         .map(|arr| {
@@ -985,7 +1062,6 @@ async fn encrypt_handler(
                         );
                     }
 
-                    // Encode as base64 for JSON transmission
                     let base64_data = base64_helper::encode(&encrypted_data);
 
                     println!(
@@ -994,7 +1070,7 @@ async fn encrypt_handler(
                         encrypted_data.len()
                     );
 
-                    Ok(Json(serde_json::json!({
+                    Ok(Json(json!({
                         "request_id": request_id,
                         "status": status,
                         "message": message,
@@ -1009,7 +1085,7 @@ async fn encrypt_handler(
                         "[Server Middleware] [Req #{}] Failed to parse server response: {}",
                         request_id, e
                     );
-                    Ok(Json(serde_json::json!({
+                    Ok(Json(json!({
                         "request_id": request_id,
                         "status": "ERROR",
                         "message": format!("Failed to parse server response: {}", e)
@@ -1022,10 +1098,10 @@ async fn encrypt_handler(
                 "[Server Middleware] [Req #{}] Server communication error: {}",
                 request_id, e
             );
-            Ok(Json(serde_json::json!({
+            Ok(Json(json!({
                 "request_id": request_id,
                 "status": "ERROR",
-                "message": format!("Server communication error: {}", e)
+                "message": e
             })))
         }
         Err(e) => {
@@ -1033,7 +1109,7 @@ async fn encrypt_handler(
                 "[Server Middleware] [Req #{}] Task join error: {}",
                 request_id, e
             );
-            Ok(Json(serde_json::json!({
+            Ok(Json(json!({
                 "request_id": request_id,
                 "status": "ERROR",
                 "message": format!("Internal error: {}", e)
