@@ -376,7 +376,7 @@ impl ClientMiddleware {
                 (&server_resp.file_data, &server_resp.output_filename)
             {
                 let file_data = general_purpose::STANDARD.decode(file_data_b64)?;
-                let output_path = format!("./{}", output_filename);
+                let output_path = format!("./trash/{}", output_filename);
 
                 std::fs::write(&output_path, file_data)?;
 

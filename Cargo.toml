@@ -41,5 +41,10 @@ name = "client_app"
 path = "client/src/client_app.rs"
 
 [[bin]]
+name = "stress_test_client"
+path = "client/src/stress_test_client.rs"
+
+[[bin]]
 name = "server"
 path = "server/src/server.rs"
+
