@@ -312,7 +312,7 @@ impl ClientMiddleware {
             }
 
             // Wait for threads or 40s timeout
-            while start_time.elapsed() < Duration::from_secs(30) {
+            while start_time.elapsed() < Duration::from_secs(60) {
                 {
                     let response_lock = response.lock().unwrap();
                     if let Some(resp) = response_lock.as_ref() {
@@ -350,7 +350,7 @@ impl ClientMiddleware {
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // Create multipart form using reqwest blocking client
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30)) // 30 second timeout
+            .timeout(Duration::from_secs(60)) // 30 second timeout
             .build()?;
 
         let url = format!("{}/encrypt", server_url);

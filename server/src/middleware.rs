@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
+use axum::extract::DefaultBodyLimit;
 // =======================================
 // Configuration Structures
 // =======================================
@@ -295,6 +296,7 @@ impl ServerMiddleware {
             .route("/", get(root_handler))
             .route("/health", get(health_handler))
             .route("/encrypt", post(encrypt_handler))
+            .layer(DefaultBodyLimit::max(1024 * 1024 * 100)) // 100 MB
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
