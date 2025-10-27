@@ -474,15 +474,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         peers: vec![
             // Add other server instances here
             PeerInfo {
-                server_id: 1,
-                address: "10.40.0.70:8001".to_string(), // Server 2's peer port
-            },
-            PeerInfo {
                 server_id: 2,
                 address: "10.40.5.200:8001".to_string(),
             },
+            PeerInfo {
+                server_id: 3,
+                address: "10.40.50.186:8001".to_string(),
+            },
         ],
         election_timeout_ms: 7000, // Wait 2 seconds for election responses
+        failure_port: 8002,                    // ADD THIS
+        failure_check_interval_secs: 10,       // ADD THIS (check every 45 seconds)
+        recovery_timeout_secs: 10,  
+        enable_failure_simulation: true,  // ADD THIS - set to false to disable
     };
 
     println!("\n========================================");
