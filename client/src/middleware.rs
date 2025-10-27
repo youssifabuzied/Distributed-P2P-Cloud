@@ -312,7 +312,7 @@ impl ClientMiddleware {
             }
 
             // Wait for threads or 40s timeout
-            while start_time.elapsed() < Duration::from_secs(60) {
+            while start_time.elapsed() < Duration::from_secs(300) {
                 {
                     let response_lock = response.lock().unwrap();
                     if let Some(resp) = response_lock.as_ref() {

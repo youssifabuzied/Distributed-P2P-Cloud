@@ -475,6 +475,7 @@ mod config {
                 middleware_ip: "127.0.0.1".to_string(),
                 server_urls: vec![
                     "http://127.0.0.1:8000".to_string(),
+                    "http://10.40.0.70:8000".to_string(),
                 ],
             })
         }

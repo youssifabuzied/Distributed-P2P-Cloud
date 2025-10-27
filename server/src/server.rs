@@ -466,17 +466,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ✨ Server configuration
     // Change these values for different server instances
     let config = ServerConfig {
-        server_id: 1,               // ← Unique server ID
+        server_id: 2,               // ← Unique server ID
         priority: 20,               // ← Election priority (higher wins)
         client_port: 8000,          // ← HTTP port for client middleware
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
         peers: vec![
             // Add other server instances here
-            // PeerInfo {
-            //     server_id: 2,
-            //     address: "10.40.5.200:8001".to_string(),
-            // },
+            PeerInfo {
+                server_id: 1,
+                address: "10.40.0.70:8001".to_string(),
+            },
             // PeerInfo {
             //     server_id: 3,
             //     address: "10.40.50.186:8001".to_string(),
@@ -486,7 +486,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         failure_port: 8002,                    // ADD THIS
         failure_check_interval_secs: 10,       // ADD THIS (check every 45 seconds)
         recovery_timeout_secs: 10,  
-        enable_failure_simulation: false,  // ADD THIS - set to false to disable
+        enable_failure_simulation: true,  // ADD THIS - set to false to disable
     };
 
     println!("\n========================================");
