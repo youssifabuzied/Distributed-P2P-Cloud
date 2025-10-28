@@ -312,7 +312,7 @@ impl ClientMiddleware {
             }
 
             // Wait for threads or 40s timeout
-            while start_time.elapsed() < Duration::from_secs(300) {
+            while start_time.elapsed() < Duration::from_secs(80) {
                 {
                     let response_lock = response.lock().unwrap();
                     if let Some(resp) = response_lock.as_ref() {
@@ -376,7 +376,7 @@ impl ClientMiddleware {
                 (&server_resp.file_data, &server_resp.output_filename)
             {
                 let file_data = general_purpose::STANDARD.decode(file_data_b64)?;
-                let output_path = format!("./trash/{}", output_filename);
+                let output_path = format!("../../trash/{}", output_filename);
 
                 std::fs::write(&output_path, file_data)?;
 

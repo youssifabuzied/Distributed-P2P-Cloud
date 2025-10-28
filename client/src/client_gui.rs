@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use image;
 use rfd::FileDialog;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,9 @@ struct GuiApp {
     cmd_tx: Sender<Command>,
     evt_rx: Receiver<UiEvent>,
     selected_file: Option<PathBuf>,
+    original_image: Option<egui::TextureHandle>,
+    encrypted_image: Option<egui::TextureHandle>,
+    current_request_id: Option<u64>,
 }
 
 impl GuiApp {
@@ -38,6 +42,38 @@ impl GuiApp {
             cmd_tx,
             evt_rx,
             selected_file: None,
+            original_image: None,
+            encrypted_image: None,
+            current_request_id: None,
+        }
+    }
+
+    fn load_image(&self, path: &PathBuf, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        println!("[GUI] Trying to load image from: {:?}", path);
+
+        if !path.exists() {
+            eprintln!("[GUI] File does not exist: {:?}", path);
+            return None;
+        }
+
+        match image::open(path) {
+            Ok(image) => {
+                let size = [image.width() as usize, image.height() as usize];
+                let image_buffer = image.to_rgba8();
+                let pixels = image_buffer.as_flat_samples();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                let tex = ctx.load_texture(
+                    path.to_string_lossy().to_string(),
+                    color_image,
+                    Default::default(),
+                );
+                println!("[GUI] Successfully loaded image {:?}", path);
+                Some(tex)
+            }
+            Err(e) => {
+                eprintln!("[GUI] Failed to load image at {:?}: {}", path, e);
+                None
+            }
         }
     }
 }
@@ -49,6 +85,7 @@ impl eframe::App for GuiApp {
             match evt {
                 UiEvent::Queued(id) => {
                     println!("Queued request: {}", id);
+                    self.current_request_id = Some(id);
                 }
                 UiEvent::Error(msg) => {
                     eprintln!("UI Error: {}", msg);
@@ -56,12 +93,32 @@ impl eframe::App for GuiApp {
             }
         }
 
+        // Check if encryption is completed
+        if let Some(req_id) = self.current_request_id {
+            if let Some(status) = self.client.tracker.get_status(req_id) {
+                if let RequestStatus::Completed(ref resp) = status {
+                    if let Some(ref output_path) = resp.output_path {
+                        let encrypted_path = PathBuf::from(output_path);
+                        if encrypted_path.exists() {
+                            println!("[GUI] Loading encrypted image from {:?}", encrypted_path);
+                            self.encrypted_image = self.load_image(&encrypted_path, ctx);
+                        } else {
+                            eprintln!("[GUI] Encrypted file not found yet at {:?}", encrypted_path);
+                        }
+                        self.current_request_id = None;
+                    }
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Distributed P2P Client GUI");
 
+            // File selection
             ui.horizontal(|ui| {
                 if ui.button("Select File...").clicked() {
                     if let Some(path) = FileDialog::new().pick_file() {
+                        println!("[GUI] Selected file: {:?}", path);
                         self.selected_file = Some(path);
                     }
                 }
@@ -75,16 +132,21 @@ impl eframe::App for GuiApp {
 
             ui.separator();
 
+            // Encrypt/Decrypt buttons
             ui.horizontal(|ui| {
                 if ui.button("Encrypt").clicked() {
                     if let Some(p) = &self.selected_file {
+                        self.original_image = self.load_image(p, ctx);
+                        self.encrypted_image = None;
                         let _ = self.cmd_tx.send(Command::Encrypt(p.clone()));
+                        println!("[GUI] Sent encrypt command for {:?}", p);
                     }
                 }
 
                 if ui.button("Decrypt").clicked() {
                     if let Some(p) = &self.selected_file {
                         let _ = self.cmd_tx.send(Command::Decrypt(p.clone()));
+                        println!("[GUI] Sent decrypt command for {:?}", p);
                     }
                 }
             });
@@ -92,31 +154,63 @@ impl eframe::App for GuiApp {
             ui.separator();
 
             ui.label("Requests:");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (id, status) in self.client.tracker.list_all() {
-                    ui.horizontal(|ui| match status {
-                        RequestStatus::Pending => {
-                            ui.label(format!("#{} | ⏳ Pending", id));
-                        }
-                        RequestStatus::InProgress => {
-                            ui.label(format!("#{} | 🔄 In Progress", id));
-                        }
-                        RequestStatus::Completed(ref resp) => {
-                            ui.label(format!(
-                                "#{} | ✓ {}",
-                                id,
-                                resp.output_path.as_ref().unwrap_or(&"N/A".to_string())
-                            ));
-                        }
-                        RequestStatus::Failed(ref err) => {
-                            ui.label(format!("#{} | ✗ {}", id, err));
-                        }
-                    });
-                }
+            let available_height = ui.available_height();
+            let requests_height = available_height * 0.3;
+
+            egui::ScrollArea::vertical()
+                .max_height(requests_height)
+                .show(ui, |ui| {
+                    for (id, status) in self.client.tracker.list_all() {
+                        ui.horizontal(|ui| match status {
+                            RequestStatus::Pending => {
+                                ui.label(format!("#{} | ⏳ Pending", id));
+                            }
+                            RequestStatus::InProgress => {
+                                ui.label(format!("#{} | 🔄 In Progress", id));
+                            }
+                            RequestStatus::Completed(ref resp) => {
+                                ui.label(format!(
+                                    "#{} | ✓ {}",
+                                    id,
+                                    resp.output_path.as_ref().unwrap_or(&"N/A".to_string())
+                                ));
+                            }
+                            RequestStatus::Failed(ref err) => {
+                                ui.label(format!("#{} | ✗ {}", id, err));
+                            }
+                        });
+                    }
+                });
+
+            ui.separator();
+
+            // Image display area
+            ui.horizontal(|ui| {
+                // Original Image
+                ui.vertical(|ui| {
+                    ui.heading("Original Image");
+                    if let Some(texture) = &self.original_image {
+                        ui.image(texture.id(), egui::vec2(300.0, 300.0)); // fixed size for visibility
+                    } else {
+                        ui.label("No image loaded");
+                    }
+                });
+
+                ui.separator();
+
+                // Encrypted Image
+                ui.vertical(|ui| {
+                    ui.heading("Encrypted Image");
+                    if let Some(texture) = &self.encrypted_image {
+                        ui.image(texture.id(), egui::vec2(300.0, 300.0));
+                    } else {
+                        ui.label("No encrypted image yet");
+                    }
+                });
             });
         });
 
-        ctx.request_repaint_after(Duration::from_millis(500)); // refresh regularly
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 }
 
@@ -157,13 +251,11 @@ fn main() {
     let middleware_ip = "127.0.0.1";
     let middleware_port = 9000u16;
 
-    // Multiple backend servers (adjust as needed)
     let server_urls = vec![
         "http://127.0.0.1:8000".to_string(),
-        "http://10.40.50.186:8000".to_string(),
     ];
 
-    // --- Start middleware in background ---
+    // Start middleware in background
     let middleware = ClientMiddleware::new(middleware_ip, middleware_port, server_urls);
     let middleware_handle = thread::spawn(move || {
         if let Err(e) = middleware.start() {
@@ -197,6 +289,5 @@ fn main() {
         eprintln!("Failed to start GUI: {}", e);
     }
 
-    // --- Wait for middleware thread to finish (usually never) ---
     let _ = middleware_handle.join();
 }
