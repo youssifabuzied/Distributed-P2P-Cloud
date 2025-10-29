@@ -21,6 +21,7 @@ use std::io::Cursor;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::path::Path;
 use std::thread;
 use stegano_core::api::hide::prepare as hide_prepare;
 use tempfile::Builder;
@@ -38,6 +39,7 @@ use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 pub struct EncryptionRequest {
     pub request_id: u64,
     pub filename: String,
+    pub views: u64,
     pub file_data: Vec<u8>, // Raw image bytes
 }
 
@@ -56,7 +58,7 @@ pub struct EncryptionResponse {
 #[derive(Serialize, Deserialize, Debug)]
 struct HiddenPayload {
     message: String,
-    views: i32,
+    views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
     extra: Option<String>,
 }
@@ -163,10 +165,11 @@ impl Server {
         let response = match serde_json::from_str::<EncryptionRequest>(request_line.trim()) {
             Ok(request) => {
                 println!(
-                    "[Server] [Req #{}] Processing encryption for: {} ({} bytes)",
+                    "[Server] [Req #{}] Processing encryption for: {} ({} bytes) (views: {})",
                     request.request_id,
                     request.filename,
-                    request.file_data.len()
+                    request.file_data.len(),
+                    request.views
                 );
 
                 // Process encryption
@@ -195,10 +198,11 @@ impl Server {
     /// Perform steganographic encryption on the provided image data
     fn encrypt_data(request: EncryptionRequest) -> EncryptionResponse {
         println!(
-            "[Server] [Req #{}] Starting encryption: {} ({} bytes)",
+            "[Server] [Req #{}] Starting encryption: {} ({} bytes) (views: {})",
             request.request_id,
             request.filename,
-            request.file_data.len()
+            request.file_data.len(),
+            request.views
         );
 
         // Create temp directory
@@ -214,12 +218,81 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        let ext = Path::new(&request.filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+        let mut converted_image_path = None;
+        let mut working_image_bytes = request.file_data.clone();
+        if ext == "jpg" || ext == "jpeg" {
+            println!(
+                "[Server] [Req #{}] JPEG detected — converting to PNG for lossless encryption...",
+                request.request_id
+            );
 
+            let tmp_jpg = tmp_dir.join(format!("upload_{}.jpg", request.request_id));
+            if let Err(e) = std::fs::write(&tmp_jpg, &request.file_data) {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to save uploaded JPEG: {}", e),
+                    encrypted_data: None,
+                    original_size: request.file_data.len(),
+                    encrypted_size: 0,
+                };
+            }
+
+            let img = match image::open(&tmp_jpg) {
+                Ok(i) => i,
+                Err(e) => {
+                    return EncryptionResponse {
+                        request_id: request.request_id,
+                        status: "error".into(),
+                        message: format!("Failed to open JPEG: {}", e),
+                        encrypted_data: None,
+                        original_size: request.file_data.len(),
+                        encrypted_size: 0,
+                    };
+                }
+            };
+
+            let tmp_png = tmp_dir.join(format!("upload_{}.png", request.request_id));
+            if let Err(e) = img.save_with_format(&tmp_png, image::ImageFormat::Png) {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to convert JPEG to PNG: {}", e),
+                    encrypted_data: None,
+                    original_size: request.file_data.len(),
+                    encrypted_size: 0,
+                };
+            }
+
+            // Read converted PNG bytes and use them going forward
+            match std::fs::read(&tmp_png) {
+                Ok(png_bytes) => {
+                    working_image_bytes = png_bytes;
+                    converted_image_path = Some(tmp_png.clone());
+                    println!(
+                        "[Server] [Req #{}] Conversion complete -> PNG ready at {}",
+                        request.request_id,
+                        tmp_png.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[Server] Failed to read converted PNG: {}", e);
+                }
+            }
+
+            // Cleanup original JPG
+            let _ = std::fs::remove_file(&tmp_jpg);
+        }
         // Create payload with metadata
         let payload = HiddenPayload {
             message: format!("Hidden from file: {}", request.filename),
-            views: 42,
-            image_bytes: request.file_data.clone(),
+            views: request.views,
+            image_bytes: working_image_bytes.clone(),
             extra: Some("Metadata info".to_string()),
         };
 
@@ -240,9 +313,10 @@ impl Server {
         };
 
         println!(
-            "[Server] [Req #{}] Serialized payload: {} bytes",
+            "[Server] [Req #{}] Serialized payload: {} bytes (views: {})",
             request.request_id,
-            serialized.len()
+            serialized.len(),
+            request.views
         );
 
         // Load cover image
@@ -434,10 +508,11 @@ impl Server {
         };
 
         println!(
-            "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes",
+            "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes (views: {})",
             request.request_id,
             original_size,
-            stego_bytes.len()
+            stego_bytes.len(),
+            request.views
         );
 
         EncryptionResponse {
@@ -473,10 +548,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         internal_server_port: 7000, // ← TCP port for encryption server
         peers: vec![
             // Add other server instances here
-            PeerInfo {
-                server_id: 1,
-                address: "10.40.0.70:8001".to_string(),
-            },
+            // PeerInfo {
+            //     server_id: 1,
+            //     address: "10.40.0.70:8001".to_string(),
+            // },
             // PeerInfo {
             //     server_id: 3,
             //     address: "10.40.50.186:8001".to_string(),
@@ -486,7 +561,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         failure_port: 8002,                    // ADD THIS
         failure_check_interval_secs: 10,       // ADD THIS (check every 45 seconds)
         recovery_timeout_secs: 10,  
-        enable_failure_simulation: true,  // ADD THIS - set to false to disable
+        enable_failure_simulation: false,  // ADD THIS - set to false to disable
     };
 
     println!("\n========================================");

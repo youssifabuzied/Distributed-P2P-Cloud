@@ -287,8 +287,8 @@ mod stress_test {
 
                 println!("[StressTest] [{}/{}] Queuing: {}", 
                     index + 1, image_files.len(), filename);
-
-                match self.client.request_encryption(image_path.to_str().unwrap()) {
+                
+                match self.client.request_encryption(image_path.to_str().unwrap(), views=5) {
                     Ok(request_id) => {
                         self.metrics.start_request(request_id, filename.clone());
                         request_ids.push((request_id, filename));
