@@ -76,7 +76,12 @@ mod metrics {
             metrics.insert(request_id, RequestMetrics::new(request_id, filename));
         }
 
-        pub fn complete_request(&self, request_id: u64, success: bool, error_message: Option<String>) {
+        pub fn complete_request(
+            &self,
+            request_id: u64,
+            success: bool,
+            error_message: Option<String>,
+        ) {
             let mut metrics = self.metrics.lock().unwrap();
             if let Some(metric) = metrics.get_mut(&request_id) {
                 metric.complete(success, error_message);
@@ -95,7 +100,7 @@ mod metrics {
         pub fn print_summary(&self) {
             let metrics = self.metrics.lock().unwrap();
             let total_requests = metrics.len();
-            
+
             if total_requests == 0 {
                 println!("\n========================================");
                 println!("No requests were processed");
@@ -146,7 +151,10 @@ mod metrics {
             println!("Turnaround Time (Min): {} ms", min_turnaround);
             println!("Turnaround Time (Max): {} ms", max_turnaround);
             println!("----------------------------------------");
-            println!("Total Elapsed Time:    {:.2} seconds", total_elapsed.as_secs_f64());
+            println!(
+                "Total Elapsed Time:    {:.2} seconds",
+                total_elapsed.as_secs_f64()
+            );
             println!("Throughput:            {:.2} requests/second", throughput);
             println!("========================================\n");
 
@@ -158,7 +166,10 @@ mod metrics {
                         "  #{} - {} - {}",
                         metric.request_id,
                         metric.filename,
-                        metric.error_message.as_ref().unwrap_or(&"Unknown error".to_string())
+                        metric
+                            .error_message
+                            .as_ref()
+                            .unwrap_or(&"Unknown error".to_string())
                     );
                 }
                 println!();
@@ -228,15 +239,12 @@ mod filesystem {
     }
 
     pub fn save_encrypted_file(source: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
-        let filename = source
-            .file_name()
-            .ok_or("Invalid source filename")?;
-        
+        let filename = source.file_name().ok_or("Invalid source filename")?;
+
         let dest_path = dest_dir.join(filename);
-        
-        fs::copy(source, &dest_path)
-            .map_err(|e| format!("Failed to copy file: {}", e))?;
-        
+
+        fs::copy(source, &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
+
         Ok(dest_path)
     }
 }
@@ -247,8 +255,8 @@ mod filesystem {
 
 mod stress_test {
     use super::*;
-    use crate::metrics::MetricsCollector;
     use crate::filesystem;
+    use crate::metrics::MetricsCollector;
 
     pub struct StressTestRunner {
         client: Client,
@@ -285,10 +293,17 @@ mod stress_test {
                     .to_string_lossy()
                     .to_string();
 
-                println!("[StressTest] [{}/{}] Queuing: {}", 
-                    index + 1, image_files.len(), filename);
-                
-                match self.client.request_encryption(image_path.to_str().unwrap(), views=5) {
+                println!(
+                    "[StressTest] [{}/{}] Queuing: {}",
+                    index + 1,
+                    image_files.len(),
+                    filename
+                );
+
+                match self
+                    .client
+                    .request_encryption(image_path.to_str().unwrap(), 5)
+                {
                     Ok(request_id) => {
                         self.metrics.start_request(request_id, filename.clone());
                         request_ids.push((request_id, filename));
@@ -301,9 +316,11 @@ mod stress_test {
                 thread::sleep(Duration::from_millis(100));
             }
 
-            println!("\n[StressTest] All {} requests queued. Monitoring completion...\n", 
-                request_ids.len());
-            
+            println!(
+                "\n[StressTest] All {} requests queued. Monitoring completion...\n",
+                request_ids.len()
+            );
+
             request_ids
         }
 
@@ -327,7 +344,7 @@ mod stress_test {
                             if let Some(output_path) = &response.output_path {
                                 match filesystem::save_encrypted_file(
                                     Path::new(output_path),
-                                    &self.output_dir
+                                    &self.output_dir,
                                 ) {
                                     Ok(dest_path) => {
                                         println!(
@@ -346,7 +363,7 @@ mod stress_test {
                                         self.metrics.complete_request(
                                             *request_id,
                                             false,
-                                            Some(format!("Failed to save: {}", e))
+                                            Some(format!("Failed to save: {}", e)),
                                         );
                                     }
                                 }
@@ -364,11 +381,8 @@ mod stress_test {
                                 "[StressTest] ✗ Request #{}: {} - {}",
                                 request_id, filename, err
                             );
-                            self.metrics.complete_request(
-                                *request_id,
-                                false,
-                                Some(err.clone())
-                            );
+                            self.metrics
+                                .complete_request(*request_id, false, Some(err.clone()));
                             completed_count += 1;
                         }
                         _ => {}
@@ -416,11 +430,8 @@ mod stress_test {
         fn handle_timeout(&self, request_ids: &[(u64, String)]) {
             for (request_id, _) in request_ids {
                 if !self.metrics.is_completed(*request_id) {
-                    self.metrics.complete_request(
-                        *request_id,
-                        false,
-                        Some("Timeout".to_string())
-                    );
+                    self.metrics
+                        .complete_request(*request_id, false, Some("Timeout".to_string()));
                 }
             }
         }
@@ -488,8 +499,14 @@ mod config {
             println!("Middleware Port:      {}", self.middleware_port);
             println!("Input Directory:      {}", self.input_dir);
             println!("Output Directory:     {}", self.output_dir);
-            println!("Middleware Address:   {}:{}", self.middleware_ip, self.middleware_port);
-            println!("Server URLs:          {} configured", self.server_urls.len());
+            println!(
+                "Middleware Address:   {}:{}",
+                self.middleware_ip, self.middleware_port
+            );
+            println!(
+                "Server URLs:          {} configured",
+                self.server_urls.len()
+            );
             println!("========================================\n");
         }
     }
@@ -534,7 +551,7 @@ fn main() {
     let middleware = ClientMiddleware::new(
         &config.middleware_ip,
         config.middleware_port,
-        config.server_urls.clone()
+        config.server_urls.clone(),
     );
 
     let middleware_handle = thread::spawn(move || {
@@ -550,7 +567,7 @@ fn main() {
         &config.username,
         &config.client_ip,
         config.client_port,
-        &middleware_addr
+        &middleware_addr,
     );
 
     let runner = stress_test::StressTestRunner::new(client, output_dir.to_path_buf());
