@@ -26,4 +26,6 @@ cargo run --bin client_app
 
 # Step 5: Once the client is running, you can test commands directly.
 # For example, to encrypt a file:
-encrypt resources/default_image.png
+# Must be PNG
+encrypt resources/input.jpg 5
+decrypt client_storage/encrypted_input.png

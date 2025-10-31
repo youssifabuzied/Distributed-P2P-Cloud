@@ -8,6 +8,7 @@
 use aes_gcm::{Aes256Gcm, Key};
 use base64::{Engine as _, engine::general_purpose};
 use bincode;
+use std::path::PathBuf;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -25,7 +26,7 @@ use stegano_core::api::unveil::prepare as extract_prepare;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
-    EncryptImage { request_id: u64, image_path: String },
+    EncryptImage { request_id: u64, image_path: String, views: u64},
     DecryptImage { request_id: u64, image_path: String },
 }
 
@@ -69,7 +70,7 @@ pub struct ServerResponse {
 #[derive(Serialize, Deserialize, Debug)]
 struct HiddenPayload {
     message: String,
-    views: i32,
+    views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
     extra: Option<String>,
 }
@@ -193,9 +194,10 @@ impl ClientMiddleware {
             ClientRequest::EncryptImage {
                 request_id,
                 image_path,
+                views
             } => {
                 // Forward encryption to ALL servers and wait for first response
-                Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path)
+                Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path,views)
             }
             ClientRequest::DecryptImage {
                 request_id,
@@ -212,6 +214,7 @@ impl ClientMiddleware {
         server_urls: &[String],
         request_id: u64,
         image_path: &str,
+        views: u64,
     ) -> MiddlewareResponse {
         use std::fs;
         use std::path::Path;
@@ -239,10 +242,11 @@ impl ClientMiddleware {
             .to_string();
 
         println!(
-            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes)",
+            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes) ({} views)",
             request_id,
             server_urls.len(),
-            file_data.len()
+            file_data.len(),
+            views
         );
 
         // Keep retrying until success
@@ -257,13 +261,15 @@ impl ClientMiddleware {
                 let file_data = file_data.clone();
                 let filename = filename.clone();
                 let response = Arc::clone(&response);
+                let views = views;
 
                 let handle = thread::spawn(move || {
                     println!(
-                        "[ClientMiddleware] [Req #{}] [Server {}] Sending to {}",
+                        "[ClientMiddleware] [Req #{}] [Server {}] Sending to {} ({} views)",
                         request_id,
                         index + 1,
-                        server_url
+                        server_url,
+                        views
                     );
 
                     match Self::send_encrypt_to_single_server(
@@ -271,6 +277,7 @@ impl ClientMiddleware {
                         request_id,
                         &filename,
                         &file_data,
+                        views,
                     ) {
                         Ok(server_response) => {
                             if server_response.status == "OK" {
@@ -311,7 +318,7 @@ impl ClientMiddleware {
                 handles.push(handle);
             }
 
-            // Wait for threads or 40s timeout
+            // Wait for threads or 80s timeout
             while start_time.elapsed() < Duration::from_secs(80) {
                 {
                     let response_lock = response.lock().unwrap();
@@ -347,10 +354,11 @@ impl ClientMiddleware {
         request_id: u64,
         filename: &str,
         file_data: &[u8],
+        views: u64,
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // Create multipart form using reqwest blocking client
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60)) // 30 second timeout
+            .timeout(Duration::from_secs(80)) // 30 second timeout
             .build()?;
 
         let url = format!("{}/encrypt", server_url);
@@ -358,6 +366,7 @@ impl ClientMiddleware {
         let form = reqwest::blocking::multipart::Form::new()
             .text("request_id", request_id.to_string())
             .text("filename", filename.to_string())
+            .text("views", views.to_string())
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file_data.to_vec())
@@ -376,14 +385,21 @@ impl ClientMiddleware {
                 (&server_resp.file_data, &server_resp.output_filename)
             {
                 let file_data = general_purpose::STANDARD.decode(file_data_b64)?;
-                let output_path = format!("../../trash/{}", output_filename);
-
+                let output_dir = "client_storage";
+                std::fs::create_dir_all(output_dir)?; // ensure dir exists
+                let output_stem = Path::new(output_filename)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+                let output_path = format!("{}/{}.png", output_dir, output_stem);
+                //let output_path = format!("{}/{}", output_dir, output_filename);
                 std::fs::write(&output_path, file_data)?;
+
 
                 return Ok(MiddlewareResponse::success(
                     request_id,
                     &server_resp.message,
-                    Some(output_path),
+                    Some(output_path.to_string()),
                 ));
             }
 
@@ -423,7 +439,7 @@ impl ClientMiddleware {
             tmp_extract_dir.path().display()
         );
 
-        //println!("[ClientMiddleware] [Req #{}] Read {} bytes", request_id, file_data.len());
+        println!("[ClientMiddleware] [Req #{}] Decryption Begin", request_id);
 
         let secret_key = b"supersecretkey_supersecretkey_32";
         let key = Key::<Aes256Gcm>::from_slice(secret_key);
@@ -486,23 +502,46 @@ impl ClientMiddleware {
         if let Some(extra) = &recovered.extra {
             println!("Extra: {}", extra);
         }
-        let output_path = format!("{}_recovered.png", image_path);
+        let output_dir = PathBuf::from("client_storage");
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            return MiddlewareResponse::error(
+                request_id,
+                &format!("Failed to create directory: {}", e),
+            );
+        }
+
+        //fs::create_dir_all(&output_dir)?;
+        let output_stem = Path::new(image_path)
+        .file_stem() // e.g. "encrypted_input"
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+        let output_path = output_dir.join(format!("decrypted_{}.png", output_stem));
         match fs::write(&output_path, &recovered.image_bytes) {
             Ok(_) => {
                 println!(
                     "[ClientMiddleware] [Req #{}] Decryption complete → saved hidden image as: {}",
-                    request_id, output_path
+                    request_id,
+                    output_path.display()
                 );
                 MiddlewareResponse::success(
                     request_id,
-                    &format!("Image successfully decrypted and saved to {}", output_path),
-                    Some(output_path),
+                    &format!(
+                        "Image successfully decrypted and saved to {}",
+                        output_path.display()
+                    ),
+                    Some(output_path.to_string_lossy().to_string()),
                 )
             }
-            Err(e) => MiddlewareResponse::error(
-                request_id,
-                &format!("Failed to save recovered image: {}", e),
-            ),
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to save decrypted image: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to save decrypted image: {}", e),
+                )
+            }
         }
     }
 }

@@ -8,7 +8,7 @@
 // 2. Each server listens for 5 seconds for higher priority announcements
 // 3. If higher priority received -> drop request
 // 4. If no higher priority after 5 seconds -> process request
-
+use std::path::Path;
 use axum::{
     Router,
     extract::{Multipart, State},
@@ -790,6 +790,7 @@ pub async fn encrypt_handler(
     let mut request_id = 0u64;
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
+    let mut views = 0u64;
     while let Some(field) = multipart.next_field().await.unwrap() {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
@@ -799,6 +800,10 @@ pub async fn encrypt_handler(
             }
             "filename" => {
                 filename = field.text().await.unwrap();
+            }
+            "views" => {
+                let data = field.text().await.unwrap();
+                views = data.parse().unwrap_or(0);
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -832,6 +837,10 @@ pub async fn encrypt_handler(
             }
             "filename" => {
                 filename = field.text().await.unwrap();
+            }
+            "views" => {
+                let data = field.text().await.unwrap();
+                views = data.parse().unwrap_or(0);
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -868,9 +877,10 @@ pub async fn encrypt_handler(
     }
 
     println!(
-        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes)",
+        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({} views)",
         request_id,
         filename,
+        views,
         file_data.len()
     );
 
@@ -952,6 +962,7 @@ pub async fn encrypt_handler(
     let encryption_request = json!({
         "request_id": request_id,
         "filename": filename,
+        "views": views,
         "file_data": file_data,
     });
 
@@ -1046,8 +1057,11 @@ pub async fn encrypt_handler(
                 Ok(resp_json) => {
                     let status = resp_json["status"].as_str().unwrap_or("ERROR");
                     let message = resp_json["message"].as_str().unwrap_or("");
-                    let output_filename = format!("encrypted_{}", filename);
-
+                    let output_stem = Path::new(&filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+                    let output_filename = format!("encrypted_{}", output_stem);
                     let encrypted_data = resp_json["encrypted_data"]
                         .as_array()
                         .map(|arr| {
@@ -1079,6 +1093,7 @@ pub async fn encrypt_handler(
                         "output_filename": output_filename,
                         "file_data": base64_data,
                         "file_size": encrypted_data.len(),
+                        "views": views,
                         "processed_by": server_id,
                     })))
                 }

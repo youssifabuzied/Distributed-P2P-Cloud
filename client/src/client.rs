@@ -18,7 +18,7 @@ pub struct ClientMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientRequest {
-    EncryptImage { request_id: u64, image_path: String },
+    EncryptImage { request_id: u64, image_path: String, views: u64},
     DecryptImage { request_id: u64, image_path: String },
 }
 
@@ -181,7 +181,8 @@ impl Client {
     }
 
     /// Request encryption (async)
-    pub fn request_encryption(&self, image_path: &str) -> Result<u64, Box<dyn Error>> {
+    pub fn request_encryption(&self, image_path: &str,
+    views: u64,) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
@@ -190,12 +191,13 @@ impl Client {
         let request = ClientRequest::EncryptImage {
             request_id,
             image_path: image_path.to_string(),
+            views,
         };
 
         let id = self.send_request_async(request);
         println!(
-            "[Client] Queued encryption request #{} for '{}'",
-            id, image_path
+            "[Client] Queued encryption request #{} for '{}' ({} views)",
+            id, image_path, views
         );
         Ok(id)
     }
@@ -296,7 +298,7 @@ impl Client {
         println!("Welcome, {}!", self.metadata.username);
         println!("Middleware: {}", self.middleware_addr);
         println!("\nCommands:");
-        println!("  encrypt <image_path>     - Queue encryption (returns immediately)");
+        println!("  encrypt <image_path>, <views>    - Queue encryption (returns immediately)");
         println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
         println!("  status <request_id>      - Check request status");
         println!("  list                     - List all requests");
@@ -317,11 +319,18 @@ impl Client {
             }
 
             match tokens[0] {
-                "encrypt" if tokens.len() == 2 => match self.request_encryption(tokens[1]) {
-                    Ok(id) => {
-                        println!("Request #{id} queued (background processing)");
+                "encrypt" if tokens.len() == 3 => {
+                    let image_path = tokens[1];
+                    let views_str = tokens[2];
+                    match views_str.parse::<u64>() {
+                        Ok(views) => match self.request_encryption(image_path, views) {
+                            Ok(id) => {
+                                println!("Request #{id} queued (background processing)");
+                            }
+                            Err(e) => eprintln!("Error: {e}"),
+                        },
+                        Err(_) => eprintln!("Error: 'views' must be a valid integer"),
                     }
-                    Err(e) => eprintln!("Error: {e}"),
                 },
                 "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
                     Ok(id) => {
