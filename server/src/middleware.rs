@@ -8,7 +8,7 @@
 // 2. Each server listens for 5 seconds for higher priority announcements
 // 3. If higher priority received -> drop request
 // 4. If no higher priority after 5 seconds -> process request
-use std::path::Path;
+use axum::extract::DefaultBodyLimit;
 use axum::{
     Router,
     extract::{Multipart, State},
@@ -16,18 +16,18 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::fs;
-use tower_http::trace::TraceLayer;
-use axum::extract::DefaultBodyLimit;
-use rand::Rng;
-use serde_json::json;
 use tokio::task;
+use tower_http::trace::TraceLayer;
 // =======================================
 // Configuration Structures
 // =======================================
@@ -316,7 +316,7 @@ impl ServerMiddleware {
         ServerMiddleware {
             config,
             election_tracker: Arc::new(ElectionTracker::new()),
-            failure_tracker: Arc::new(FailureElectionTracker::new()),  // ADD THIS LINE
+            failure_tracker: Arc::new(FailureElectionTracker::new()), // ADD THIS LINE
         }
     }
 
@@ -324,7 +324,7 @@ impl ServerMiddleware {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Create storage directory
         fs::create_dir_all("./server_storage").await?;
-    
+
         println!("========================================");
         println!("Cloud P2P Server Middleware");
         println!("========================================");
@@ -333,15 +333,21 @@ impl ServerMiddleware {
         println!("[Server] Client port: {}", self.config.client_port);
         println!("[Server] Peer port: {}", self.config.peer_port);
         println!("[Server] Failure port: {}", self.config.failure_port);
-        println!("[Server] Failure simulation: {}", 
-            if self.config.enable_failure_simulation { "ENABLED" } else { "DISABLED" });
+        println!(
+            "[Server] Failure simulation: {}",
+            if self.config.enable_failure_simulation {
+                "ENABLED"
+            } else {
+                "DISABLED"
+            }
+        );
         println!("[Server] Peers: {}", self.config.peers.len());
         println!(
             "[Server] Election timeout: {}ms",
             self.config.election_timeout_ms
         );
         println!("========================================\n");
-    
+
         // Clone self for the peer listener
         let peer_self = self.clone();
         let peer_listener = tokio::spawn(async move {
@@ -349,14 +355,14 @@ impl ServerMiddleware {
                 eprintln!("[Server] Peer listener error: {}", e);
             }
         });
-    
+
         // Start client listener
         let client_listener = self.start_client_listener();
-    
+
         // Conditionally start failure simulation
         if self.config.enable_failure_simulation {
             println!("[Server] Starting failure simulation subsystem...\n");
-            
+
             // Clone self for failure listener
             let failure_self = self.clone();
             let failure_listener = tokio::spawn(async move {
@@ -364,13 +370,13 @@ impl ServerMiddleware {
                     eprintln!("[Server] Failure listener error: {}", e);
                 }
             });
-    
+
             // Start failure election loop
             let election_self = Arc::new(self.clone());
             let failure_election = tokio::spawn(async move {
                 election_self.run_failure_election_loop().await;
             });
-    
+
             // Wait for any task to complete (all run in background)
             tokio::select! {
                 result = client_listener => result?,
@@ -380,14 +386,14 @@ impl ServerMiddleware {
             }
         } else {
             println!("[Server] Failure simulation disabled - running normal mode\n");
-            
+
             // Only run client and peer listeners
             tokio::select! {
                 result = client_listener => result?,
                 _ = peer_listener => {},
             }
         }
-    
+
         Ok(())
     }
 
@@ -549,7 +555,7 @@ impl ServerMiddleware {
             });
         }
     }
-        /// Calculate failure score (higher = more likely to fail)
+    /// Calculate failure score (higher = more likely to fail)
     /// Formula: (CPU Load × 0.3) + (Memory Usage × 0.3) + (Random × 0.4)
     fn calculate_failure_score(&self) -> u32 {
         let mut sys = System::new_all();
@@ -608,36 +614,33 @@ impl ServerMiddleware {
     async fn run_failure_election_loop(self: Arc<Self>) {
         loop {
             // Wait for the interval
-            tokio::time::sleep(Duration::from_secs(
-                self.config.failure_check_interval_secs,
-            ))
-            .await;
-    
+            tokio::time::sleep(Duration::from_secs(self.config.failure_check_interval_secs)).await;
+
             // REMOVED: Skip if already failed
             // Now server participates in elections even when failed
-    
+
             println!(
                 "\n[Failure Election] Starting failure check (Server {})",
                 self.config.server_id
             );
-    
+
             // Calculate my failure score
             let my_score = self.calculate_failure_score();
-    
+
             // Record my own score
             self.failure_tracker
                 .record_score(self.config.server_id, my_score);
-    
+
             // Broadcast to all peers
             self.broadcast_failure_score(my_score).await;
-    
+
             // Wait for announcements
             println!("[Failure Election] Listening for 40 seconds...");
             tokio::time::sleep(Duration::from_secs(40)).await;
-    
+
             // Check if I have the highest score
             let (winner_id, highest_score) = self.failure_tracker.get_highest_score();
-    
+
             // Only initiate failure if not already failed
             if winner_id == self.config.server_id && !self.failure_tracker.is_failed() {
                 println!(
@@ -645,10 +648,10 @@ impl ServerMiddleware {
                     self.config.server_id, my_score
                 );
                 println!("[Failure Election] Initiating controlled failure...\n");
-    
+
                 // Mark as failed
                 self.failure_tracker.mark_failed();
-    
+
                 // Spawn recovery task
                 let recovery_self = self.clone();
                 tokio::spawn(async move {
@@ -656,13 +659,16 @@ impl ServerMiddleware {
                         recovery_self.config.recovery_timeout_secs,
                     ))
                     .await;
-    
+
                     println!(
                         "\n[Recovery] ✓ Server {} recovering after {} seconds",
                         recovery_self.config.server_id, recovery_self.config.recovery_timeout_secs
                     );
                     recovery_self.failure_tracker.mark_recovered();
-                    println!("[Recovery] Server {} back online\n", recovery_self.config.server_id);
+                    println!(
+                        "[Recovery] Server {} back online\n",
+                        recovery_self.config.server_id
+                    );
                 });
             } else if winner_id == self.config.server_id && self.failure_tracker.is_failed() {
                 println!(
@@ -678,39 +684,45 @@ impl ServerMiddleware {
         }
     }
 
-/// Broadcast failure score to all peers
-async fn broadcast_failure_score(&self, score: u32) {
-    let client = reqwest::Client::new();
+    /// Broadcast failure score to all peers
+    async fn broadcast_failure_score(&self, score: u32) {
+        let client = reqwest::Client::new();
 
-    let announcement = FailureAnnouncement {
-        server_id: self.config.server_id,
-        failure_score: score,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    };
+        let announcement = FailureAnnouncement {
+            server_id: self.config.server_id,
+            failure_score: score,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
 
-    for peer in &self.config.peers {
-        let url = format!("http://{}/announce_failure", peer.address.replace(":8001", ":8002"));
-        let announcement = announcement.clone();
-        let client = client.clone();
-        let peer_id = peer.server_id;
+        for peer in &self.config.peers {
+            let url = format!(
+                "http://{}/announce_failure",
+                peer.address.replace(":8001", ":8002")
+            );
+            let announcement = announcement.clone();
+            let client = client.clone();
+            let peer_id = peer.server_id;
 
-        tokio::spawn(async move {
-            match client.post(&url).json(&announcement).send().await {
-                Ok(_) => {
-                    println!(
-                        "[Failure Election] Sent score {} to peer {}",
-                        announcement.failure_score, peer_id
-                    );
+            tokio::spawn(async move {
+                match client.post(&url).json(&announcement).send().await {
+                    Ok(_) => {
+                        println!(
+                            "[Failure Election] Sent score {} to peer {}",
+                            announcement.failure_score, peer_id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[Failure Election] Failed to send to peer {}: {}",
+                            peer_id, e
+                        );
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[Failure Election] Failed to send to peer {}: {}", peer_id, e);
-                }
-            }
-        });
-    }
+            });
+        }
     }
 }
 
@@ -817,14 +829,14 @@ pub async fn encrypt_handler(
             "[Failure] [Req #{}] Server {} FAILED - hanging connection",
             request_id, middleware.config.server_id
         );
-        
+
         // Hang indefinitely
         std::future::pending::<()>().await;
-        
+
         // Never reached
         unreachable!();
     }
-    
+
     // ========================================
     // 1. Parse multipart form data
     // ========================================
@@ -857,10 +869,10 @@ pub async fn encrypt_handler(
             "[Failure] [Req #{}] Server {} FAILED - hanging connection",
             request_id, middleware.config.server_id
         );
-        
+
         // Hang indefinitely
         std::future::pending::<()>().await;
-        
+
         // Never reached
         unreachable!();
     }
@@ -880,8 +892,8 @@ pub async fn encrypt_handler(
         "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({} views)",
         request_id,
         filename,
-        views,
-        file_data.len()
+        file_data.len(),
+        views
     );
 
     // ========================================
@@ -894,10 +906,10 @@ pub async fn encrypt_handler(
             "[Failure] [Req #{}] Server {} FAILED - hanging connection",
             request_id, middleware.config.server_id
         );
-        
+
         // Hang indefinitely
         std::future::pending::<()>().await;
-        
+
         // Never reached
         unreachable!();
     }
@@ -914,10 +926,10 @@ pub async fn encrypt_handler(
             "[Failure] [Req #{}] Server {} FAILED - hanging connection",
             request_id, middleware.config.server_id
         );
-        
+
         // Hang indefinitely
         std::future::pending::<()>().await;
-        
+
         // Never reached
         unreachable!();
     }
@@ -951,10 +963,10 @@ pub async fn encrypt_handler(
             "[Failure] [Req #{}] Server {} FAILED - hanging connection",
             request_id, middleware.config.server_id
         );
-        
+
         // Hang indefinitely
         std::future::pending::<()>().await;
-        
+
         // Never reached
         unreachable!();
     }
@@ -988,11 +1000,11 @@ pub async fn encrypt_handler(
                 "[Failure] [Req #{}] Server {} FAILED - hanging connection",
                 request_id, middleware.config.server_id
             );
-            
+
             // Hang indefinitely
             loop {
                 std::thread::park();
-            }            
+            }
             // Never reached
             unreachable!();
         }
@@ -1008,11 +1020,11 @@ pub async fn encrypt_handler(
                 "[Failure] [Req #{}] Server {} FAILED - hanging connection",
                 request_id, middleware.config.server_id
             );
-            
+
             // Hang indefinitely
             loop {
                 std::thread::park();
-            }            
+            }
             // Never reached
             unreachable!();
         }
@@ -1032,11 +1044,11 @@ pub async fn encrypt_handler(
                 "[Failure] [Req #{}] Server {} FAILED - hanging connection",
                 request_id, middleware.config.server_id
             );
-            
+
             // Hang indefinitely
             loop {
                 std::thread::park();
-            }            
+            }
             // Never reached
             unreachable!();
         }
@@ -1058,9 +1070,9 @@ pub async fn encrypt_handler(
                     let status = resp_json["status"].as_str().unwrap_or("ERROR");
                     let message = resp_json["message"].as_str().unwrap_or("");
                     let output_stem = Path::new(&filename)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output");
                     let output_filename = format!("encrypted_{}", output_stem);
                     let encrypted_data = resp_json["encrypted_data"]
                         .as_array()

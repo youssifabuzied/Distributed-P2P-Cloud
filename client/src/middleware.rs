@@ -8,7 +8,6 @@
 use aes_gcm::{Aes256Gcm, Key};
 use base64::{Engine as _, engine::general_purpose};
 use bincode;
-use std::path::PathBuf;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -16,6 +15,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,8 +26,15 @@ use stegano_core::api::unveil::prepare as extract_prepare;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientRequest {
-    EncryptImage { request_id: u64, image_path: String, views: u64},
-    DecryptImage { request_id: u64, image_path: String },
+    EncryptImage {
+        request_id: u64,
+        image_path: String,
+        views: u64,
+    },
+    DecryptImage {
+        request_id: u64,
+        image_path: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -194,10 +201,10 @@ impl ClientMiddleware {
             ClientRequest::EncryptImage {
                 request_id,
                 image_path,
-                views
+                views,
             } => {
                 // Forward encryption to ALL servers and wait for first response
-                Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path,views)
+                Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path, views)
             }
             ClientRequest::DecryptImage {
                 request_id,
@@ -241,12 +248,28 @@ impl ClientMiddleware {
             .to_string_lossy()
             .to_string();
 
+        // === NEW: compute timeout based on image size ===
+        // Base timeout: 30 seconds
+        // Per-MB overhead: 6 seconds per MB (ceiling)
+        let size_bytes = file_data.len() as f64;
+        let size_mb = size_bytes / (1024.0 * 1024.0);
+        let per_mb_secs: u64 = 6;
+        let extra_mb = size_mb.ceil() as u64; // ceil(3.5) -> 4
+        let timeout_secs = 30u64.saturating_add(extra_mb.saturating_mul(per_mb_secs));
+        let timeout_duration = Duration::from_secs(timeout_secs);
         println!(
-            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes) ({} views)",
+            "[ClientMiddleware] [Req #{}] Computed timeout: {} seconds (size: {:.2} MB → +{} MB * {}s/MB)",
+            request_id, timeout_secs, size_mb, extra_mb, per_mb_secs
+        );
+        // ===============================================
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes) ({} views) -> timeout: {}s",
             request_id,
             server_urls.len(),
             file_data.len(),
-            views
+            views,
+            timeout_secs
         );
 
         // Keep retrying until success
@@ -318,8 +341,8 @@ impl ClientMiddleware {
                 handles.push(handle);
             }
 
-            // Wait for threads or 80s timeout
-            while start_time.elapsed() < Duration::from_secs(80) {
+            // Wait for threads or computed timeout
+            while start_time.elapsed() < timeout_duration {
                 {
                     let response_lock = response.lock().unwrap();
                     if let Some(resp) = response_lock.as_ref() {
@@ -335,8 +358,8 @@ impl ClientMiddleware {
 
             // Timeout: no OK response
             println!(
-                "[ClientMiddleware] [Req #{}] Timeout after 40s - retrying broadcast...",
-                request_id
+                "[ClientMiddleware] [Req #{}] Timeout after {}s - retrying broadcast...",
+                request_id, timeout_secs
             );
 
             // Make sure all threads finish cleanly before retry
@@ -356,9 +379,17 @@ impl ClientMiddleware {
         file_data: &[u8],
         views: u64,
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
+        // === NEW: compute client timeout consistently with outer logic ===
+        let size_bytes = file_data.len() as f64;
+        let size_mb = size_bytes / (1024.0 * 1024.0);
+        let per_mb_secs: u64 = 6;
+        let extra_mb = size_mb.ceil() as u64;
+        let timeout_secs = 30u64.saturating_add(extra_mb.saturating_mul(per_mb_secs));
+        // ===============================================================
+
         // Create multipart form using reqwest blocking client
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(80)) // 30 second timeout
+            .timeout(Duration::from_secs(timeout_secs)) // use computed timeout
             .build()?;
 
         let url = format!("{}/encrypt", server_url);
@@ -388,13 +419,12 @@ impl ClientMiddleware {
                 let output_dir = "client_storage";
                 std::fs::create_dir_all(output_dir)?; // ensure dir exists
                 let output_stem = Path::new(output_filename)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output");
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
                 let output_path = format!("{}/{}.png", output_dir, output_stem);
                 //let output_path = format!("{}/{}", output_dir, output_filename);
                 std::fs::write(&output_path, file_data)?;
-
 
                 return Ok(MiddlewareResponse::success(
                     request_id,
@@ -512,9 +542,9 @@ impl ClientMiddleware {
 
         //fs::create_dir_all(&output_dir)?;
         let output_stem = Path::new(image_path)
-        .file_stem() // e.g. "encrypted_input"
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
+            .file_stem() // e.g. "encrypted_input"
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
         let output_path = output_dir.join(format!("decrypted_{}.png", output_stem));
         match fs::write(&output_path, &recovered.image_bytes) {
             Ok(_) => {

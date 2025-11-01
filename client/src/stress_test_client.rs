@@ -9,13 +9,13 @@ mod middleware;
 use client::{Client, RequestStatus};
 use middleware::ClientMiddleware;
 
+use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use rand::Rng;
 
 // =======================================
 // Metrics Module
@@ -489,9 +489,9 @@ mod config {
                 client_port: 8080,
                 middleware_ip: "127.0.0.1".to_string(),
                 server_urls: vec![
-                    "http://127.0.0.1:8000".to_string(),
-                    "http://10.40.5.200:8000".to_string(),
-                    "http://10.7.57.168:8000".to_string(),
+                    "http://10.251.174.138:8000".to_string(),
+                    "http://10.251.174.196:8000".to_string(),
+                    "http://10.251.174.183:8000".to_string(),
                 ],
             })
         }
