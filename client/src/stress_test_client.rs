@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use rand::Rng;
 
 // =======================================
 // Metrics Module
@@ -313,7 +314,10 @@ mod stress_test {
                     }
                 }
 
-                thread::sleep(Duration::from_millis(100));
+                // Sleep a random duration between 5 and 20 seconds to simulate varied client behavior
+                let mut rng = rand::thread_rng();
+                let secs: u64 = rng.gen_range(5..=20);
+                thread::sleep(Duration::from_secs(secs));
             }
 
             println!(
