@@ -36,6 +36,9 @@ struct GuiApp {
     client: Arc<Client>,
     cmd_tx: Sender<Command>,
     evt_rx: Receiver<UiEvent>,
+    // file dialog results come back on this channel (spawned thread shows native dialog)
+    file_result_rx: Receiver<Option<PathBuf>>,
+    file_result_tx: Sender<Option<PathBuf>>,
 
     selected_file: Option<PathBuf>,
     original_image: Option<egui::TextureHandle>,
@@ -57,10 +60,13 @@ struct GuiApp {
 
 impl GuiApp {
     fn new(client: Arc<Client>, cmd_tx: Sender<Command>, evt_rx: Receiver<UiEvent>) -> Self {
+        let (file_result_tx, file_result_rx) = crossbeam_channel::unbounded::<Option<PathBuf>>();
         Self {
             client,
             cmd_tx,
             evt_rx,
+            file_result_rx,
+            file_result_tx,
             selected_file: None,
             original_image: None,
             encrypted_image: None,
@@ -118,6 +124,13 @@ impl eframe::App for GuiApp {
             }
         }
 
+        // Process any file dialog results (sent from a spawned thread)
+        while let Ok(opt_path) = self.file_result_rx.try_recv() {
+            if let Some(path) = opt_path {
+                self.selected_file = Some(path);
+            }
+        }
+
         // If we have a current request id, check its status and handle completion depending on its kind
         if let Some(req_id) = self.current_request_id {
             if let Some(status) = self.client.tracker.get_status(req_id) {
@@ -156,9 +169,15 @@ impl eframe::App for GuiApp {
             // File selection
             ui.horizontal(|ui| {
                 if ui.button("Select File...").clicked() {
-                    if let Some(path) = FileDialog::new().pick_file() {
-                        self.selected_file = Some(path);
-                    }
+                    // Spawn a thread to show the native file dialog so we don't re-enter
+                    // the winit/egui event loop (which causes a panic on Windows).
+                    let file_tx = self.file_result_tx.clone();
+                    std::thread::spawn(move || {
+                        let picked = FileDialog::new().pick_file();
+                        // send the result (Option<PathBuf>) back to the UI
+                        // ignore send errors (UI may have shut down)
+                        let _ = file_tx.send(picked);
+                    });
                 }
 
                 if let Some(p) = &self.selected_file {
@@ -380,7 +399,7 @@ fn main() {
     let middleware_ip = "127.0.0.1";
     let middleware_port = 9000u16;
 
-    let server_urls = vec!["http://127.0.0.1:8000".to_string()];
+    let server_urls = vec!["http://10.251.174.138:8000".to_string(),"http://10.251.174.196:8000".to_string() ,"http://10.251.174.183:8000".to_string() ];
 
     let middleware = ClientMiddleware::new(middleware_ip, middleware_port, server_urls);
     let middleware_handle = thread::spawn(move || {
