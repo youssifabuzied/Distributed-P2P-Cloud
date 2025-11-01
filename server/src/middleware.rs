@@ -512,8 +512,8 @@ impl ServerMiddleware {
         // CPU availability = 100 - usage
         let cpu_availability = 100.0 - cpu_usage.min(100.0);
 
-        // Calculate weighted priority (50% memory, 50% CPU)
-        let priority = (memory_percent * 0.5 + cpu_availability * 0.5) as u32;
+        // Calculate weighted priority (80% memory, 20% CPU)
+        let priority = (memory_percent * 0.8 + cpu_availability * 0.2) as u32;
 
         println!(
             "[System] Server {}: Memory: {:.1}% available, CPU: {:.1}% available, Priority: {}",
