@@ -113,11 +113,13 @@ mod metrics {
             let failed = total_requests - successful;
             let success_rate = (successful as f64 / total_requests as f64) * 100.0;
 
-            let turnaround_times: Vec<Duration> = metrics
+            // collect turnaround times (only for completed requests that have end_time)
+            let turnaround_times: Vec<std::time::Duration> = metrics
                 .values()
                 .filter_map(|m| m.turnaround_time())
                 .collect();
 
+            // average turnaround time in milliseconds (same as before)
             let avg_turnaround = if !turnaround_times.is_empty() {
                 let total_ms: u128 = turnaround_times.iter().map(|d| d.as_millis()).sum();
                 total_ms as f64 / turnaround_times.len() as f64
@@ -137,26 +139,57 @@ mod metrics {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
 
-            let total_elapsed = self.start_time.elapsed();
-            let throughput = successful as f64 / total_elapsed.as_secs_f64();
+            // TOTAL ACTIVE TIME: sum of all individual turnaround times (excludes gaps between requests)
+            let total_active_duration = turnaround_times
+                .iter()
+                .fold(std::time::Duration::from_secs(0), |acc, d| acc + *d);
+
+            // Also compute wall-clock elapsed since metrics collector started (includes idle gaps)
+            let total_wall_elapsed = self.start_time.elapsed();
+
+            // Compute throughput two ways:
+            // - wall_throughput: successful requests / wall-clock elapsed seconds (what you had before)
+            // - active_throughput: successful requests / total_active_duration seconds (excludes gaps)
+            let wall_throughput = if total_wall_elapsed.as_secs_f64() > 0.0 {
+                successful as f64 / total_wall_elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let active_throughput = if total_active_duration.as_secs_f64() > 0.0 {
+                successful as f64 / total_active_duration.as_secs_f64()
+            } else {
+                0.0
+            };
 
             println!("\n========================================");
             println!("STRESS TEST RESULTS");
             println!("========================================");
-            println!("Total Requests:        {}", total_requests);
-            println!("Successful:            {}", successful);
-            println!("Failed:                {}", failed);
-            println!("Success Rate:          {:.2}%", success_rate);
+            println!("Total Requests: {}", total_requests);
+            println!("Successful: {}", successful);
+            println!("Failed: {}", failed);
+            println!("Success Rate: {:.2}%", success_rate);
             println!("----------------------------------------");
             println!("Turnaround Time (Avg): {:.2} ms", avg_turnaround);
             println!("Turnaround Time (Min): {} ms", min_turnaround);
             println!("Turnaround Time (Max): {} ms", max_turnaround);
             println!("----------------------------------------");
             println!(
-                "Total Elapsed Time:    {:.2} seconds",
-                total_elapsed.as_secs_f64()
+                "Total Active Time (sum of turnarounds): {:.2} seconds",
+                total_active_duration.as_secs_f64()
             );
-            println!("Throughput:            {:.2} requests/second", throughput);
+            println!(
+                "Total Wall-clock Elapsed: {:.2} seconds",
+                total_wall_elapsed.as_secs_f64()
+            );
+            println!(
+                "Throughput (wall-clock): {:.2} requests/second",
+                wall_throughput
+            );
+            println!(
+                "Throughput (active only): {:.2} requests/second",
+                active_throughput
+            );
             println!("========================================\n");
 
             if failed > 0 {
@@ -164,7 +197,7 @@ mod metrics {
                 println!("----------------------------------------");
                 for metric in metrics.values().filter(|m| !m.success) {
                     println!(
-                        "  #{} - {} - {}",
+                        " #{} - {} - {}",
                         metric.request_id,
                         metric.filename,
                         metric
@@ -317,7 +350,7 @@ mod stress_test {
                 // Sleep a random duration between 5 and 20 seconds to simulate varied client behavior
                 let mut rng = rand::thread_rng();
                 let secs: u64 = rng.gen_range(5..=20);
-                thread::sleep(Duration::from_secs(secs));
+                thread::sleep(Duration::from_secs(15));
             }
 
             println!(
@@ -500,17 +533,14 @@ mod config {
             println!("========================================");
             println!("Cloud P2P Stress Test Client");
             println!("========================================");
-            println!("Middleware Port:      {}", self.middleware_port);
-            println!("Input Directory:      {}", self.input_dir);
-            println!("Output Directory:     {}", self.output_dir);
+            println!("Middleware Port: {}", self.middleware_port);
+            println!("Input Directory: {}", self.input_dir);
+            println!("Output Directory: {}", self.output_dir);
             println!(
-                "Middleware Address:   {}:{}",
+                "Middleware Address: {}:{}",
                 self.middleware_ip, self.middleware_port
             );
-            println!(
-                "Server URLs:          {} configured",
-                self.server_urls.len()
-            );
+            println!("Server URLs: {} configured", self.server_urls.len());
             println!("========================================\n");
         }
     }
@@ -528,7 +558,7 @@ fn main() {
         Err(e) => {
             eprintln!("Error: {}", e);
             eprintln!("\nExample:");
-            eprintln!("  stress_test_client 9000 ./test_images ./encrypted_output");
+            eprintln!(" stress_test_client 9000 ./test_images ./encrypted_output");
             std::process::exit(1);
         }
     };
@@ -550,7 +580,7 @@ fn main() {
     }
 
     config.print();
-    println!("Images Found:         {}\n", image_files.len());
+    println!("Images Found: {}\n", image_files.len());
 
     let middleware = ClientMiddleware::new(
         &config.middleware_ip,

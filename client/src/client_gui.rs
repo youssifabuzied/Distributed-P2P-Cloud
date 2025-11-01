@@ -399,7 +399,11 @@ fn main() {
     let middleware_ip = "127.0.0.1";
     let middleware_port = 9000u16;
 
-    let server_urls = vec!["http://10.251.174.138:8000".to_string(),"http://10.251.174.196:8000".to_string() ,"http://10.251.174.183:8000".to_string() ];
+    let server_urls = vec![
+        "http://10.40.32.12:8000".to_string(),
+        // "http://10.251.174.196:8000".to_string(),
+        // "http://10.251.174.183:8000".to_string(),
+    ];
 
     let middleware = ClientMiddleware::new(middleware_ip, middleware_port, server_urls);
     let middleware_handle = thread::spawn(move || {
