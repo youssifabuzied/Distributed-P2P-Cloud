@@ -657,7 +657,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 address: "10.251.174.183:8001".to_string(),
             },
         ],
-        election_timeout_ms: 7000,
+        election_timeout_ms: 3500,
         failure_port: 8002,
         failure_check_interval_secs: 10,
         recovery_timeout_secs: 10,
