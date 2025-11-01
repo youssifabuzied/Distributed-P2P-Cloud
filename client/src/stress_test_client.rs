@@ -113,13 +113,11 @@ mod metrics {
             let failed = total_requests - successful;
             let success_rate = (successful as f64 / total_requests as f64) * 100.0;
 
-            // collect turnaround times (only for completed requests that have end_time)
             let turnaround_times: Vec<std::time::Duration> = metrics
                 .values()
                 .filter_map(|m| m.turnaround_time())
                 .collect();
 
-            // average turnaround time in milliseconds (same as before)
             let avg_turnaround = if !turnaround_times.is_empty() {
                 let total_ms: u128 = turnaround_times.iter().map(|d| d.as_millis()).sum();
                 total_ms as f64 / turnaround_times.len() as f64
@@ -139,17 +137,12 @@ mod metrics {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
 
-            // TOTAL ACTIVE TIME: sum of all individual turnaround times (excludes gaps between requests)
             let total_active_duration = turnaround_times
                 .iter()
                 .fold(std::time::Duration::from_secs(0), |acc, d| acc + *d);
 
-            // Also compute wall-clock elapsed since metrics collector started (includes idle gaps)
             let total_wall_elapsed = self.start_time.elapsed();
 
-            // Compute throughput two ways:
-            // - wall_throughput: successful requests / wall-clock elapsed seconds (what you had before)
-            // - active_throughput: successful requests / total_active_duration seconds (excludes gaps)
             let wall_throughput = if total_wall_elapsed.as_secs_f64() > 0.0 {
                 successful as f64 / total_wall_elapsed.as_secs_f64()
             } else {
@@ -284,7 +277,7 @@ mod filesystem {
 }
 
 // =======================================
-// Stress Test Runner Module
+// Stress Test Runner
 // =======================================
 
 mod stress_test {
@@ -347,10 +340,7 @@ mod stress_test {
                     }
                 }
 
-                // Sleep a random duration between 5 and 20 seconds to simulate varied client behavior
-                let mut rng = rand::thread_rng();
-                let secs: u64 = rng.gen_range(5..=20);
-                thread::sleep(Duration::from_secs(15));
+                thread::sleep(Duration::from_secs(5));
             }
 
             println!(
@@ -476,7 +466,7 @@ mod stress_test {
 }
 
 // =======================================
-// Configuration Module
+// Config Module — ✅ added repeat_count
 // =======================================
 
 mod config {
@@ -486,6 +476,7 @@ mod config {
         pub middleware_port: u16,
         pub input_dir: String,
         pub output_dir: String,
+        pub repeat_count: u32, // 👈 NEW
         pub username: String,
         pub client_ip: String,
         pub client_port: u16,
@@ -495,9 +486,10 @@ mod config {
 
     impl Config {
         pub fn from_args(args: Vec<String>) -> Result<Self, String> {
-            if args.len() != 4 {
+            // ⬇️ now expecting 4 args + program name = len 5
+            if args.len() != 5 {
                 return Err(format!(
-                    "Usage: {} <middleware_port> <input_directory> <output_directory>",
+                    "Usage: {} <middleware_port> <input_directory> <output_directory> <repeat_count>",
                     args[0]
                 ));
             }
@@ -509,6 +501,10 @@ mod config {
             let input_dir = args[2].clone();
             let output_dir = args[3].clone();
 
+            let repeat_count: u32 = args[4] // 👈 NEW
+                .parse()
+                .map_err(|_| format!("Invalid repeat_count: {}", args[4]))?; // 👈 NEW
+
             if !Path::new(&input_dir).exists() {
                 return Err(format!("Input directory does not exist: {}", input_dir));
             }
@@ -517,15 +513,12 @@ mod config {
                 middleware_port,
                 input_dir,
                 output_dir,
+                repeat_count, // 👈 NEW
                 username: "stress_test_user".to_string(),
                 client_ip: "127.0.0.1".to_string(),
                 client_port: 8080,
                 middleware_ip: "127.0.0.1".to_string(),
-                server_urls: vec![
-                    "http://10.251.174.138:8000".to_string(),
-                    "http://10.251.174.196:8000".to_string(),
-                    "http://10.251.174.183:8000".to_string(),
-                ],
+                server_urls: vec!["http://10.40.32.12:8000".to_string()],
             })
         }
 
@@ -536,6 +529,7 @@ mod config {
             println!("Middleware Port: {}", self.middleware_port);
             println!("Input Directory: {}", self.input_dir);
             println!("Output Directory: {}", self.output_dir);
+            println!("Repeat Count: {}", self.repeat_count); // 👈 NEW
             println!(
                 "Middleware Address: {}:{}",
                 self.middleware_ip, self.middleware_port
@@ -547,7 +541,7 @@ mod config {
 }
 
 // =======================================
-// Main Entry Point
+// Main — ✅ run batches
 // =======================================
 
 fn main() {
@@ -558,7 +552,7 @@ fn main() {
         Err(e) => {
             eprintln!("Error: {}", e);
             eprintln!("\nExample:");
-            eprintln!(" stress_test_client 9000 ./test_images ./encrypted_output");
+            eprintln!(" stress_test_client 9000 ./test_images ./encrypted_output 4");
             std::process::exit(1);
         }
     };
@@ -605,11 +599,19 @@ fn main() {
     );
 
     let runner = stress_test::StressTestRunner::new(client, output_dir.to_path_buf());
-    runner.run(image_files);
+
+    // ✅ LOOP runs based on repeat_count
+    for i in 1..=config.repeat_count {
+        println!(
+            "\n========== Batch {}/{} ==========\n",
+            i, config.repeat_count
+        );
+        runner.run(image_files.clone());
+    }
 
     println!("[StressTest] Shutting down...");
-    println!("[StressTest] Note: Middleware is still running (background thread)");
-    println!("[StressTest] Press Ctrl+C to fully exit\n");
+    println!("[StressTest] Middleware still running (background)");
+    println!("[StressTest] Press Ctrl+C to exit\n");
 
     let _ = middleware_handle.join();
 }

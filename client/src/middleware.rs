@@ -253,7 +253,7 @@ impl ClientMiddleware {
         // Per-MB overhead: 6 seconds per MB (ceiling)
         let size_bytes = file_data.len() as f64;
         let size_mb = size_bytes / (1024.0 * 1024.0);
-        let per_mb_secs: u64 = 6;
+        let per_mb_secs: u64 = 15;
         let extra_mb = size_mb.ceil() as u64; // ceil(3.5) -> 4
         let timeout_secs = 30u64.saturating_add(extra_mb.saturating_mul(per_mb_secs));
         let timeout_duration = Duration::from_secs(timeout_secs);
@@ -382,7 +382,7 @@ impl ClientMiddleware {
         // === NEW: compute client timeout consistently with outer logic ===
         let size_bytes = file_data.len() as f64;
         let size_mb = size_bytes / (1024.0 * 1024.0);
-        let per_mb_secs: u64 = 6;
+        let per_mb_secs: u64 = 15;
         let extra_mb = size_mb.ceil() as u64;
         let timeout_secs = 30u64.saturating_add(extra_mb.saturating_mul(per_mb_secs));
         // ===============================================================
