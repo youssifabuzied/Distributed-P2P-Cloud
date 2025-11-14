@@ -1,3 +1,5 @@
 target/
 resources/encrypted_test_images_low/
 resources/encrypted_test_images_med/
+__pycache__/
+database.db
