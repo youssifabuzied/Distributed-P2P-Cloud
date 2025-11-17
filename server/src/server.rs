@@ -31,7 +31,7 @@ use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 
 /// Request structure for encryption operations
 #[derive(Serialize, Deserialize, Debug)]
-pub struct EncryptionRequest {
+pub struct EncryptionRequest { //VIEWS NEED TO CHANGE
     pub request_id: u64,
     pub filename: String,
     pub views: u64,
@@ -51,7 +51,7 @@ pub struct EncryptionResponse {
 
 /// Hidden payload structure for steganography
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload {
+struct HiddenPayload { //VIEWS NEED TO CHANGE
     message: String,
     views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
@@ -292,7 +292,7 @@ impl Server {
                     request.request_id,
                     request.filename,
                     request.file_data.len(),
-                    request.views
+                    request.views //VIEWS NEED TO CHANGE
                 );
 
                 // Proceed to encryption with cached resources
@@ -324,7 +324,7 @@ impl Server {
     /// Chooses the most appropriate cached cover image (small/medium/large) so that
     /// resizing work is minimized and overall latency is reduced. This version
     /// computes a conservative required_side up-front (no retries).
-    fn encrypt_data(
+    fn encrypt_data( 
         request: EncryptionRequest,
         tmp_dir: &PathBuf,
         covers: &Arc<Vec<CachedCover>>,
@@ -335,7 +335,7 @@ impl Server {
             request.request_id,
             request.filename,
             request.file_data.len(),
-            request.views
+            request.views //VIEWS NEED TO CHANGE
         );
 
         // original_size to return in responses
@@ -395,11 +395,13 @@ impl Server {
         // Build payload and serialize with bincode
         let payload = HiddenPayload {
             message: format!("Hidden from file: {}", request.filename),
-            views: request.views,
+            views: request.views, //VIEWS NEED TO CHANGE
             image_bytes: working_image_bytes.clone(),
             extra: Some("Metadata info".to_string()),
         };
-
+        //NEED TO CHANGE ENCRYPTION LOGIC
+        //VIEWS TO BE ENCODED OUTSIDE OF COVER IMAGE
+        //MODFIY FUNCTION TO REFLECT THIS
         let serialized = match bincode::serialize(&payload) {
             Ok(s) => s,
             Err(e) => {
@@ -648,14 +650,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
         peers: vec![
-            PeerInfo {
-                server_id: 1,
-                address: "10.251.174.138:8001".to_string(),
-            },
-            PeerInfo {
-                server_id: 3,
-                address: "10.251.174.183:8001".to_string(),
-            },
+            // PeerInfo {
+            //     server_id: 1,
+            //     address: "10.251.174.138:8001".to_string(),
+            // },
+            // PeerInfo {
+            //     server_id: 3,
+            //     address: "10.251.174.183:8001".to_string(),
+            // },
         ],
         election_timeout_ms: 3500,
         failure_port: 8002,

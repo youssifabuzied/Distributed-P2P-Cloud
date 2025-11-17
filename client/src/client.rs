@@ -181,6 +181,7 @@ impl Client {
     }
 
     /// Request encryption (async)
+    //VIEWS NEED TO CHANGE
     pub fn request_encryption(&self, image_path: &str,
     views: u64,) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
@@ -318,7 +319,7 @@ impl Client {
                 continue;
             }
 
-            match tokens[0] {
+            match tokens[0] { //VIEWS NEED TO CHANGE
                 "encrypt" if tokens.len() == 3 => {
                     let image_path = tokens[1];
                     let views_str = tokens[2];

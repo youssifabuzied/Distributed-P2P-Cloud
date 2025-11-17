@@ -25,7 +25,7 @@ use stegano_core::api::unveil::prepare as extract_prepare;
 // ---------------------------------------
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum ClientRequest {
+pub enum ClientRequest { //VIEWS NEED TO CHANGE
     EncryptImage {
         request_id: u64,
         image_path: String,
@@ -75,7 +75,7 @@ pub struct ServerResponse {
     pub file_size: Option<usize>,
 }
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload {
+struct HiddenPayload { //VIEWS NEED TO CHANGE
     message: String,
     views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
@@ -198,12 +198,14 @@ impl ClientMiddleware {
 
     fn forward_to_servers(server_urls: &[String], request: ClientRequest) -> MiddlewareResponse {
         match request {
+            //VIEWS NEED TO CHANGE
             ClientRequest::EncryptImage {
                 request_id,
                 image_path,
                 views,
             } => {
                 // Forward encryption to ALL servers and wait for first response
+                //VIEWS NEED TO CHANGE
                 Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path, views)
             }
             ClientRequest::DecryptImage {
@@ -221,7 +223,7 @@ impl ClientMiddleware {
         server_urls: &[String],
         request_id: u64,
         image_path: &str,
-        views: u64,
+        views: u64, //VIEWS NEED TO CHANGE
     ) -> MiddlewareResponse {
         use std::fs;
         use std::path::Path;
@@ -268,7 +270,7 @@ impl ClientMiddleware {
             request_id,
             server_urls.len(),
             file_data.len(),
-            views,
+            views, //VIEWS NEED TO CHANGE
             timeout_secs
         );
 
@@ -284,7 +286,7 @@ impl ClientMiddleware {
                 let file_data = file_data.clone();
                 let filename = filename.clone();
                 let response = Arc::clone(&response);
-                let views = views;
+                let views = views; //VIEWS NEED TO CHANGE
 
                 let handle = thread::spawn(move || {
                     println!(
@@ -292,7 +294,7 @@ impl ClientMiddleware {
                         request_id,
                         index + 1,
                         server_url,
-                        views
+                        views //VIEWS NEED TO CHANGE
                     );
 
                     match Self::send_encrypt_to_single_server(
@@ -300,7 +302,7 @@ impl ClientMiddleware {
                         request_id,
                         &filename,
                         &file_data,
-                        views,
+                        views, //VIEWS NEED TO CHANGE
                     ) {
                         Ok(server_response) => {
                             if server_response.status == "OK" {
@@ -372,12 +374,12 @@ impl ClientMiddleware {
         }
     }
 
-    fn send_encrypt_to_single_server(
+    fn send_encrypt_to_single_server( 
         server_url: &str,
         request_id: u64,
         filename: &str,
         file_data: &[u8],
-        views: u64,
+        views: u64,//VIEWS NEED TO CHANGE
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // === NEW: compute client timeout consistently with outer logic ===
         let size_bytes = file_data.len() as f64;
@@ -397,7 +399,7 @@ impl ClientMiddleware {
         let form = reqwest::blocking::multipart::Form::new()
             .text("request_id", request_id.to_string())
             .text("filename", filename.to_string())
-            .text("views", views.to_string())
+            .text("views", views.to_string()) //VIEWS NEED TO CHANGE
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file_data.to_vec())
@@ -454,7 +456,12 @@ impl ClientMiddleware {
             "[ClientMiddleware] [Req #{}] Decrypting locally: {}",
             request_id, image_path
         );
-
+        //DECRYPTION LOGIC NEEDED
+        //EXTRACT VIEWS LIST
+        //CHECK IF WE CAN STILL VIEW (AGREE ON IMPLEMENTATION LATER)
+        //DECREMENT VIEW COUNT IF ALLOWED
+        //RETURN ERROR IF NOT ALLOWED
+        //CHANGE PAYLOAD TO REFLECT NEW VIEW COUNT
         let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
             Ok(dir) => dir,
             Err(e) => {

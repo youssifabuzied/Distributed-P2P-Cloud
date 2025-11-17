@@ -802,7 +802,7 @@ pub async fn encrypt_handler(
     let mut request_id = 0u64;
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
-    let mut views = 0u64;
+    let mut views = 0u64; //VIEWS NEED TO CHANGE
     while let Some(field) = multipart.next_field().await.unwrap() {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
@@ -813,7 +813,7 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => {
+            "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
                 views = data.parse().unwrap_or(0);
             }
@@ -850,7 +850,7 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => {
+            "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
                 views = data.parse().unwrap_or(0);
             }
@@ -893,7 +893,7 @@ pub async fn encrypt_handler(
         request_id,
         filename,
         file_data.len(),
-        views
+        views //VIEWS NEED TO CHANGE
     );
 
     // ========================================
@@ -974,7 +974,7 @@ pub async fn encrypt_handler(
     let encryption_request = json!({
         "request_id": request_id,
         "filename": filename,
-        "views": views,
+        "views": views, //VIEWS NEED TO CHANGE
         "file_data": file_data,
     });
 
@@ -1105,7 +1105,7 @@ pub async fn encrypt_handler(
                         "output_filename": output_filename,
                         "file_data": base64_data,
                         "file_size": encrypted_data.len(),
-                        "views": views,
+                        "views": views, //VIEWS NEED TO CHANGE
                         "processed_by": server_id,
                     })))
                 }
