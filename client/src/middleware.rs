@@ -12,14 +12,22 @@ use hex;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 use stegano_core::api::unveil::prepare as extract_prepare;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce
+};
+use png::{Encoder, Decoder, TextChunk};
+use std::fs::File;
+
 // ---------------------------------------
 // Shared Structures
 // ---------------------------------------
@@ -29,11 +37,12 @@ pub enum ClientRequest { //VIEWS NEED TO CHANGE
     EncryptImage {
         request_id: u64,
         image_path: String,
-        views: u64,
+        views: HashMap<String, u64>, // Map of peer ID to allowed views
     },
     DecryptImage {
         request_id: u64,
         image_path: String,
+        username: String,
     },
 }
 
@@ -75,11 +84,11 @@ pub struct ServerResponse {
     pub file_size: Option<usize>,
 }
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload { //VIEWS NEED TO CHANGE
+struct HiddenPayload { //VIEWS NEED TO CHANGE + VIEWS NO LONGER IN PAYLOAD!!!!
     message: String,
-    views: u64,
+    // views: HashMap<String, u64>,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    extra: Option<String>,
+    // extra: Option<String>,
 }
 
 // ---------------------------------------
@@ -211,9 +220,10 @@ impl ClientMiddleware {
             ClientRequest::DecryptImage {
                 request_id,
                 image_path,
+                username,
             } => {
                 // Handle decryption locally (no server needed)
-                Self::decrypt_image_locally(request_id, &image_path)
+                Self::decrypt_image_locally(request_id, &image_path,&username)
             }
         }
     }
@@ -223,7 +233,7 @@ impl ClientMiddleware {
         server_urls: &[String],
         request_id: u64,
         image_path: &str,
-        views: u64, //VIEWS NEED TO CHANGE
+        views: HashMap<String, u64>, //VIEWS NEED TO CHANGE
     ) -> MiddlewareResponse {
         use std::fs;
         use std::path::Path;
@@ -266,7 +276,7 @@ impl ClientMiddleware {
         // ===============================================
 
         println!(
-            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes) ({} views) -> timeout: {}s",
+            "[ClientMiddleware] [Req #{}] Broadcasting to {} servers ({} bytes) ({:?} views) -> timeout: {}s",
             request_id,
             server_urls.len(),
             file_data.len(),
@@ -286,11 +296,11 @@ impl ClientMiddleware {
                 let file_data = file_data.clone();
                 let filename = filename.clone();
                 let response = Arc::clone(&response);
-                let views = views; //VIEWS NEED TO CHANGE
+                let views = views.clone(); //VIEWS NEED TO CHANGE
 
                 let handle = thread::spawn(move || {
                     println!(
-                        "[ClientMiddleware] [Req #{}] [Server {}] Sending to {} ({} views)",
+                        "[ClientMiddleware] [Req #{}] [Server {}] Sending to {} ({:?} views)",
                         request_id,
                         index + 1,
                         server_url,
@@ -302,7 +312,7 @@ impl ClientMiddleware {
                         request_id,
                         &filename,
                         &file_data,
-                        views, //VIEWS NEED TO CHANGE
+                        &views, //VIEWS NEED TO CHANGE
                     ) {
                         Ok(server_response) => {
                             if server_response.status == "OK" {
@@ -379,7 +389,7 @@ impl ClientMiddleware {
         request_id: u64,
         filename: &str,
         file_data: &[u8],
-        views: u64,//VIEWS NEED TO CHANGE
+        views: HashMap<String, u64>,//VIEWS NEED TO CHANGE
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // === NEW: compute client timeout consistently with outer logic ===
         let size_bytes = file_data.len() as f64;
@@ -395,11 +405,11 @@ impl ClientMiddleware {
             .build()?;
 
         let url = format!("{}/encrypt", server_url);
-
+        let views_json = serde_json::to_string(&views)?; //NEED TO SERIALIZE FIRST, DESERIALIZE SERVER SIDE
         let form = reqwest::blocking::multipart::Form::new()
             .text("request_id", request_id.to_string())
             .text("filename", filename.to_string())
-            .text("views", views.to_string()) //VIEWS NEED TO CHANGE
+            .text("views", views_json) //VIEWS NEED TO CHANGE
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file_data.to_vec())
@@ -446,7 +456,7 @@ impl ClientMiddleware {
     }
 
     // New local decryption function (dummy implementation)
-    fn decrypt_image_locally(request_id: u64, image_path: &str) -> MiddlewareResponse {
+    fn decrypt_image_locally(request_id: u64, image_path: &str, username: &str) -> MiddlewareResponse {
         // Validate file exists
         if !Path::new(image_path).exists() {
             return MiddlewareResponse::error(request_id, "Encrypted file not found");
@@ -456,9 +466,56 @@ impl ClientMiddleware {
             "[ClientMiddleware] [Req #{}] Decrypting locally: {}",
             request_id, image_path
         );
+
         //DECRYPTION LOGIC NEEDED
         //EXTRACT VIEWS LIST
+        let decoder = Decoder::new(File::open(image_path));
+        let mut reader = decoder.read_info();
+        let mut encrypted = None;
+        for chunk in reader.info().uncompressed_latin1_text.iter() {
+            if chunk.keyword == "EncryptedViews" {
+                encrypted = Some(chunk.text.clone());
+            }
+        }
+        for chunk in reader.info().utf8_text.iter() {
+            if chunk.keyword == "EncryptedViews" {
+                encrypted = Some(chunk.text.clone());
+            }
+        }
+        for chunk in reader.info().compressed_latin1_text.iter() {
+            if chunk.keyword == "EncryptedViews" {
+                encrypted = Some(chunk.text.clone());
+            }
+        }
+        let encrypted = encrypted.ok_or("EncryptedViews chunk not found");
+        let secret_key = b"supersecretkey_supersecretkey_32";
+        let view_key = Key::<XChaCha20Poly1305>::from_slice(secret_key);
+        let cipher = XChaCha20Poly1305::new(&view_key);
+
+        let decoded_views = hex::decode(encrypted);
+        let (nonce_bytes, ciphertext) = decoded_views.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let plaintext = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] });
+        //VIEWS EXTRACTED
+        let parsed_views: HashMap<String, u64> = serde_json::from_slice(&plaintext);
+        println!(
+            "[ClientMiddleware] [Req #{}] Image Users and Views: {:?}",
+            request_id, parsed_views
+        );
         //CHECK IF WE CAN STILL VIEW (AGREE ON IMPLEMENTATION LATER)
+        if let Some(count) = parsed_views.get(username) {
+            if *count == 0 {
+                return Ok(MiddlewareResponse::error(request_id, "Username Views Exceeded"));
+            }
+            *count -= 1;
+            // User exists and has views
+            println!("User {} has {} views remaining", username, *count);
+        } else {
+            // Username not found
+            return Ok(MiddlewareResponse::error(request_id, "Username Not Found"));
+        }
+        
         //DECREMENT VIEW COUNT IF ALLOWED
         //RETURN ERROR IF NOT ALLOWED
         //CHANGE PAYLOAD TO REFLECT NEW VIEW COUNT
@@ -478,9 +535,21 @@ impl ClientMiddleware {
 
         println!("[ClientMiddleware] [Req #{}] Decryption Begin", request_id);
 
-        let secret_key = b"supersecretkey_supersecretkey_32";
-        let key = Key::<Aes256Gcm>::from_slice(secret_key);
-        let password_hex = hex::encode(key);
+        
+        //let key = Key::<Aes256Gcm>::from_slice(secret_key);
+        let password_hex = hex::encode(secret_key);
+
+        //VIEW ENCRYPTION SETUP
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        //VIEW ENCRYPTION LOGIC
+        let json = serde_json::to_vec(&parsed_views);
+        let ciphertext = cipher.encrypt(nonce, Payload { msg: &json, aad: &[] });
+        let mut full = Vec::new();
+        full.extend_from_slice(&nonce_bytes);
+        full.extend_from_slice(&ciphertext);
+        let encoded_views=hex::encode(full);
+        
+        
         if let Err(e) = extract_prepare()
             .using_password(password_hex.as_str())
             .from_secret_file(image_path)
@@ -535,10 +604,9 @@ impl ClientMiddleware {
             }
         };
         println!("Recovered message: {}", recovered.message);
-        println!("Views: {}", recovered.views);
-        if let Some(extra) = &recovered.extra {
-            println!("Extra: {}", extra);
-        }
+        // if let Some(extra) = &recovered.extra {
+        //     println!("Extra: {}", extra);
+        // }
         let output_dir = PathBuf::from("client_storage");
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
             return MiddlewareResponse::error(
@@ -560,6 +628,34 @@ impl ClientMiddleware {
                     request_id,
                     output_path.display()
                 );
+                //EMBED UPDATED VIEWS INTO IMAGE
+                let file = File::open(output_path);
+                let decoder = Decoder::new(BufReader::new(file));
+                let mut reader = decoder.read_info();
+                let mut buf = vec![0; reader.output_buffer_size()];
+                let info = reader.next_frame(&mut buf);
+                buf.truncate(info.buffer_size());
+
+                // Re-encode with a new iTXt chunk
+                let out = File::create(output_path);
+                let w = BufWriter::new(out);
+
+                let mut encoder = Encoder::new(w, info.width, info.height);
+                encoder.set_color(info.color_type);
+                encoder.set_depth(info.bit_depth);
+
+                let mut writer = encoder.write_header();
+
+                writer.write_text_chunk(TextChunk::InternationalText {
+                    keyword: "EncryptedViews".into(),
+                    language_tag: "".into(),
+                    translated_keyword: "".into(),
+                    text: encoded_views.into(),
+                    compressed: false,
+                });
+
+                writer.write_image_data(&buf);
+                writer.finish();
                 MiddlewareResponse::success(
                     request_id,
                     &format!(

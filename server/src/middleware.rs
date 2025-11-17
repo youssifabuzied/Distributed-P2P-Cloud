@@ -16,6 +16,7 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
+use std::collections::HashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -802,7 +803,7 @@ pub async fn encrypt_handler(
     let mut request_id = 0u64;
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
-    let mut views = 0u64; //VIEWS NEED TO CHANGE
+    let mut views: HashMap<String, u64> = HashMap::new();
     while let Some(field) = multipart.next_field().await.unwrap() {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
@@ -815,7 +816,7 @@ pub async fn encrypt_handler(
             }
             "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
-                views = data.parse().unwrap_or(0);
+                views = serde_json::from_str(&data).unwrap_or_default();
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -852,7 +853,7 @@ pub async fn encrypt_handler(
             }
             "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
-                views = data.parse().unwrap_or(0);
+                views = serde_json::from_str(&data).unwrap_or_default();
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -889,7 +890,7 @@ pub async fn encrypt_handler(
     }
 
     println!(
-        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({} views)",
+        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({:?} views)",
         request_id,
         filename,
         file_data.len(),

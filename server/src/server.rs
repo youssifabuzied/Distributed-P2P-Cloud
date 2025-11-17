@@ -17,7 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tempfile::Builder;
-
+use std::collections::HashMap;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce
+};
+use png::{Encoder, Decoder, TextChunk};
+use std::fs::File;
 // Re-import the steganography builder function used in original code
 use stegano_core::api::hide::prepare as hide_prepare;
 
@@ -34,7 +40,7 @@ use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 pub struct EncryptionRequest { //VIEWS NEED TO CHANGE
     pub request_id: u64,
     pub filename: String,
-    pub views: u64,
+    pub views: HashMap<String, u64>,
     pub file_data: Vec<u8>, // Raw image bytes
 }
 
@@ -53,9 +59,9 @@ pub struct EncryptionResponse {
 #[derive(Serialize, Deserialize, Debug)]
 struct HiddenPayload { //VIEWS NEED TO CHANGE
     message: String,
-    views: u64,
+    //views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    extra: Option<String>,
+    //extra: Option<String>,
 }
 
 impl EncryptionResponse {
@@ -217,7 +223,8 @@ impl Server {
 
         // Cache password_hex once (safe optimization)
         let secret_key: &[u8] = b"supersecretkey_supersecretkey_32";
-        let password_hex = Arc::new(hex::encode(secret_key));
+        let view_key = Key::<XChaCha20Poly1305>::from_slice(secret_key);
+        let password_hex = Arc::new(hex::encode(view_key));
 
         // Accept incoming connections
         for stream in listener.incoming() {
@@ -391,6 +398,25 @@ impl Server {
                 }
             }
         }
+
+
+        //VIEW ENCRYPTION SETUP
+        let view_key = Key::from_slice(secret_key);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let json = serde_json::to_vec(&ViewsData { views: views.clone() })?;
+        //VIEW ENCRYPTION LOGIC
+        let ciphertext = cipher.encrypt(nonce, Payload { msg: &json, aad: &[] })?;
+        let mut full = Vec::new();
+        full.extend_from_slice(&nonce_bytes);
+        full.extend_from_slice(&ciphertext);
+        let encoded_views=hex::encode(full);
+        //VIEW DECODING LOGIC
+        let decoded_views = hex::decode(encoded_views)?
+        let (nonce_bytes, ciphertext) = decoded_views.split_at(12);
+        let plaintext = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] })?;
+        let parsed: ViewsData = serde_json::from_slice(&plaintext)?;
+        let parsed_views = parsed.views;
 
         // Build payload and serialize with bincode
         let payload = HiddenPayload {
