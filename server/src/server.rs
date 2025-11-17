@@ -1,8 +1,3 @@
-// =======================================
-// server.rs - Deterministic required-side cover selection (no retries)
-// Cloud P2P Controlled Image Sharing Project
-// =======================================
-
 use bincode;
 use hex;
 use image::imageops::FilterType;
@@ -22,6 +17,7 @@ use tempfile::Builder;
 use stegano_core::api::hide::prepare as hide_prepare;
 
 // Import middleware module and its config types
+mod directory_service;
 mod middleware;
 use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 

@@ -1,13 +1,5 @@
-// =======================================
-// middleware.rs - Simplified Election
-// Cloud P2P Controlled Image Sharing Project
-// =======================================
-//
-// Election Algorithm:
-// 1. Each server broadcasts its priority to all peers (no response expected)
-// 2. Each server listens for 5 seconds for higher priority announcements
-// 3. If higher priority received -> drop request
-// 4. If no higher priority after 5 seconds -> process request
+use crate::directory_service;
+
 use axum::extract::DefaultBodyLimit;
 use axum::{
     Router,
@@ -16,6 +8,7 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,6 +21,7 @@ use sysinfo::System;
 use tokio::fs;
 use tokio::task;
 use tower_http::trace::TraceLayer;
+
 // =======================================
 // Configuration Structures
 // =======================================
@@ -424,6 +418,8 @@ impl ServerMiddleware {
             .route("/", get(root_handler))
             .route("/health", get(health_handler))
             .route("/encrypt", post(encrypt_handler))
+            .route("/register", post(register_handler))
+            .route("/add_image", post(add_image_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100)) // 100 MB
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1164,6 +1160,78 @@ async fn handle_failure_announcement(
     Json(serde_json::json!({
         "status": "received"
     }))
+}
+
+// Register client
+async fn register_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+    let ip = payload["ip"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Received registration request: {} {}",
+        request_id, username, ip
+    );
+
+    match directory_service::register_client(username, ip).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "success",
+            "message": format!("Client {} registered successfully", username),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Registration failed: {}", e),
+        }))),
+    }
+}
+
+// Add image
+async fn add_image_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let image_bytes_b64 = payload["image_bytes"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Received add image request: {} {} ({} bytes base64)",
+        request_id,
+        username,
+        image_name,
+        image_bytes_b64.len()
+    );
+
+    // Decode base64 image data
+    let image_bytes = match general_purpose::STANDARD.decode(image_bytes_b64) {
+        Ok(data) => data,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "error",
+                "message": format!("Failed to decode image data: {}", e),
+            })));
+        }
+    };
+
+    match directory_service::add_image(username, image_name, &image_bytes).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "success",
+            "message": format!("Image {} added successfully for user {}", image_name, username),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to add image: {}", e),
+        }))),
+    }
 }
 
 // =======================================

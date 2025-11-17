@@ -18,8 +18,26 @@ pub struct ClientMetadata {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientRequest {
-    EncryptImage { request_id: u64, image_path: String, views: u64},
-    DecryptImage { request_id: u64, image_path: String },
+    EncryptImage {
+        request_id: u64,
+        image_path: String,
+        views: u64,
+    },
+    DecryptImage {
+        request_id: u64,
+        image_path: String,
+    },
+    RegisterWithDirectory {
+        request_id: u64,
+        username: String,
+        ip: String,
+    },
+    AddImage {
+        request_id: u64,
+        username: String,
+        image_name: String,
+        image_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -118,6 +136,8 @@ impl Client {
         let request_id = match &request {
             ClientRequest::EncryptImage { request_id, .. } => *request_id,
             ClientRequest::DecryptImage { request_id, .. } => *request_id,
+            ClientRequest::RegisterWithDirectory { request_id, .. } => *request_id,
+            ClientRequest::AddImage { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -181,8 +201,7 @@ impl Client {
     }
 
     /// Request encryption (async)
-    pub fn request_encryption(&self, image_path: &str,
-    views: u64,) -> Result<u64, Box<dyn Error>> {
+    pub fn request_encryption(&self, image_path: &str, views: u64) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
@@ -298,12 +317,14 @@ impl Client {
         println!("Welcome, {}!", self.metadata.username);
         println!("Middleware: {}", self.middleware_addr);
         println!("\nCommands:");
-        println!("  encrypt <image_path>, <views>    - Queue encryption (returns immediately)");
-        println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
-        println!("  status <request_id>      - Check request status");
-        println!("  list                     - List all requests");
-        println!("  pending                  - Show pending count");
-        println!("  exit                     - Exit the client");
+        println!("  register                         - Register with directory service");
+        println!("  add_image <image_path>           - Add image to directory");
+        println!("  encrypt <image_path> <views>     - Queue encryption (returns immediately)");
+        println!("  decrypt <image_path>             - Queue decryption (returns immediately)");
+        println!("  status <request_id>              - Check request status");
+        println!("  list                             - List all requests");
+        println!("  pending                          - Show pending count");
+        println!("  exit                             - Exit the client");
         println!("========================================");
 
         loop {
@@ -319,6 +340,44 @@ impl Client {
             }
 
             match tokens[0] {
+                "register" => {
+                    let request_id = self.tracker.create_request();
+                    let request = ClientRequest::RegisterWithDirectory {
+                        request_id,
+                        username: self.metadata.username.clone(),
+                        ip: self.metadata.ip.clone(),
+                    };
+
+                    let id = self.send_request_async(request);
+                    println!("Request #{id} queued (registering with directory service)");
+                }
+                "add_image" if tokens.len() == 2 => {
+                    let image_path = tokens[1];
+                    // Extract image name from path
+                    let image_name = Path::new(image_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+
+                    // Read image bytes
+                    match std::fs::read(image_path) {
+                        Ok(image_bytes) => {
+                            let request_id = self.tracker.create_request();
+                            let request = ClientRequest::AddImage {
+                                request_id,
+                                username: self.metadata.username.clone(),
+                                image_name: image_name.to_string(),
+                                image_bytes,
+                            };
+                            let id = self.send_request_async(request);
+                            println!(
+                                "Request #{id} queued (adding image '{}' to directory)",
+                                image_name
+                            );
+                        }
+                        Err(e) => eprintln!("Error reading file: {e}"),
+                    }
+                }
                 "encrypt" if tokens.len() == 3 => {
                     let image_path = tokens[1];
                     let views_str = tokens[2];
@@ -331,7 +390,7 @@ impl Client {
                         },
                         Err(_) => eprintln!("Error: 'views' must be a valid integer"),
                     }
-                },
+                }
                 "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
                     Ok(id) => {
                         println!("Request #{id} queued (background processing)");
