@@ -19,7 +19,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce, Key
 };
 use png::{Encoder, Decoder};
-use png::text_metadata::{ITXtChunk, OptCompressed};
+use png::text_metadata::{ITXtChunk};
 
 
 use std::fs::File;
@@ -452,6 +452,20 @@ impl EncryptionResponse {
         encoder.set_color(info.color_type);
         encoder.set_depth(info.bit_depth);
 
+        if let Err(e) = encoder.add_itxt_chunk(
+            "EncryptedViews".to_string(),
+            encoded_views.clone(),
+        ) {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to add EncryptedViews iTXt chunk: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+
         let mut writer = match encoder.write_header() {
             Ok(w) => w,
             Err(e) => {
@@ -465,26 +479,6 @@ impl EncryptionResponse {
                 };
             }
         };
-
-        // let itxt = ITXtChunk {
-        //     keyword: "EncryptedViews".to_string(),
-        //     language_tag: "".to_string(),
-        //     translated_keyword: "".to_string(),
-        //     text: OptCompressed::Raw(encoded_views.clone().into_bytes()),
-        //     compressed: false,
-        // };
-        // if let Err(e) = writer.write_itext_chunk("EncryptedViews", &encoded_views, Some(""), Some("")) 
-        // {
-        //     return EncryptionResponse {
-        //         request_id: request.request_id,
-        //         status: "error".into(),
-        //         message: format!("Failed to write EncryptedViews chunk: {}", e),
-        //         encrypted_data: None,
-        //         original_size,
-        //         encrypted_size: 0,
-        //     };
-        // }
-
         // Write PNG image data
         if let Err(e) = writer.write_image_data(&buf) {
             return EncryptionResponse {
@@ -555,7 +549,7 @@ impl EncryptionResponse {
 
     fn main() -> Result<(), Box<dyn Error>> {
     // 1️⃣ Load a sample image
-    let test_image_path = "../resources/input.jpg";
+    let test_image_path = "resources/input.jpg";
     println!("Loading input image");
     let image_bytes = fs::read(test_image_path)?;
     println!("Loaded input image: {} ({} bytes)", test_image_path, image_bytes.len());
@@ -672,6 +666,30 @@ impl EncryptionResponse {
     println!("Message: {}", res.message);
     println!("Original Size: {} bytes", res.original_size);
     println!("Encrypted Size: {} bytes", res.encrypted_size);
+    if res.status == "success" {
+            // Save returned file if present
+            if let (Some(file_data_b64)) =
+                (&res.encrypted_data)
+            {
+                let output_filename = PathBuf::from("output.png");
+                let file_data = file_data_b64.clone();                
+                let output_dir = "client_storage";
+                std::fs::create_dir_all(output_dir)?; // ensure dir exists
+                let output_stem = output_filename
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+                let output_path = output_filename
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|name| format!("{}/{}", output_dir, name))
+                .unwrap_or_else(|| format!("{}/output.png", output_dir));
+                //let output_path = format!("{}/{}", output_dir, output_filename);
+                std::fs::write(&output_path, file_data)?;
+                println!("Saved encrypted file to: {}", output_path);
+
+            }
+        }
     
     Ok(())
 }

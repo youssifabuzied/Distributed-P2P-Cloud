@@ -11,7 +11,7 @@ use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, Cursor, Write};
+use std::io::{BufRead, Cursor, Write, BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,9 +20,10 @@ use tempfile::Builder;
 use std::collections::HashMap;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    XChaCha20Poly1305, XNonce
+    XChaCha20Poly1305, XNonce, Key
 };
-use png::{Encoder, Decoder, TextChunk};
+use png::{Encoder, Decoder};
+use png::text_metadata::{ITXtChunk};
 use std::fs::File;
 // Re-import the steganography builder function used in original code
 use stegano_core::api::hide::prepare as hide_prepare;
