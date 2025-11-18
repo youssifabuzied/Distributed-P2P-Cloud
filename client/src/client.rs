@@ -4,7 +4,6 @@ use std::error::Error;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -201,7 +200,7 @@ impl Client {
         let request = ClientRequest::EncryptImage {
             request_id,
             image_path: image_path.to_string(),
-            views,
+            views:views.clone(),
         };
 
         let id = self.send_request_async(request);
@@ -309,7 +308,7 @@ impl Client {
         println!("Welcome, {}!", self.metadata.username);
         println!("Middleware: {}", self.middleware_addr);
         println!("\nCommands:");
-        println!("  encrypt <image_path>, <views>    - Queue encryption (returns immediately)");
+        println!("  encrypt <image_path>, <user1>=<views1>    - Queue encryption (returns immediately)");
         println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
         println!("  status <request_id>      - Check request status");
         println!("  list                     - List all requests");
@@ -332,7 +331,7 @@ impl Client {
             match tokens[0] { //VIEWS NEED TO CHANGE
                 "encrypt" if tokens.len() >= 3 => {
                     let image_path = tokens[1];
-                    let mut user_views = HashMap<String, u64> = HashMap::new();
+                    let mut user_views: HashMap<String, u64> = HashMap::new();
                     let mut invalid = false;
                     for pair in &tokens[2..] {
                         if let Some((user, value_str)) = pair.split_once('=') 

@@ -173,14 +173,11 @@ fn decrypt_image_locally(request_id: u64, image_path: &str, username: &str) -> M
                     return MiddlewareResponse::error(request_id, "Username Views Exceeded");
                 }
                 *count -= 1;
-                println!("User {} has {} views remaining", username, *count);
+                println!("User: {} has {} views remaining", username, *count);
             }
             None => return MiddlewareResponse::error(request_id, "Username Not Found"),
         }
         
-        //DECREMENT VIEW COUNT IF ALLOWED
-        //RETURN ERROR IF NOT ALLOWED
-        //CHANGE PAYLOAD TO REFLECT NEW VIEW COUNT
         let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
             Ok(dir) => dir,
             Err(e) => {
