@@ -1,26 +1,25 @@
 use bincode;
+use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+};
 use hex;
 use image::imageops::FilterType;
 use image::io::Reader as ImageReader;
 use image::{DynamicImage, GenericImageView, ImageFormat};
+use png::text_metadata::ITXtChunk;
+use png::{Decoder, Encoder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, Cursor, Write, BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use tempfile::Builder;
-use std::collections::HashMap;
 use stegano_core::api::hide::prepare as hide_prepare;
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
-    XChaCha20Poly1305, XNonce, Key
-};
-use png::{Encoder, Decoder};
-use png::text_metadata::{ITXtChunk};
-
+use tempfile::Builder;
 
 use std::fs::File;
 #[derive(Clone)]
@@ -39,7 +38,8 @@ struct CachedCover {
 
 /// Request structure for encryption operations
 #[derive(Serialize, Deserialize, Debug)]
-pub struct EncryptionRequest { //VIEWS NEED TO CHANGE
+pub struct EncryptionRequest {
+    //VIEWS NEED TO CHANGE
     pub request_id: u64,
     pub filename: String,
     pub views: HashMap<String, u64>,
@@ -59,13 +59,13 @@ pub struct EncryptionResponse {
 
 /// Hidden payload structure for steganography
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload { //VIEWS NEED TO CHANGE
+struct HiddenPayload {
+    //VIEWS NEED TO CHANGE
     message: String,
     //views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    //extra: Option<String>,
+                          //extra: Option<String>,
 }
-
 
 impl EncryptionResponse {
     /// Create a successful response
@@ -93,466 +93,475 @@ impl EncryptionResponse {
         }
     }
 }
-    fn encrypt_data( 
-        request: EncryptionRequest,
-        tmp_dir: &PathBuf,
-        covers: &Arc<Vec<CachedCover>>,
-        password_hex: &Arc<String>,
-    ) -> EncryptionResponse {
+fn encrypt_data(
+    request: EncryptionRequest,
+    tmp_dir: &PathBuf,
+    covers: &Arc<Vec<CachedCover>>,
+    password_hex: &Arc<String>,
+) -> EncryptionResponse {
+    println!(
+        "[Server] [Req #{}] Starting encryption: {} ({} bytes) (views: {:?})",
+        request.request_id,
+        request.filename,
+        request.file_data.len(),
+        request.views //VIEWS NEED TO CHANGE
+    );
+
+    // original_size to return in responses
+    let original_size = request.file_data.len();
+
+    // Determine file extension
+    let ext = std::path::Path::new(&request.filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Convert uploaded JPEG to PNG in-memory when necessary (no tmp file)
+    let mut working_image_bytes = request.file_data.clone();
+    if ext == "jpg" || ext == "jpeg" {
         println!(
-            "[Server] [Req #{}] Starting encryption: {} ({} bytes) (views: {:?})",
-            request.request_id,
-            request.filename,
-            request.file_data.len(),
-            request.views //VIEWS NEED TO CHANGE
+            "[Server] [Req #{}] JPEG detected — converting to PNG in-memory...",
+            request.request_id
         );
 
-        // original_size to return in responses
-        let original_size = request.file_data.len();
-
-        // Determine file extension
-        let ext = std::path::Path::new(&request.filename)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        // Convert uploaded JPEG to PNG in-memory when necessary (no tmp file)
-        let mut working_image_bytes = request.file_data.clone();
-        if ext == "jpg" || ext == "jpeg" {
-            println!(
-                "[Server] [Req #{}] JPEG detected — converting to PNG in-memory...",
-                request.request_id
-            );
-
-            match image::load_from_memory(&request.file_data) {
-                Ok(img) => {
-                    let mut png_buf = Vec::with_capacity(request.file_data.len().saturating_mul(2));
-                    if let Err(e) = img.write_to(&mut Cursor::new(&mut png_buf), ImageFormat::Png) {
-                        eprintln!(
-                            "[Server] [Req #{}] Failed to encode uploaded JPEG to PNG: {}",
-                            request.request_id, e
-                        );
-                        return EncryptionResponse {
-                            request_id: request.request_id,
-                            status: "error".into(),
-                            message: format!("Failed to encode uploaded JPEG to PNG: {}", e),
-                            encrypted_data: None,
-                            original_size,
-                            encrypted_size: 0,
-                        };
-                    }
-                    working_image_bytes = png_buf;
-                }
-                Err(e) => {
+        match image::load_from_memory(&request.file_data) {
+            Ok(img) => {
+                let mut png_buf = Vec::with_capacity(request.file_data.len().saturating_mul(2));
+                if let Err(e) = img.write_to(&mut Cursor::new(&mut png_buf), ImageFormat::Png) {
                     eprintln!(
-                        "[Server] [Req #{}] Failed to decode uploaded JPEG from memory: {}",
+                        "[Server] [Req #{}] Failed to encode uploaded JPEG to PNG: {}",
                         request.request_id, e
                     );
                     return EncryptionResponse {
                         request_id: request.request_id,
                         status: "error".into(),
-                        message: format!("Failed to decode uploaded JPEG: {}", e),
+                        message: format!("Failed to encode uploaded JPEG to PNG: {}", e),
                         encrypted_data: None,
                         original_size,
                         encrypted_size: 0,
                     };
                 }
+                working_image_bytes = png_buf;
             }
-        }
-
-
-        
-        // Build payload and serialize with bincode
-        let payload = HiddenPayload {
-            message: format!("Hidden from file: {}", request.filename),
-            //views: request.views, //VIEWS NEED TO CHANGE
-            image_bytes: working_image_bytes.clone(),
-            //extra: Some("Metadata info".to_string()),
-        };
-        //NEED TO CHANGE ENCRYPTION LOGIC
-        //VIEWS TO BE ENCODED OUTSIDE OF COVER IMAGE
-        //MODFIY FUNCTION TO REFLECT THIS
-        let serialized = match bincode::serialize(&payload) {
-            Ok(s) => s,
             Err(e) => {
-                eprintln!("[Server] Serialization failed: {}", e);
+                eprintln!(
+                    "[Server] [Req #{}] Failed to decode uploaded JPEG from memory: {}",
+                    request.request_id, e
+                );
                 return EncryptionResponse {
                     request_id: request.request_id,
                     status: "error".into(),
-                    message: format!("Failed to serialize payload: {}", e),
+                    message: format!("Failed to decode uploaded JPEG: {}", e),
                     encrypted_data: None,
                     original_size,
                     encrypted_size: 0,
                 };
             }
-        };
-
-        println!(
-            "[Server] [Req #{}] Serialized payload: {} bytes (views: {:?})",
-            request.request_id,
-            serialized.len(),
-            request.views
-        );
-
-        // ------------------------------
-        // Deterministic required-side logic
-        // ------------------------------
-        // Constants to tweak: header overhead and pixel margin (small)
-        const BYTES_PER_PIXEL: f32 = 0.375_f32; // heuristic used previously
-        const HEADER_OVERHEAD: usize = 1024; // conservative estimate for stegano headers (tweak if needed)
-        const MARGIN_PIXELS: u32 = 2; // safety margin in pixels
-
-        let payload_len = serialized.len();
-        let required_pixels = ((payload_len + HEADER_OVERHEAD) as f32 / BYTES_PER_PIXEL).ceil();
-        let mut required_side = (required_pixels.sqrt()).ceil() as u32;
-        required_side = required_side.saturating_add(MARGIN_PIXELS);
-
-        // Choose best cover by minimizing uniform scale factor to meet required_side
-        let mut best_index: Option<usize> = None;
-        let mut best_scale: f32 = f32::MAX;
-
-        for (i, c) in covers.iter().enumerate() {
-            let w = c.width as f32;
-            let h = c.height as f32;
-
-            let scale_w = (required_side as f32) / w;
-            let scale_h = (required_side as f32) / h;
-            let scale = scale_w.max(scale_h).max(1.0);
-
-            // small bias: if scale is very close to 1, prefer slightly larger covers to avoid tiny encodes
-            let adjusted_scale = if (scale - 1.0).abs() < 0.05 {
-                // bias factor reduces effective scale for larger images (heuristic)
-                let area = (c.width as f32) * (c.height as f32);
-                scale * (1.0 - (area / (10_000_000.0)).min(0.02)) // tiny bias
-            } else {
-                scale
-            };
-
-            if adjusted_scale < best_scale {
-                best_scale = adjusted_scale;
-                best_index = Some(i);
-            }
         }
+    }
 
-        let chosen = match best_index {
-            Some(i) => &covers[i],
-            None => &covers[0],
+    // Build payload and serialize with bincode
+    let payload = HiddenPayload {
+        message: format!("Hidden from file: {}", request.filename),
+        //views: request.views, //VIEWS NEED TO CHANGE
+        image_bytes: working_image_bytes.clone(),
+        //extra: Some("Metadata info".to_string()),
+    };
+    //NEED TO CHANGE ENCRYPTION LOGIC
+    //VIEWS TO BE ENCODED OUTSIDE OF COVER IMAGE
+    //MODFIY FUNCTION TO REFLECT THIS
+    let serialized = match bincode::serialize(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Server] Serialization failed: {}", e);
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to serialize payload: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+
+    println!(
+        "[Server] [Req #{}] Serialized payload: {} bytes (views: {:?})",
+        request.request_id,
+        serialized.len(),
+        request.views
+    );
+
+    // ------------------------------
+    // Deterministic required-side logic
+    // ------------------------------
+    // Constants to tweak: header overhead and pixel margin (small)
+    const BYTES_PER_PIXEL: f32 = 0.375_f32; // heuristic used previously
+    const HEADER_OVERHEAD: usize = 1024; // conservative estimate for stegano headers (tweak if needed)
+    const MARGIN_PIXELS: u32 = 2; // safety margin in pixels
+
+    let payload_len = serialized.len();
+    let required_pixels = ((payload_len + HEADER_OVERHEAD) as f32 / BYTES_PER_PIXEL).ceil();
+    let mut required_side = (required_pixels.sqrt()).ceil() as u32;
+    required_side = required_side.saturating_add(MARGIN_PIXELS);
+
+    // Choose best cover by minimizing uniform scale factor to meet required_side
+    let mut best_index: Option<usize> = None;
+    let mut best_scale: f32 = f32::MAX;
+
+    for (i, c) in covers.iter().enumerate() {
+        let w = c.width as f32;
+        let h = c.height as f32;
+
+        let scale_w = (required_side as f32) / w;
+        let scale_h = (required_side as f32) / h;
+        let scale = scale_w.max(scale_h).max(1.0);
+
+        // small bias: if scale is very close to 1, prefer slightly larger covers to avoid tiny encodes
+        let adjusted_scale = if (scale - 1.0).abs() < 0.05 {
+            // bias factor reduces effective scale for larger images (heuristic)
+            let area = (c.width as f32) * (c.height as f32);
+            scale * (1.0 - (area / (10_000_000.0)).min(0.02)) // tiny bias
+        } else {
+            scale
         };
 
+        if adjusted_scale < best_scale {
+            best_scale = adjusted_scale;
+            best_index = Some(i);
+        }
+    }
+
+    let chosen = match best_index {
+        Some(i) => &covers[i],
+        None => &covers[0],
+    };
+
+    println!(
+        "[Server] [Req #{}] Chosen cover '{}' ({}x{}, capacity {:.0}), required_side {}, scale {:.4}",
+        request.request_id,
+        chosen.name,
+        chosen.width,
+        chosen.height,
+        chosen.capacity,
+        required_side,
+        best_scale
+    );
+
+    // Compute final target dimensions and ensure they meet required_side
+    let mut target_w = ((chosen.width as f32) * best_scale).ceil() as u32;
+    let mut target_h = ((chosen.height as f32) * best_scale).ceil() as u32;
+    if target_w < required_side {
+        target_w = required_side;
+    }
+    if target_h < required_side {
+        target_h = required_side;
+    }
+    // final tiny safety margin
+    target_w = target_w.saturating_add(1);
+    target_h = target_h.saturating_add(1);
+
+    // Reuse cached PNG bytes when no resize required
+    let mut cover_buf: Vec<u8> = if best_scale <= 1.0 + f32::EPSILON {
+        // reuse cached encoded PNG
+        chosen.png_bytes.as_ref().clone()
+    } else {
+        // Resize chosen cover once and encode to PNG buffer
+        let filter = if best_scale > 2.0 {
+            FilterType::Triangle
+        } else {
+            FilterType::Lanczos3
+        };
         println!(
-            "[Server] [Req #{}] Chosen cover '{}' ({}x{}, capacity {:.0}), required_side {}, scale {:.4}",
+            "[Server] [Req #{}] Resizing chosen cover '{}' {}x{} -> {}x{} (scale {:.4}) using {:?}",
             request.request_id,
             chosen.name,
             chosen.width,
             chosen.height,
-            chosen.capacity,
-            required_side,
-            best_scale
+            target_w,
+            target_h,
+            best_scale,
+            filter
         );
-
-        // Compute final target dimensions and ensure they meet required_side
-        let mut target_w = ((chosen.width as f32) * best_scale).ceil() as u32;
-        let mut target_h = ((chosen.height as f32) * best_scale).ceil() as u32;
-        if target_w < required_side {
-            target_w = required_side;
-        }
-        if target_h < required_side {
-            target_h = required_side;
-        }
-        // final tiny safety margin
-        target_w = target_w.saturating_add(1);
-        target_h = target_h.saturating_add(1);
-
-        // Reuse cached PNG bytes when no resize required
-        let mut cover_buf: Vec<u8> = if best_scale <= 1.0 + f32::EPSILON {
-            // reuse cached encoded PNG
-            chosen.png_bytes.as_ref().clone()
-        } else {
-            // Resize chosen cover once and encode to PNG buffer
-            let filter = if best_scale > 2.0 {
-                FilterType::Triangle
-            } else {
-                FilterType::Lanczos3
+        let resized = chosen.dyn_image.resize(target_w, target_h, filter);
+        let mut buf = Vec::new();
+        if let Err(e) = resized.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png) {
+            eprintln!("[Server] Failed to encode resized cover: {}", e);
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to encode resized cover image: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
             };
-            println!(
-                "[Server] [Req #{}] Resizing chosen cover '{}' {}x{} -> {}x{} (scale {:.4}) using {:?}",
-                request.request_id,
-                chosen.name,
-                chosen.width,
-                chosen.height,
-                target_w,
-                target_h,
-                best_scale,
-                filter
-            );
-            let resized = chosen.dyn_image.resize(target_w, target_h, filter);
-            let mut buf = Vec::new();
-            if let Err(e) = resized.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png) {
-                eprintln!("[Server] Failed to encode resized cover: {}", e);
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to encode resized cover image: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-            buf
+        }
+        buf
+    };
+
+    // Write serialized payload and cover to temporary files under /tmp (deterministic names)
+    let payload_path = tmp_dir.join(format!("payload_{}.bin", request.request_id));
+    let cover_path = tmp_dir.join(format!("cover_{}.png", request.request_id));
+    let output_path = tmp_dir.join(format!("stego_{}.png", request.request_id));
+
+    if let Err(e) = fs::write(&payload_path, &serialized) {
+        eprintln!("[Server] Failed to write payload file: {}", e);
+        return EncryptionResponse {
+            request_id: request.request_id,
+            status: "error".into(),
+            message: format!("Failed to write payload file: {}", e),
+            encrypted_data: None,
+            original_size,
+            encrypted_size: 0,
         };
+    }
 
-        // Write serialized payload and cover to temporary files under /tmp (deterministic names)
-        let payload_path = tmp_dir.join(format!("payload_{}.bin", request.request_id));
-        let cover_path = tmp_dir.join(format!("cover_{}.png", request.request_id));
-        let output_path = tmp_dir.join(format!("stego_{}.png", request.request_id));
+    if let Err(e) = fs::write(&cover_path, &cover_buf) {
+        eprintln!("[Server] Failed to write cover file: {}", e);
+        let _ = fs::remove_file(&payload_path);
+        return EncryptionResponse {
+            request_id: request.request_id,
+            status: "error".into(),
+            message: format!("Failed to write cover file: {}", e),
+            encrypted_data: None,
+            original_size,
+            encrypted_size: 0,
+        };
+    }
 
-        if let Err(e) = fs::write(&payload_path, &serialized) {
-            eprintln!("[Server] Failed to write payload file: {}", e);
+    // Steganography invocation (same as original). Use cached hex password.
+    println!(
+        "[Server] [Req #{}] Executing steganography...",
+        request.request_id
+    );
+    //VIEW ENCRYPTION SETUP
+    let key_bytes = hex::decode(password_hex.as_ref()).expect("Invalid hex key");
+    let key = Key::from_slice(&key_bytes);
+    let cipher = XChaCha20Poly1305::new(&key);
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let json = match serde_json::to_vec(&request.views) {
+        Ok(j) => j,
+        Err(e) => {
             return EncryptionResponse {
                 request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to write payload file: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
-
-        if let Err(e) = fs::write(&cover_path, &cover_buf) {
-            eprintln!("[Server] Failed to write cover file: {}", e);
-            let _ = fs::remove_file(&payload_path);
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to write cover file: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
-
-        // Steganography invocation (same as original). Use cached hex password.
-        println!(
-            "[Server] [Req #{}] Executing steganography...",
-            request.request_id
-        );
-        //VIEW ENCRYPTION SETUP
-        let key_bytes = hex::decode(password_hex.as_ref()).expect("Invalid hex key");
-        let key = Key::from_slice(&key_bytes);
-        let cipher = XChaCha20Poly1305::new(&key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let json = match serde_json::to_vec(&request.views) {
-            Ok(j) => j,
-            Err(e) => return EncryptionResponse { request_id: request.request_id,
                 status: "error".into(),
                 message: format!("Failed to Serialize Views: {}", e),
                 encrypted_data: None,
                 original_size,
-                encrypted_size: 0, },
-        };
-        //VIEW ENCRYPTION LOGIC
-        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: &json, aad: &[] }) {
-            Ok(c) => c,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to encrypt views: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                }
-            }
-        };
-        let mut full = Vec::new();
-        full.extend_from_slice(&nonce.as_slice());
-        full.extend_from_slice(&ciphertext);
-        let encoded_views=hex::encode(full);
-
-        if let Err(e) = hide_prepare()
-            .with_file(&payload_path)
-            .with_image(&cover_path)
-            .with_output(&output_path)
-            .using_password(password_hex.as_str())
-            .execute()
-        {
-            eprintln!("[Server] Steganography execution failed: {}", e);
-            let _ = fs::remove_file(&payload_path);
-            let _ = fs::remove_file(&cover_path);
+                encrypted_size: 0,
+            };
+        }
+    };
+    //VIEW ENCRYPTION LOGIC
+    let ciphertext = match cipher.encrypt(
+        &nonce,
+        Payload {
+            msg: &json,
+            aad: &[],
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),
-                message: format!("Steganography failed: {}", e),
+                message: format!("Failed to encrypt views: {}", e),
                 encrypted_data: None,
                 original_size,
                 encrypted_size: 0,
             };
         }
-        let file = match File::open(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to open output file: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        let decoder = Decoder::new(BufReader::new(file));
-        let mut reader = match decoder.read_info() {
-            Ok(r) => r,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to read PNG info: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        let mut buf = vec![0; reader.output_buffer_size()];
-        let info = match reader.next_frame(&mut buf) {
-            Ok(i) => i,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to read PNG frame: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        buf.truncate(info.buffer_size());
+    };
+    let mut full = Vec::new();
+    full.extend_from_slice(&nonce.as_slice());
+    full.extend_from_slice(&ciphertext);
+    let encoded_views = hex::encode(full);
 
-        // Re-encode with a new iTXt chunk
-        let out = match File::create(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to create output file: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        let w = BufWriter::new(out);
-
-        let mut encoder = Encoder::new(w, info.width, info.height);
-        encoder.set_color(info.color_type);
-        encoder.set_depth(info.bit_depth);
-
-        if let Err(e) = encoder.add_itxt_chunk(
-            "EncryptedViews".to_string(),
-            encoded_views.clone(),
-        ) {
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to add EncryptedViews iTXt chunk: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
-
-        let mut writer = match encoder.write_header() {
-            Ok(w) => w,
-            Err(e) => {
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to write PNG header: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        // Write PNG image data
-        if let Err(e) = writer.write_image_data(&buf) {
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to write PNG image data: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
-
-        // Finish writing
-        if let Err(e) = writer.finish() {
-            return EncryptionResponse {
-                request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to finish PNG writing: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0,
-            };
-        }
-        // Read stego output
-        let stego_bytes = match fs::read(&output_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("[Server] Failed to read stego output: {}", e);
-                let _ = fs::remove_file(&payload_path);
-                let _ = fs::remove_file(&cover_path);
-                let _ = fs::remove_file(&output_path);
-                return EncryptionResponse {
-                    request_id: request.request_id,
-                    status: "error".into(),
-                    message: format!("Failed to read stego output: {}", e),
-                    encrypted_data: None,
-                    original_size,
-                    encrypted_size: 0,
-                };
-            }
-        };
-        
-        // Best-effort cleanup of temp files
+    if let Err(e) = hide_prepare()
+        .with_file(&payload_path)
+        .with_image(&cover_path)
+        .with_output(&output_path)
+        .using_password(password_hex.as_str())
+        .execute()
+    {
+        eprintln!("[Server] Steganography execution failed: {}", e);
         let _ = fs::remove_file(&payload_path);
         let _ = fs::remove_file(&cover_path);
-        let _ = fs::remove_file(&output_path);
-
-        println!(
-            "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes (views: {:?})",
-            request.request_id,
-            original_size,
-            stego_bytes.len(),
-            request.views
-        );
-
-        EncryptionResponse {
+        return EncryptionResponse {
             request_id: request.request_id,
-            status: "success".into(),
-            message: format!(
-                "Stego image successfully generated ({} bytes)",
-                stego_bytes.len()
-            ),
-            encrypted_data: Some(stego_bytes.clone()),
+            status: "error".into(),
+            message: format!("Steganography failed: {}", e),
+            encrypted_data: None,
             original_size,
-            encrypted_size: stego_bytes.len(),
+            encrypted_size: 0,
+        };
+    }
+    let file = match File::open(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to open output file: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
         }
+    };
+    let decoder = Decoder::new(BufReader::new(file));
+    let mut reader = match decoder.read_info() {
+        Ok(r) => r,
+        Err(e) => {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to read PNG info: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = match reader.next_frame(&mut buf) {
+        Ok(i) => i,
+        Err(e) => {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to read PNG frame: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+    buf.truncate(info.buffer_size());
+
+    // Re-encode with a new iTXt chunk
+    let out = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to create output file: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+    let w = BufWriter::new(out);
+
+    let mut encoder = Encoder::new(w, info.width, info.height);
+    encoder.set_color(info.color_type);
+    encoder.set_depth(info.bit_depth);
+
+    if let Err(e) = encoder.add_itxt_chunk("EncryptedViews".to_string(), encoded_views.clone()) {
+        return EncryptionResponse {
+            request_id: request.request_id,
+            status: "error".into(),
+            message: format!("Failed to add EncryptedViews iTXt chunk: {}", e),
+            encrypted_data: None,
+            original_size,
+            encrypted_size: 0,
+        };
     }
 
-    fn main() -> Result<(), Box<dyn Error>> {
+    let mut writer = match encoder.write_header() {
+        Ok(w) => w,
+        Err(e) => {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to write PNG header: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+    // Write PNG image data
+    if let Err(e) = writer.write_image_data(&buf) {
+        return EncryptionResponse {
+            request_id: request.request_id,
+            status: "error".into(),
+            message: format!("Failed to write PNG image data: {}", e),
+            encrypted_data: None,
+            original_size,
+            encrypted_size: 0,
+        };
+    }
+
+    // Finish writing
+    if let Err(e) = writer.finish() {
+        return EncryptionResponse {
+            request_id: request.request_id,
+            status: "error".into(),
+            message: format!("Failed to finish PNG writing: {}", e),
+            encrypted_data: None,
+            original_size,
+            encrypted_size: 0,
+        };
+    }
+    // Read stego output
+    let stego_bytes = match fs::read(&output_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[Server] Failed to read stego output: {}", e);
+            let _ = fs::remove_file(&payload_path);
+            let _ = fs::remove_file(&cover_path);
+            let _ = fs::remove_file(&output_path);
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to read stego output: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+    };
+
+    // Best-effort cleanup of temp files
+    let _ = fs::remove_file(&payload_path);
+    let _ = fs::remove_file(&cover_path);
+    let _ = fs::remove_file(&output_path);
+
+    println!(
+        "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes (views: {:?})",
+        request.request_id,
+        original_size,
+        stego_bytes.len(),
+        request.views
+    );
+
+    EncryptionResponse {
+        request_id: request.request_id,
+        status: "success".into(),
+        message: format!(
+            "Stego image successfully generated ({} bytes)",
+            stego_bytes.len()
+        ),
+        encrypted_data: Some(stego_bytes.clone()),
+        original_size,
+        encrypted_size: stego_bytes.len(),
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
     // 1️⃣ Load a sample image
     let test_image_path = "resources/input.jpg";
     println!("Loading input image");
     let image_bytes = fs::read(test_image_path)?;
-    println!("Loaded input image: {} ({} bytes)", test_image_path, image_bytes.len());
+    println!(
+        "Loaded input image: {} ({} bytes)",
+        test_image_path,
+        image_bytes.len()
+    );
 
     // 2️⃣ Build request
     let req = EncryptionRequest {
@@ -563,100 +572,97 @@ impl EncryptionResponse {
             let mut m = HashMap::new();
             m.insert("user1".to_string(), 5);
             m.insert("user2".to_string(), 10);
-            m  // return the HashMap from the block
+            m // return the HashMap from the block
         },
     };
-
 
     // 3️⃣ Call encryption
     //let res: EncryptionResponse = encrypt_data(req);
     let tmp_dir = PathBuf::from("/tmp");
-        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-            eprintln!("[Server] Failed to ensure /tmp exists: {}", e);
-            // continue; operations will fail later if /tmp truly unusable
-        }
-        let cover_paths = vec![
-            (
-                "small",
-                PathBuf::from("resources/default/default_image_small.png"),
-            ),
-            (
-                "medium",
-                PathBuf::from("resources/default/default_image_medium.png"),
-            ),
-            (
-                "large",
-                PathBuf::from("resources/default/default_image_large.png"),
-            ),
-            // (
-            //     "extra_large",
-            //     PathBuf::from("resources/default/default_image_extra_large.png"),
-            // ),
-        ];
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        eprintln!("[Server] Failed to ensure /tmp exists: {}", e);
+        // continue; operations will fail later if /tmp truly unusable
+    }
+    let cover_paths = vec![
+        (
+            "small",
+            PathBuf::from("resources/default/default_image_small.png"),
+        ),
+        (
+            "medium",
+            PathBuf::from("resources/default/default_image_medium.png"),
+        ),
+        (
+            "large",
+            PathBuf::from("resources/default/default_image_large.png"),
+        ),
+        // (
+        //     "extra_large",
+        //     PathBuf::from("resources/default/default_image_extra_large.png"),
+        // ),
+    ];
 
-        let mut covers: Vec<CachedCover> = Vec::new();
+    let mut covers: Vec<CachedCover> = Vec::new();
 
-        for (name, path) in cover_paths.into_iter() {
-            match ImageReader::open(&path) {
-                Ok(reader) => match reader.decode() {
-                    Ok(img) => {
-                        // encode PNG bytes once
-                        let mut png_buf = Vec::new();
-                        if let Err(e) =
-                            img.write_to(&mut Cursor::new(&mut png_buf), ImageFormat::Png)
-                        {
-                            eprintln!(
-                                "[Server] Failed to encode cover {} to PNG: {}",
-                                path.display(),
-                                e
-                            );
-                            return Err(Box::new(e));
-                        }
-                        let (w, h) = img.dimensions();
-                        let capacity = (w as f32 * h as f32) * 0.375f32; // same heuristic used later
-
-                        covers.push(CachedCover {
-                            name: name.to_string(),
-                            dyn_image: Arc::new(img),
-                            png_bytes: Arc::new(png_buf),
-                            width: w,
-                            height: h,
-                            capacity,
-                        });
-
-                        println!(
-                            "[Server] Loaded cover '{}' ({}x{}, capacity {:.0} bytes)",
-                            name, w, h, capacity
-                        );
-                    }
-                    Err(e) => {
+    for (name, path) in cover_paths.into_iter() {
+        match ImageReader::open(&path) {
+            Ok(reader) => match reader.decode() {
+                Ok(img) => {
+                    // encode PNG bytes once
+                    let mut png_buf = Vec::new();
+                    if let Err(e) = img.write_to(&mut Cursor::new(&mut png_buf), ImageFormat::Png) {
                         eprintln!(
-                            "[Server] Failed to decode cover image at startup: {}: {}",
+                            "[Server] Failed to encode cover {} to PNG: {}",
                             path.display(),
                             e
                         );
                         return Err(Box::new(e));
                     }
-                },
+                    let (w, h) = img.dimensions();
+                    let capacity = (w as f32 * h as f32) * 0.375f32; // same heuristic used later
+
+                    covers.push(CachedCover {
+                        name: name.to_string(),
+                        dyn_image: Arc::new(img),
+                        png_bytes: Arc::new(png_buf),
+                        width: w,
+                        height: h,
+                        capacity,
+                    });
+
+                    println!(
+                        "[Server] Loaded cover '{}' ({}x{}, capacity {:.0} bytes)",
+                        name, w, h, capacity
+                    );
+                }
                 Err(e) => {
                     eprintln!(
-                        "[Server] Failed to open cover image at startup: {}: {}",
+                        "[Server] Failed to decode cover image at startup: {}: {}",
                         path.display(),
                         e
                     );
                     return Err(Box::new(e));
                 }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[Server] Failed to open cover image at startup: {}: {}",
+                    path.display(),
+                    e
+                );
+                return Err(Box::new(e));
             }
         }
+    }
 
-        // Wrap covers in Arc so we can clone cheaply into the per-connection threads
-        let covers_arc = Arc::new(covers);
+    // Wrap covers in Arc so we can clone cheaply into the per-connection threads
+    let covers_arc = Arc::new(covers);
 
-        // Cache password_hex once (safe optimization)
-        let secret_key: &[u8] = b"supersecretkey_supersecretkey_32";
-        let view_key = Key::from_slice(secret_key);
-        let password_hex = Arc::new(hex::encode(view_key.as_slice())); // convert to hex string and wrap in Arc
-        let res = encrypt_data(req, &tmp_dir, &covers_arc, &password_hex);
+    // Cache password_hex once (safe optimization)
+    let secret_key: &[u8] = b"supersecretkey_supersecretkey_32";
+    let view_key = Key::from_slice(secret_key);
+    let password_hex = Arc::new(hex::encode(view_key.as_slice())); // convert to hex string and wrap in Arc
+    let res = encrypt_data(req, &tmp_dir, &covers_arc, &password_hex);
     // 4️⃣ Validate response
     assert_eq!(res.status, "success", "Encryption did not return success");
 
@@ -667,29 +673,26 @@ impl EncryptionResponse {
     println!("Original Size: {} bytes", res.original_size);
     println!("Encrypted Size: {} bytes", res.encrypted_size);
     if res.status == "success" {
-            // Save returned file if present
-            if let (Some(file_data_b64)) =
-                (&res.encrypted_data)
-            {
-                let output_filename = PathBuf::from("output.png");
-                let file_data = file_data_b64.clone();                
-                let output_dir = "client_storage";
-                std::fs::create_dir_all(output_dir)?; // ensure dir exists
-                let output_stem = output_filename
+        // Save returned file if present
+        if let (Some(file_data_b64)) = (&res.encrypted_data) {
+            let output_filename = PathBuf::from("output.png");
+            let file_data = file_data_b64.clone();
+            let output_dir = "client_storage";
+            std::fs::create_dir_all(output_dir)?; // ensure dir exists
+            let output_stem = output_filename
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("output");
-                let output_path = output_filename
+            let output_path = output_filename
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|name| format!("{}/{}", output_dir, name))
                 .unwrap_or_else(|| format!("{}/output.png", output_dir));
-                //let output_path = format!("{}/{}", output_dir, output_filename);
-                std::fs::write(&output_path, file_data)?;
-                println!("Saved encrypted file to: {}", output_path);
-
-            }
+            //let output_path = format!("{}/{}", output_dir, output_filename);
+            std::fs::write(&output_path, file_data)?;
+            println!("Saved encrypted file to: {}", output_path);
         }
-    
+    }
+
     Ok(())
 }

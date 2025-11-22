@@ -1,25 +1,25 @@
 use bincode;
+use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+};
 use hex;
 use image::imageops::FilterType;
 use image::io::Reader as ImageReader;
 use image::{DynamicImage, GenericImageView, ImageFormat};
+use png::text_metadata::ITXtChunk;
+use png::{Decoder, Encoder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, Cursor, Write, BufReader, BufWriter};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tempfile::Builder;
-use std::collections::HashMap;
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
-    XChaCha20Poly1305, XNonce, Key
-};
-use png::{Encoder, Decoder};
-use png::text_metadata::{ITXtChunk};
-use std::fs::File;
 // Re-import the steganography builder function used in original code
 use stegano_core::api::hide::prepare as hide_prepare;
 
@@ -34,7 +34,8 @@ use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 
 /// Request structure for encryption operations
 #[derive(Serialize, Deserialize, Debug)]
-pub struct EncryptionRequest { //VIEWS NEED TO CHANGE
+pub struct EncryptionRequest {
+    //VIEWS NEED TO CHANGE
     pub request_id: u64,
     pub filename: String,
     pub views: HashMap<String, u64>,
@@ -54,11 +55,12 @@ pub struct EncryptionResponse {
 
 /// Hidden payload structure for steganography
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload { //VIEWS NEED TO CHANGE
+struct HiddenPayload {
+    //VIEWS NEED TO CHANGE
     message: String,
     //views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    //extra: Option<String>,
+                          //extra: Option<String>,
 }
 
 impl EncryptionResponse {
@@ -328,7 +330,7 @@ impl Server {
     /// Chooses the most appropriate cached cover image (small/medium/large) so that
     /// resizing work is minimized and overall latency is reduced. This version
     /// computes a conservative required_side up-front (no retries).
-    fn encrypt_data( 
+    fn encrypt_data(
         request: EncryptionRequest,
         tmp_dir: &PathBuf,
         covers: &Arc<Vec<CachedCover>>,
@@ -396,22 +398,31 @@ impl Server {
             }
         }
 
-
         let key_bytes = hex::decode(password_hex.as_ref()).expect("Invalid hex key");
         let key = Key::from_slice(&key_bytes);
         let cipher = XChaCha20Poly1305::new(&key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let json = match serde_json::to_vec(&request.views) {
             Ok(j) => j,
-            Err(e) => return EncryptionResponse { request_id: request.request_id,
-                status: "error".into(),
-                message: format!("Failed to Serialize Views: {}", e),
-                encrypted_data: None,
-                original_size,
-                encrypted_size: 0, },
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to Serialize Views: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
         };
         //VIEW ENCRYPTION LOGIC
-        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: &json, aad: &[] }) {
+        let ciphertext = match cipher.encrypt(
+            &nonce,
+            Payload {
+                msg: &json,
+                aad: &[],
+            },
+        ) {
             Ok(c) => c,
             Err(e) => {
                 return EncryptionResponse {
@@ -421,13 +432,13 @@ impl Server {
                     encrypted_data: None,
                     original_size,
                     encrypted_size: 0,
-                }
+                };
             }
         };
         let mut full = Vec::new();
         full.extend_from_slice(&nonce.as_slice());
         full.extend_from_slice(&ciphertext);
-        let encoded_views=hex::encode(full);
+        let encoded_views = hex::encode(full);
 
         // Build payload and serialize with bincode
         let payload = HiddenPayload {
@@ -687,10 +698,8 @@ impl Server {
         encoder.set_color(info.color_type);
         encoder.set_depth(info.bit_depth);
 
-        if let Err(e) = encoder.add_itxt_chunk(
-            "EncryptedViews".to_string(),
-            encoded_views.clone(),
-        ) {
+        if let Err(e) = encoder.add_itxt_chunk("EncryptedViews".to_string(), encoded_views.clone())
+        {
             return EncryptionResponse {
                 request_id: request.request_id,
                 status: "error".into(),

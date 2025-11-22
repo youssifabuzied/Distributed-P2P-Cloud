@@ -84,6 +84,49 @@ def remove_image(image_name):
     conn.commit()
     conn.close()
 
+def fetch_active_users():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_name, ip_addr FROM Client WHERE status = 1")
+    users = cursor.fetchall()
+    conn.close()
+    return users
+
+def fetch_user_images(user_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Check if user is online (status = 1)
+    cursor.execute("SELECT status FROM Client WHERE user_name = ?", (user_name,))
+    result = cursor.fetchone()
+    
+    if result is None:
+        conn.close()
+        return False, []  # User doesn't exist
+    
+    is_online = result[0] == 1
+    
+    if not is_online:
+        conn.close()
+        return False, []  # User is offline
+    
+    # Fetch images with their bytes for this user
+    cursor.execute("SELECT image_name, image_bytes FROM Image WHERE user_name = ?", (user_name,))
+    images = []
+    for row in cursor.fetchall():
+        image_name = row[0]
+        image_bytes = row[1]  # BLOB data
+        # Encode bytes to base64 for JSON transport
+        image_bytes_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        images.append({
+            'image_name': image_name,
+            'image_bytes': image_bytes_b64
+        })
+    print("fetch_images_done")
+    conn.close()
+    return True, images
+
+
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -95,7 +138,7 @@ def client_status_worker():
         clients = cursor.fetchall()
         for user_name, ts in clients:
             ts_dt = datetime.fromisoformat(ts)
-            if (now - ts_dt).total_seconds() > 10:
+            if (now - ts_dt).total_seconds() > 30:
 
                 print("Status should change:")
                 cursor.execute("SELECT * FROM Client")
@@ -110,7 +153,7 @@ def client_status_worker():
 
         conn.commit()
         conn.close()
-        time.sleep(10)
+        time.sleep(30)
 
 
 def init_db():
@@ -159,6 +202,19 @@ def handle_request():
         elif operation == 'remove_image':
             remove_image(data.get('image_name'))
             return jsonify({'status': 'success', 'message': 'Image removed'}), 200
+        
+        elif operation == 'fetch_active_users':
+            users = fetch_active_users()
+            users_list = [{'user_name': u[0], 'ip_addr': u[1]} for u in users]
+            return jsonify({'status': 'success', 'users': users_list}), 200
+        
+        elif operation == 'fetch_user_images':
+            is_online, images = fetch_user_images(data.get('user_name'))
+            return jsonify({
+                'status': 'success',
+                'is_online': is_online,
+                'images': images
+            }), 200
 
         else:
             return jsonify({'status': 'error', 'message': 'Unknown operation'}), 400
@@ -172,7 +228,7 @@ if __name__ == "__main__":
     init_db()
 
     # Run worker thread
-    # threading.Thread(target=client_status_worker, daemon=True).start()
+    threading.Thread(target=client_status_worker, daemon=True).start()
 
     # Run flask server
     app.run(host='127.0.0.1', port=5000)

@@ -9,10 +9,10 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use std::collections::HashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -420,7 +420,10 @@ impl ServerMiddleware {
             .route("/encrypt", post(encrypt_handler))
             .route("/register", post(register_handler))
             .route("/add_image", post(add_image_handler))
-            .layer(DefaultBodyLimit::max(1024 * 1024 * 100)) // 100 MB
+            .route("/heartbeat", post(heartbeat_handler))
+            .route("/fetch_users", post(fetch_users_handler))
+            .route("/fetch_images", post(fetch_images_handler))
+            .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
@@ -809,7 +812,8 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => { //VIEWS NEED TO CHANGE
+            "views" => {
+                //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
                 views = serde_json::from_str(&data).unwrap_or_default();
             }
@@ -846,7 +850,8 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => { //VIEWS NEED TO CHANGE
+            "views" => {
+                //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
                 views = serde_json::from_str(&data).unwrap_or_default();
             }
@@ -1231,6 +1236,122 @@ async fn add_image_handler(
             "status": "error",
             "message": format!("Failed to add image: {}", e),
         }))),
+    }
+}
+
+async fn heartbeat_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+
+    match directory_service::update_client_timestamp(username).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "success",
+            "message": "Heartbeat received",
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Heartbeat failed: {}", e),
+        }))),
+    }
+}
+
+async fn fetch_users_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+
+    match directory_service::fetch_active_users().await {
+        Ok(users) => {
+            // Format users as readable string
+            let user_list = if users.is_empty() {
+                "No active users found".to_string()
+            } else {
+                users
+                    .iter()
+                    .map(|(username, ip)| format!("  {} - {}", username, ip))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "message": user_list,
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to fetch users: {}", e),
+        }))),
+    }
+}
+
+// In server/src/middleware.rs - fetch_images_handler
+
+async fn fetch_images_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let target_username = payload["target_username"].as_str().unwrap_or("");
+
+    println!("[Server] Fetching images for user: {}", target_username);
+
+    match directory_service::fetch_user_images(target_username).await {
+        Ok((is_online, images)) => {
+            println!(
+                "[Server] Got response - is_online: {}, images count: {}",
+                is_online,
+                images.len()
+            );
+
+            if !is_online {
+                println!("[Server] User is not online");
+                return Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "error",
+                    "message": format!("User '{}' is not online", target_username),
+                })));
+            }
+
+            // images: Vec<(String, String)> where String is base64 encoded bytes
+            let images_json: Vec<_> = images
+                .iter()
+                .map(|(name, bytes_b64)| {
+                    serde_json::json!({
+                        "image_name": name,
+                        "image_bytes": bytes_b64
+                    })
+                })
+                .collect();
+
+            println!(
+                "[Server] Sending response with {} images",
+                images_json.len()
+            );
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "images": images_json
+            })))
+        }
+
+        Err(e) => {
+            println!("[Server] Error fetching images: {}", e);
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "error",
+                "message": format!("Failed to fetch images: {}", e),
+            })))
+        }
     }
 }
 

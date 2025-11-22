@@ -224,7 +224,8 @@ impl eframe::App for GuiApp {
 
                     if ui.button("Start").clicked() {
                         if let Some(p) = &self.selected_file {
-                            match self.encrypt_value.parse::<u64>() { //VIEWS NEED TO CHANGE
+                            match self.encrypt_value.parse::<u64>() {
+                                //VIEWS NEED TO CHANGE
                                 Ok(v) => {
                                     // set pending kind so queued id is mapped to Encrypt
                                     self.pending_request_kind = Some(RequestKind::Encrypt);

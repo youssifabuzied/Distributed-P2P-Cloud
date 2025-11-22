@@ -8,33 +8,34 @@
 //use aes_gcm::{Aes256Gcm, Key};
 use base64::{Engine as _, engine::general_purpose};
 use bincode;
+use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+};
 use hex;
+use png::text_metadata::ITXtChunk;
+use png::{Decoder, Encoder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, BufReader, Write, BufWriter};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 use stegano_core::api::unveil::prepare as extract_prepare;
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
-    XChaCha20Poly1305, XNonce, Key
-};
-use png::{Encoder, Decoder};
-use png::text_metadata::{ITXtChunk};
-use std::fs::File;
 
 // ---------------------------------------
 // Shared Structures
 // ---------------------------------------
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum ClientRequest { //VIEWS NEED TO CHANGE
+pub enum ClientRequest {
+    //VIEWS NEED TO CHANGE
     EncryptImage {
         request_id: u64,
         image_path: String,
@@ -55,6 +56,17 @@ pub enum ClientRequest { //VIEWS NEED TO CHANGE
         username: String,
         image_name: String,
         image_bytes: Vec<u8>,
+    },
+    Heartbeat {
+        request_id: u64,
+        username: String,
+    },
+    FetchActiveUsers {
+        request_id: u64,
+    },
+    FetchUserImages {
+        request_id: u64,
+        target_username: String,
     },
 }
 
@@ -96,11 +108,12 @@ pub struct ServerResponse {
     pub file_size: Option<usize>,
 }
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload { //VIEWS NEED TO CHANGE + VIEWS NO LONGER IN PAYLOAD!!!!
+struct HiddenPayload {
+    //VIEWS NEED TO CHANGE + VIEWS NO LONGER IN PAYLOAD!!!!
     message: String,
     // views: HashMap<String, u64>,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    // extra: Option<String>,
+                          // extra: Option<String>,
 }
 
 // ---------------------------------------
@@ -119,6 +132,186 @@ impl ClientMiddleware {
             ip: ip.to_string(),
             port,
             server_urls,
+        }
+    }
+
+    fn send_fetch_images_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        target_username: &str,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        // Try first available server
+        let server_url = &server_urls[0];
+        let url = format!("{}/fetch_images", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "target_username": target_username,
+        });
+
+        match client.post(&url).json(&payload).send() {
+    Ok(response) => {
+        println!("Got response from server!");
+        
+        match response.json::<serde_json::Value>() {
+            Ok(json_resp) => {
+                println!("Successfully parsed JSON response");
+                println!("Response: {:?}", json_resp);
+                
+                let status = json_resp["status"].as_str().unwrap_or("error");
+                println!("Status: {}", status);
+                
+                if status == "success" {
+                    // Parse images array
+                    if let Some(images_array) = json_resp["images"].as_array() {
+                        println!("Found {} images", images_array.len());
+                        println!("\n========================================");
+                        println!("Images for user '{}':", target_username);
+                        println!("========================================");
+                        
+                        // Create client_storage directory if it doesn't exist
+                        let storage_dir = "client_storage";
+                        if let Err(e) = std::fs::create_dir_all(storage_dir) {
+                            eprintln!("Failed to create storage directory: {}", e);
+                        }
+                        
+                        for img in images_array {
+                            let image_name = img["image_name"].as_str().unwrap_or("unknown");
+                            let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
+                            
+                            println!("Processing image: {}", image_name);
+                            
+                            // Decode base64 to get actual bytes
+                            match general_purpose::STANDARD.decode(image_bytes_b64) {
+                                Ok(bytes) => {
+                                    println!("  {} ({} bytes)", image_name, bytes.len());
+                                    
+                                    // Save to client_storage as PNG
+                                    let output_path = format!("{}/{}", storage_dir, image_name);
+                                    match std::fs::write(&output_path, &bytes) {
+                                        Ok(_) => {
+                                            println!("  ✓ Saved to: {}", output_path);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ✗ Failed to save {}: {}", image_name, e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  {} (decode error: {})", image_name, e);
+                                }
+                            }
+                        }
+                        
+                        println!("========================================\n");
+                        
+                        MiddlewareResponse::success(request_id, "Images fetched and saved", None)
+                    } else {
+                        println!("No images array found in response");
+                        MiddlewareResponse::error(request_id, "No images array in response")
+                    }
+                } else {
+                    let message = json_resp["message"].as_str().unwrap_or("Unknown error");
+                    println!("Error: {}", message);
+                    MiddlewareResponse::error(request_id, message)
+                }
+            }
+            Err(e) => {
+                println!("Failed to parse JSON: {}", e);
+                MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                )
+            }
+        }
+    }
+    Err(e) => {
+        println!("Failed to send request: {}", e);
+        MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+    }
+}
+    }
+
+    fn send_fetch_users_to_server(server_urls: &[String], request_id: u64) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        // Try first available server
+        let server_url = &server_urls[0];
+        let url = format!("{}/fetch_users", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+        });
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        // Parse users from message (will be JSON string)
+                        println!("\n========================================");
+                        println!("Active Users:");
+                        println!("========================================");
+                        println!("{}", server_resp.message);
+                        println!("========================================\n");
+
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                ),
+            },
+            Err(e) => {
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+
+    fn send_heartbeat_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        username: &str,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // Try first available server
+        let server_url = &server_urls[0];
+        let url = format!("{}/heartbeat", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "username": username,
+        });
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(_) => MiddlewareResponse::error(request_id, "Failed to parse response"),
+            },
+            Err(_) => {
+                // Silent failure - will retry in 20 seconds
+                MiddlewareResponse::error(request_id, "Heartbeat failed")
+            }
         }
     }
 
@@ -189,6 +382,9 @@ impl ClientMiddleware {
                     ClientRequest::DecryptImage { request_id, .. } => *request_id,
                     ClientRequest::RegisterWithDirectory { request_id, .. } => *request_id,
                     ClientRequest::AddImage { request_id, .. } => *request_id,
+                    ClientRequest::Heartbeat { request_id, .. } => *request_id,
+                    ClientRequest::FetchActiveUsers { request_id } => *request_id,
+                    ClientRequest::FetchUserImages { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -232,7 +428,7 @@ impl ClientMiddleware {
                 username,
             } => {
                 // Handle decryption locally (no server needed)
-                Self::decrypt_image_locally(request_id, &image_path,&username)
+                Self::decrypt_image_locally(request_id, &image_path, &username)
             }
             ClientRequest::RegisterWithDirectory {
                 request_id,
@@ -253,6 +449,17 @@ impl ClientMiddleware {
                     &image_bytes,
                 ) // ← Add this
             }
+            ClientRequest::Heartbeat {
+                request_id,
+                username,
+            } => Self::send_heartbeat_to_server(server_urls, request_id, &username),
+            ClientRequest::FetchActiveUsers { request_id } => {
+                Self::send_fetch_users_to_server(server_urls, request_id)
+            }
+            ClientRequest::FetchUserImages {
+                request_id,
+                target_username,
+            } => Self::send_fetch_images_to_server(server_urls, request_id, &target_username),
         }
     }
     /// Send encryption request to ALL servers simultaneously
@@ -289,7 +496,7 @@ impl ClientMiddleware {
             .to_string();
 
         // === NEW: compute timeout based on image size ===
-       // Base timeout: 60 seconds (was 30)
+        // Base timeout: 60 seconds (was 30)
         let base_secs = 60u64;
         // Per-MB overhead: 20 seconds per MB (was 15)
         let per_mb_secs = 20u64;
@@ -414,12 +621,12 @@ impl ClientMiddleware {
         }
     }
 
-    fn send_encrypt_to_single_server( 
+    fn send_encrypt_to_single_server(
         server_url: &str,
         request_id: u64,
         filename: &str,
         file_data: &[u8],
-        views: HashMap<String, u64>,//VIEWS NEED TO CHANGE
+        views: HashMap<String, u64>, //VIEWS NEED TO CHANGE
     ) -> Result<MiddlewareResponse, Box<dyn Error>> {
         // === NEW: compute client timeout consistently with outer logic ===
         let base_secs = 60u64;
@@ -489,74 +696,82 @@ impl ClientMiddleware {
     }
     fn extract_and_decrypt_views(
         png_path: &str,
-        password_hex: &str,   // same hex key used for encryption
-        ) -> Result<HashMap<String, u64>, String> {
-            // 1️⃣ Read the PNG
-            let file = File::open(png_path)
-                .map_err(|e| format!("Failed to open PNG: {}", e))?;
+        password_hex: &str, // same hex key used for encryption
+    ) -> Result<HashMap<String, u64>, String> {
+        // 1️⃣ Read the PNG
+        let file = File::open(png_path).map_err(|e| format!("Failed to open PNG: {}", e))?;
 
-            let decoder = Decoder::new(BufReader::new(file));
+        let decoder = Decoder::new(BufReader::new(file));
 
-            let mut reader = decoder.read_info()
-                .map_err(|e| format!("Failed to read PNG header: {}", e))?;
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| format!("Failed to read PNG header: {}", e))?;
 
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let _info = reader.next_frame(&mut buf)
-                .map_err(|e| format!("Failed to read PNG frame: {}", e))?;
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let _info = reader
+            .next_frame(&mut buf)
+            .map_err(|e| format!("Failed to read PNG frame: {}", e))?;
 
-            // 2️⃣ Extract iTXt chunks
-            let info = reader.info();
+        // 2️⃣ Extract iTXt chunks
+        let info = reader.info();
 
-            let mut encoded_views_hex: Option<String> = None;
+        let mut encoded_views_hex: Option<String> = None;
 
-            for chunk in &info.utf8_text {
-                if chunk.keyword == "EncryptedViews" {
-                    let text_str = chunk
-                        .get_text()
-                        .map_err(|e| format!("Failed to decode ITXt chunk: {}", e))?;
-                    encoded_views_hex = Some(text_str);
-                    break;
-                }
+        for chunk in &info.utf8_text {
+            if chunk.keyword == "EncryptedViews" {
+                let text_str = chunk
+                    .get_text()
+                    .map_err(|e| format!("Failed to decode ITXt chunk: {}", e))?;
+                encoded_views_hex = Some(text_str);
+                break;
             }
+        }
 
-
-
-            let encoded_views_hex =
+        let encoded_views_hex =
             encoded_views_hex.ok_or_else(|| "EncryptedViews iTXt chunk not found".to_string())?;
 
-            // 3️⃣ Decode hex → nonce + ciphertext
-            let full = hex::decode(encoded_views_hex)
-                .map_err(|e| format!("Hex decode error: {}", e))?;
+        // 3️⃣ Decode hex → nonce + ciphertext
+        let full =
+            hex::decode(encoded_views_hex).map_err(|e| format!("Hex decode error: {}", e))?;
 
-            if full.len() < 24 {
-                return Err("iTXt encrypted data too small".into());
-            }
+        if full.len() < 24 {
+            return Err("iTXt encrypted data too small".into());
+        }
 
-            let nonce_bytes = &full[..24];
-            let ciphertext = &full[24..];
+        let nonce_bytes = &full[..24];
+        let ciphertext = &full[24..];
 
-            let nonce = XNonce::from_slice(nonce_bytes);
+        let nonce = XNonce::from_slice(nonce_bytes);
 
-            // 4️⃣ Key decode
-            let key_bytes =
-                hex::decode(password_hex).map_err(|e| format!("Invalid hex key: {}", e))?;
+        // 4️⃣ Key decode
+        let key_bytes = hex::decode(password_hex).map_err(|e| format!("Invalid hex key: {}", e))?;
 
-            let key = Key::from_slice(&key_bytes);
-            let cipher = XChaCha20Poly1305::new(key);
+        let key = Key::from_slice(&key_bytes);
+        let cipher = XChaCha20Poly1305::new(key);
 
-            // 5️⃣ Decrypt JSON
-            let decrypted = cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &[] })
-                .map_err(|e| format!("Decryption failed: {}", e))?;
+        // 5️⃣ Decrypt JSON
+        let decrypted = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[],
+                },
+            )
+            .map_err(|e| format!("Decryption failed: {}", e))?;
 
-            // 6️⃣ Deserialize back to HashMap<String,u64>
-            let views: HashMap<String, u64> =
-                serde_json::from_slice(&decrypted)
-                .map_err(|e| format!("JSON deserialize error: {}", e))?;
+        // 6️⃣ Deserialize back to HashMap<String,u64>
+        let views: HashMap<String, u64> = serde_json::from_slice(&decrypted)
+            .map_err(|e| format!("JSON deserialize error: {}", e))?;
 
-            Ok(views)
+        Ok(views)
     }
     // New local decryption function (dummy implementation)
-    fn decrypt_image_locally(request_id: u64, image_path: &str, username: &str) -> MiddlewareResponse {
+    fn decrypt_image_locally(
+        request_id: u64,
+        image_path: &str,
+        username: &str,
+    ) -> MiddlewareResponse {
         // Validate file exists
         if !Path::new(image_path).exists() {
             return MiddlewareResponse::error(request_id, "Encrypted file not found");
@@ -580,7 +795,7 @@ impl ClientMiddleware {
                 return MiddlewareResponse::error(
                     request_id,
                     &format!("Failed to extract/decrypt views: {}", e),
-                )
+                );
             }
         };
         println!(
@@ -599,7 +814,7 @@ impl ClientMiddleware {
             }
             None => return MiddlewareResponse::error(request_id, "Username Not Found"),
         }
-        
+
         let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
             Ok(dir) => dir,
             Err(e) => {
@@ -616,7 +831,6 @@ impl ClientMiddleware {
 
         println!("[ClientMiddleware] [Req #{}] Decryption Begin", request_id);
 
-        
         //let key = Key::<Aes256Gcm>::from_slice(secret_key);
         let cipher = XChaCha20Poly1305::new(view_key);
         //VIEW ENCRYPTION SETUP
@@ -631,7 +845,13 @@ impl ClientMiddleware {
                 );
             }
         };
-        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: &json_bytes, aad: &[] }) {
+        let ciphertext = match cipher.encrypt(
+            &nonce,
+            Payload {
+                msg: &json_bytes,
+                aad: &[],
+            },
+        ) {
             Ok(c) => c,
             Err(e) => {
                 return MiddlewareResponse::error(
@@ -643,9 +863,8 @@ impl ClientMiddleware {
         let mut full = Vec::new();
         full.extend_from_slice(&nonce.as_slice());
         full.extend_from_slice(&ciphertext);
-        let encoded_views=hex::encode(full);
-        
-        
+        let encoded_views = hex::encode(full);
+
         if let Err(e) = extract_prepare()
             .using_password(password_hex.as_str())
             .from_secret_file(image_path)
@@ -724,9 +943,9 @@ impl ClientMiddleware {
                     Ok(f) => f,
                     Err(e) => {
                         return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Open Original Image: {}", e),
-                    );
+                            request_id,
+                            &format!("Failed to Open Original Image: {}", e),
+                        );
                     }
                 };
                 let decoder = Decoder::new(BufReader::new(file));
@@ -734,9 +953,9 @@ impl ClientMiddleware {
                     Ok(r) => r,
                     Err(e) => {
                         return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Read Original Image Info: {}", e),
-                    );
+                            request_id,
+                            &format!("Failed to Read Original Image Info: {}", e),
+                        );
                     }
                 };
                 let mut buf = vec![0; reader.output_buffer_size()];
@@ -744,9 +963,9 @@ impl ClientMiddleware {
                     Ok(i) => i,
                     Err(e) => {
                         return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Match Buffer: {}", e),
-                    );
+                            request_id,
+                            &format!("Failed to Match Buffer: {}", e),
+                        );
                     }
                 };
                 buf.truncate(info.buffer_size());
@@ -754,11 +973,11 @@ impl ClientMiddleware {
                 // Re-encode with a new iTXt chunk
                 let out = match File::create(&out_tmp) {
                     Ok(f) => f,
-                    Err(e) =>{
+                    Err(e) => {
                         return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Write to Original Image: {}", e),
-                    );
+                            request_id,
+                            &format!("Failed to Write to Original Image: {}", e),
+                        );
                     }
                 };
                 let w = BufWriter::new(out);
@@ -767,10 +986,9 @@ impl ClientMiddleware {
                 encoder.set_color(info.color_type);
                 encoder.set_depth(info.bit_depth);
 
-                if let Err(e) = encoder.add_itxt_chunk(
-                    "EncryptedViews".to_string(),
-                    encoded_views.clone(),
-                ) {
+                if let Err(e) =
+                    encoder.add_itxt_chunk("EncryptedViews".to_string(), encoded_views.clone())
+                {
                     return MiddlewareResponse::error(
                         request_id,
                         &format!("Failed to Add ITXT Chunk: {}", e),
@@ -781,9 +999,9 @@ impl ClientMiddleware {
                     Ok(w) => w,
                     Err(e) => {
                         return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Write Header: {}", e),
-                    );
+                            request_id,
+                            &format!("Failed to Write Header: {}", e),
+                        );
                     }
                 };
                 // Write PNG image data

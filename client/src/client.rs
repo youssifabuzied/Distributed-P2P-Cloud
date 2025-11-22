@@ -1,3 +1,5 @@
+use image::imageops::FilterType;
+use image::io::Reader as ImageReader;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -6,6 +8,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 // Data Structures
 
@@ -38,6 +41,17 @@ pub enum ClientRequest {
         username: String,
         image_name: String,
         image_bytes: Vec<u8>,
+    },
+    Heartbeat {
+        request_id: u64,
+        username: String,
+    },
+    FetchActiveUsers {
+        request_id: u64,
+    },
+    FetchUserImages {
+        request_id: u64,
+        target_username: String,
     },
 }
 
@@ -120,6 +134,49 @@ pub struct Client {
 }
 
 impl Client {
+    fn resize_image_to_100x100(image_path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        // Open the image
+        let img = ImageReader::open(image_path)?.decode()?;
+
+        // Resize to 100x100 using Lanczos3 filter (high quality)
+        let resized = img.resize_exact(100, 100, FilterType::Lanczos3);
+
+        // Encode as PNG
+        let mut png_bytes = Vec::new();
+        resized.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )?;
+
+        Ok(png_bytes)
+    }
+    /// Start sending heartbeat signals every 20 seconds
+    pub fn start_heartbeat(&self) {
+        let username = self.metadata.username.clone();
+        let middleware_addr = self.middleware_addr.clone();
+        let tracker = self.tracker.requests.clone();
+
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(20));
+
+                // Create heartbeat request
+                let request_id = {
+                    static HEARTBEAT_ID: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1_000_000);
+                    HEARTBEAT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                };
+
+                let request = ClientRequest::Heartbeat {
+                    request_id,
+                    username: username.clone(),
+                };
+
+                // Send heartbeat (silently, no status tracking)
+                let _ = Self::send_request_sync(&middleware_addr, &request);
+            }
+        });
+    }
     pub fn new(username: &str, ip: &str, port: u16, middleware_addr: &str) -> Self {
         Client {
             metadata: ClientMetadata {
@@ -139,6 +196,9 @@ impl Client {
             ClientRequest::DecryptImage { request_id, .. } => *request_id,
             ClientRequest::RegisterWithDirectory { request_id, .. } => *request_id,
             ClientRequest::AddImage { request_id, .. } => *request_id,
+            ClientRequest::Heartbeat { request_id, .. } => *request_id,
+            ClientRequest::FetchActiveUsers { request_id } => *request_id,
+            ClientRequest::FetchUserImages { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -211,8 +271,11 @@ impl Client {
 
     /// Request encryption (async)
     //VIEWS NEED TO CHANGE
-    pub fn request_encryption(&self, image_path: &str,
-    views: HashMap<String, u64>) -> Result<u64, Box<dyn Error>> {
+    pub fn request_encryption(
+        &self,
+        image_path: &str,
+        views: HashMap<String, u64>,
+    ) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
@@ -221,7 +284,7 @@ impl Client {
         let request = ClientRequest::EncryptImage {
             request_id,
             image_path: image_path.to_string(),
-            views:views.clone(),
+            views: views.clone(),
         };
 
         let id = self.send_request_async(request);
@@ -331,17 +394,16 @@ impl Client {
         println!("\nCommands:");
         println!("  register                         - Register with directory service");
         println!("  add_image <image_path>           - Add image to directory");
-        println!("  encrypt <image_path> <views>     - Queue encryption (returns immediately)");
-        println!("  decrypt <image_path>             - Queue decryption (returns immediately)");
-        println!("  status <request_id>              - Check request status");
-        println!("  list                             - List all requests");
-        println!("  pending                          - Show pending count");
-        println!("  exit                             - Exit the client");
-        println!("  encrypt <image_path>, <user1>=<views1>    - Queue encryption (returns immediately)");
+        // println!("  status <request_id>              - Check request status");
+        println!(
+            "  encrypt <image_path>, <user1>=<views1>    - Queue encryption (returns immediately)"
+        );
         println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
-        println!("  status <request_id>      - Check request status");
-        println!("  list                     - List all requests");
-        println!("  pending                  - Show pending count");
+        println!("  fetch_users                      - Fetch all active users");
+        println!("  fetch_images <username>          - Fetch all images of a user");
+
+        // println!("  list                     - List all requests");
+        // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
         println!("========================================");
 
@@ -368,32 +430,37 @@ impl Client {
 
                     let id = self.send_request_async(request);
                     println!("Request #{id} queued (registering with directory service)");
+
+                    // Start heartbeat after registration
+                    self.start_heartbeat();
+                    println!("Heartbeat started (every 20 seconds)");
                 }
                 "add_image" if tokens.len() == 2 => {
                     let image_path = tokens[1];
+
                     // Extract image name from path
                     let image_name = Path::new(image_path)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown");
 
-                    // Read image bytes
-                    match std::fs::read(image_path) {
-                        Ok(image_bytes) => {
+                    // Read and resize image to 100x100
+                    match Self::resize_image_to_100x100(image_path) {
+                        Ok(resized_bytes) => {
                             let request_id = self.tracker.create_request();
                             let request = ClientRequest::AddImage {
                                 request_id,
                                 username: self.metadata.username.clone(),
                                 image_name: image_name.to_string(),
-                                image_bytes,
+                                image_bytes: resized_bytes,
                             };
                             let id = self.send_request_async(request);
                             println!(
-                                "Request #{id} queued (adding image '{}' to directory)",
+                                "Request #{id} queued (adding resized 100x100 image '{}' to directory)",
                                 image_name
                             );
                         }
-                        Err(e) => eprintln!("Error reading file: {e}"),
+                        Err(e) => eprintln!("Error resizing image: {e}"),
                     }
                 }
                 "encrypt" if tokens.len() == 3 => {
@@ -401,8 +468,7 @@ impl Client {
                     let mut user_views: HashMap<String, u64> = HashMap::new();
                     let mut invalid = false;
                     for pair in &tokens[2..] {
-                        if let Some((user, value_str)) = pair.split_once('=') 
-                        {
+                        if let Some((user, value_str)) = pair.split_once('=') {
                             match value_str.parse::<u64>() {
                                 Ok(value) => {
                                     user_views.insert(user.to_string(), value);
@@ -413,17 +479,16 @@ impl Client {
                                     break;
                                 }
                             }
-                        } 
-                        else 
-                        {
+                        } else {
                             eprintln!("Error: invalid format '{pair}', expected username=value");
                             invalid = true;
                             break;
                         }
                     }
-                    if invalid {continue;}
-                    if user_views.is_empty() 
-                    {
+                    if invalid {
+                        continue;
+                    }
+                    if user_views.is_empty() {
                         eprintln!("Error: you must provide at least one username=value pair");
                         continue;
                     }
@@ -431,8 +496,7 @@ impl Client {
                         Ok(id) => println!("Request #{id} queued (background processing)"),
                         Err(e) => eprintln!("Error: {e}"),
                     }
-
-                },
+                }
                 "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
                     Ok(id) => {
                         println!("Request #{id} queued (background processing)");
@@ -452,6 +516,25 @@ impl Client {
                 "pending" => {
                     let count = self.tracker.pending_count();
                     println!("Pending/In-Progress requests: {count}");
+                }
+                "fetch_users" => {
+                    let request_id = self.tracker.create_request();
+                    let request = ClientRequest::FetchActiveUsers { request_id };
+                    let id = self.send_request_async(request);
+                    println!("Request #{id} queued (fetching active users)");
+                }
+                "fetch_images" if tokens.len() == 2 => {
+                    let target_username = tokens[1];
+                    let request_id = self.tracker.create_request();
+                    let request = ClientRequest::FetchUserImages {
+                        request_id,
+                        target_username: target_username.to_string(),
+                    };
+                    let id = self.send_request_async(request);
+                    println!(
+                        "Request #{id} queued (fetching images for '{}')",
+                        target_username
+                    );
                 }
                 "exit" => {
                     let pending = self.tracker.pending_count();
