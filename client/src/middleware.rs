@@ -45,6 +45,17 @@ pub enum ClientRequest { //VIEWS NEED TO CHANGE
         image_path: String,
         username: String,
     },
+    RegisterWithDirectory {
+        request_id: u64,
+        username: String,
+        ip: String,
+    },
+    AddImage {
+        request_id: u64,
+        username: String,
+        image_name: String,
+        image_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -165,10 +176,10 @@ impl ClientMiddleware {
             return Ok(());
         }
 
-        println!(
-            "[ClientMiddleware] Received from client: {}",
-            request_line.trim()
-        );
+        // println!(
+        //     "[ClientMiddleware] Received from client: {}",
+        //     request_line.trim()
+        // );
 
         // Parse request
         let response = match serde_json::from_str::<ClientRequest>(request_line.trim()) {
@@ -176,12 +187,9 @@ impl ClientMiddleware {
                 let request_id = match &request {
                     ClientRequest::EncryptImage { request_id, .. } => *request_id,
                     ClientRequest::DecryptImage { request_id, .. } => *request_id,
+                    ClientRequest::RegisterWithDirectory { request_id, .. } => *request_id,
+                    ClientRequest::AddImage { request_id, .. } => *request_id,
                 };
-
-                println!(
-                    "[ClientMiddleware] [Req #{}] Processing request...",
-                    request_id
-                );
 
                 // Forward to appropriate handler
                 Self::forward_to_servers(server_urls, request)
@@ -225,6 +233,25 @@ impl ClientMiddleware {
             } => {
                 // Handle decryption locally (no server needed)
                 Self::decrypt_image_locally(request_id, &image_path,&username)
+            }
+            ClientRequest::RegisterWithDirectory {
+                request_id,
+                username,
+                ip,
+            } => Self::send_register_to_server(server_urls, request_id, &username, &ip),
+            ClientRequest::AddImage {
+                request_id,
+                username,
+                image_name,
+                image_bytes,
+            } => {
+                Self::send_add_image_to_server(
+                    server_urls,
+                    request_id,
+                    &username,
+                    &image_name,
+                    &image_bytes,
+                ) // ← Add this
             }
         }
     }
@@ -806,6 +833,104 @@ impl ClientMiddleware {
                     request_id,
                     &format!("Failed to save decrypted image: {}", e),
                 )
+            }
+        }
+    }
+    fn send_register_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        username: &str,
+        ip: &str,
+    ) -> MiddlewareResponse {
+        println!(
+            "[ClientMiddleware] [Req #{}] Forwarding registration to server: {} {}",
+            request_id, username, ip
+        );
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        // Try first available server
+        let server_url = &server_urls[0];
+        let url = format!("{}/register", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "username": username,
+            "ip": ip,
+        });
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                ),
+            },
+            Err(e) => {
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+    fn send_add_image_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        username: &str,
+        image_name: &str,
+        image_bytes: &[u8],
+    ) -> MiddlewareResponse {
+        println!(
+            "[ClientMiddleware] [Req #{}] Forwarding add image to server: {} {} ({} bytes)",
+            request_id,
+            username,
+            image_name,
+            image_bytes.len()
+        );
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        // Try first available server
+        let server_url = &server_urls[0];
+        let url = format!("{}/add_image", server_url);
+
+        // Encode image data as base64 for JSON transport
+        let image_bytes_b64 = general_purpose::STANDARD.encode(image_bytes);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "username": username,
+            "image_name": image_name,
+            "image_bytes": image_bytes_b64,
+        });
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                ),
+            },
+            Err(e) => {
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
             }
         }
     }
