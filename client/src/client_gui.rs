@@ -46,7 +46,7 @@ struct GuiApp {
     decrypted_image: Option<egui::TextureHandle>,
 
     // encrypt parameter UI
-    encrypt_value: String,
+    encrypt_value: String, //VIEWS NEED TO CHANGE
     show_encrypt_box: bool,
 
     // mapping request id -> kind so we know how to handle completion
@@ -71,7 +71,7 @@ impl GuiApp {
             original_image: None,
             encrypted_image: None,
             decrypted_image: None,
-            encrypt_value: "10".to_string(),
+            encrypt_value: "10".to_string(), //VIEWS NEED TO CHANGE
             show_encrypt_box: false,
             request_kinds: HashMap::new(),
             pending_request_kind: None,
@@ -220,11 +220,11 @@ impl eframe::App for GuiApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Number of views:");
-                    ui.text_edit_singleline(&mut self.encrypt_value);
+                    ui.text_edit_singleline(&mut self.encrypt_value); //VIEWS NEED TO CHANGE
 
                     if ui.button("Start").clicked() {
                         if let Some(p) = &self.selected_file {
-                            match self.encrypt_value.parse::<u64>() {
+                            match self.encrypt_value.parse::<u64>() { //VIEWS NEED TO CHANGE
                                 Ok(v) => {
                                     // set pending kind so queued id is mapped to Encrypt
                                     self.pending_request_kind = Some(RequestKind::Encrypt);

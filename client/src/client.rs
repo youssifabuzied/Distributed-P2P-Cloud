@@ -16,10 +16,10 @@ pub struct ClientMetadata {
     pub port: u16,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)] //CLIENT REQUESTS ADDED TO INCLUDE USERNAME
 pub enum ClientRequest {
-    EncryptImage { request_id: u64, image_path: String, views: u64},
-    DecryptImage { request_id: u64, image_path: String },
+    EncryptImage { request_id: u64, image_path: String, views: HashMap<String, u64>},
+    DecryptImage { request_id: u64, image_path: String, username: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -179,10 +179,19 @@ impl Client {
         let response: MiddlewareResponse = serde_json::from_str(response_line.trim())?;
         Ok(response)
     }
+    //Helper Function To Print User-View Pairs
+    // fn format_views(views: &HashMap<String, u64>) -> String {
+    // views
+    //     .iter()
+    //     .map(|(user, value)| format!("{}={}", user, value))
+    //     .collect::<Vec<_>>()
+    //     .join(", ")
+    // }
 
     /// Request encryption (async)
+    //VIEWS NEED TO CHANGE
     pub fn request_encryption(&self, image_path: &str,
-    views: u64,) -> Result<u64, Box<dyn Error>> {
+    views: HashMap<String, u64>) -> Result<u64, Box<dyn Error>> {
         if !Path::new(image_path).exists() {
             return Err("Image file not found".into());
         }
@@ -191,12 +200,12 @@ impl Client {
         let request = ClientRequest::EncryptImage {
             request_id,
             image_path: image_path.to_string(),
-            views,
+            views:views.clone(),
         };
 
         let id = self.send_request_async(request);
         println!(
-            "[Client] Queued encryption request #{} for '{}' ({} views)",
+            "[Client] Queued encryption request #{} for '{}' ({:?})",
             id, image_path, views
         );
         Ok(id)
@@ -212,6 +221,7 @@ impl Client {
         let request = ClientRequest::DecryptImage {
             request_id,
             image_path: image_path.to_string(),
+            username: self.metadata.username.clone(),
         };
 
         let id = self.send_request_async(request);
@@ -298,7 +308,7 @@ impl Client {
         println!("Welcome, {}!", self.metadata.username);
         println!("Middleware: {}", self.middleware_addr);
         println!("\nCommands:");
-        println!("  encrypt <image_path>, <views>    - Queue encryption (returns immediately)");
+        println!("  encrypt <image_path>, <user1>=<views1>    - Queue encryption (returns immediately)");
         println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
         println!("  status <request_id>      - Check request status");
         println!("  list                     - List all requests");
@@ -318,19 +328,43 @@ impl Client {
                 continue;
             }
 
-            match tokens[0] {
-                "encrypt" if tokens.len() == 3 => {
+            match tokens[0] { //VIEWS NEED TO CHANGE
+                "encrypt" if tokens.len() >= 3 => {
                     let image_path = tokens[1];
-                    let views_str = tokens[2];
-                    match views_str.parse::<u64>() {
-                        Ok(views) => match self.request_encryption(image_path, views) {
-                            Ok(id) => {
-                                println!("Request #{id} queued (background processing)");
+                    let mut user_views: HashMap<String, u64> = HashMap::new();
+                    let mut invalid = false;
+                    for pair in &tokens[2..] {
+                        if let Some((user, value_str)) = pair.split_once('=') 
+                        {
+                            match value_str.parse::<u64>() {
+                                Ok(value) => {
+                                    user_views.insert(user.to_string(), value);
+                                }
+                                Err(_) => {
+                                    eprintln!("Error: value for '{user}' must be a valid integer");
+                                    invalid = true;
+                                    break;
+                                }
                             }
-                            Err(e) => eprintln!("Error: {e}"),
-                        },
-                        Err(_) => eprintln!("Error: 'views' must be a valid integer"),
+                        } 
+                        else 
+                        {
+                            eprintln!("Error: invalid format '{pair}', expected username=value");
+                            invalid = true;
+                            break;
+                        }
                     }
+                    if invalid {continue;}
+                    if user_views.is_empty() 
+                    {
+                        eprintln!("Error: you must provide at least one username=value pair");
+                        continue;
+                    }
+                    match self.request_encryption(image_path, user_views) {
+                        Ok(id) => println!("Request #{id} queued (background processing)"),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+
                 },
                 "decrypt" if tokens.len() == 2 => match self.request_decryption(tokens[1]) {
                     Ok(id) => {

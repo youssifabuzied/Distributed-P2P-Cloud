@@ -329,7 +329,7 @@ mod stress_test {
 
                 match self
                     .client
-                    .request_encryption(image_path.to_str().unwrap(), 5)
+                    .request_encryption(image_path.to_str().unwrap(), 5) //VIEWS HARDCODED TO 5
                 {
                     Ok(request_id) => {
                         self.metrics.start_request(request_id, filename.clone());

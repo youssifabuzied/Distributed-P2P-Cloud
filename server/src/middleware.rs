@@ -16,10 +16,10 @@ use axum::{
     response::Json,
     routing::{get, post},
 };
+use std::collections::HashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -802,7 +802,7 @@ pub async fn encrypt_handler(
     let mut request_id = 0u64;
     let mut filename = String::new();
     let mut file_data: Vec<u8> = Vec::new();
-    let mut views = 0u64;
+    let mut views: HashMap<String, u64> = HashMap::new();
     while let Some(field) = multipart.next_field().await.unwrap() {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
@@ -813,9 +813,9 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => {
+            "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
-                views = data.parse().unwrap_or(0);
+                views = serde_json::from_str(&data).unwrap_or_default();
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -850,9 +850,9 @@ pub async fn encrypt_handler(
             "filename" => {
                 filename = field.text().await.unwrap();
             }
-            "views" => {
+            "views" => { //VIEWS NEED TO CHANGE
                 let data = field.text().await.unwrap();
-                views = data.parse().unwrap_or(0);
+                views = serde_json::from_str(&data).unwrap_or_default();
             }
             "file" => {
                 file_data = field.bytes().await.unwrap().to_vec();
@@ -889,11 +889,11 @@ pub async fn encrypt_handler(
     }
 
     println!(
-        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({} views)",
+        "[Server Middleware] [Req #{}] Received encryption request: {} ({} bytes) ({:?} views)",
         request_id,
         filename,
         file_data.len(),
-        views
+        views //VIEWS NEED TO CHANGE
     );
 
     // ========================================
@@ -974,7 +974,7 @@ pub async fn encrypt_handler(
     let encryption_request = json!({
         "request_id": request_id,
         "filename": filename,
-        "views": views,
+        "views": views, //VIEWS NEED TO CHANGE
         "file_data": file_data,
     });
 
@@ -1105,7 +1105,7 @@ pub async fn encrypt_handler(
                         "output_filename": output_filename,
                         "file_data": base64_data,
                         "file_size": encrypted_data.len(),
-                        "views": views,
+                        "views": views, //VIEWS NEED TO CHANGE
                         "processed_by": server_id,
                     })))
                 }
