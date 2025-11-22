@@ -6,13 +6,20 @@ use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, Cursor, Write};
+use std::io::{BufRead, Cursor, Write, BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tempfile::Builder;
-
+use std::collections::HashMap;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    XChaCha20Poly1305, XNonce, Key
+};
+use png::{Encoder, Decoder};
+use png::text_metadata::{ITXtChunk};
+use std::fs::File;
 // Re-import the steganography builder function used in original code
 use stegano_core::api::hide::prepare as hide_prepare;
 
@@ -27,10 +34,10 @@ use middleware::{PeerInfo, ServerConfig, ServerMiddleware};
 
 /// Request structure for encryption operations
 #[derive(Serialize, Deserialize, Debug)]
-pub struct EncryptionRequest {
+pub struct EncryptionRequest { //VIEWS NEED TO CHANGE
     pub request_id: u64,
     pub filename: String,
-    pub views: u64,
+    pub views: HashMap<String, u64>,
     pub file_data: Vec<u8>, // Raw image bytes
 }
 
@@ -47,11 +54,11 @@ pub struct EncryptionResponse {
 
 /// Hidden payload structure for steganography
 #[derive(Serialize, Deserialize, Debug)]
-struct HiddenPayload {
+struct HiddenPayload { //VIEWS NEED TO CHANGE
     message: String,
-    views: u64,
+    //views: u64,
     image_bytes: Vec<u8>, // PNG or JPEG bytes
-    extra: Option<String>,
+    //extra: Option<String>,
 }
 
 impl EncryptionResponse {
@@ -213,7 +220,8 @@ impl Server {
 
         // Cache password_hex once (safe optimization)
         let secret_key: &[u8] = b"supersecretkey_supersecretkey_32";
-        let password_hex = Arc::new(hex::encode(secret_key));
+        let view_key = Key::from_slice(secret_key);
+        let password_hex = Arc::new(hex::encode(view_key.as_slice())); // convert to hex string and wrap in Arc
 
         // Accept incoming connections
         for stream in listener.incoming() {
@@ -284,11 +292,11 @@ impl Server {
         let response = match serde_json::from_slice::<EncryptionRequest>(&read_buf) {
             Ok(request) => {
                 println!(
-                    "[Server] [Req #{}] Processing encryption for: {} ({} bytes) (views: {})",
+                    "[Server] [Req #{}] Processing encryption for: {} ({} bytes) (views: {:?})",
                     request.request_id,
                     request.filename,
                     request.file_data.len(),
-                    request.views
+                    request.views //VIEWS NEED TO CHANGE
                 );
 
                 // Proceed to encryption with cached resources
@@ -320,18 +328,18 @@ impl Server {
     /// Chooses the most appropriate cached cover image (small/medium/large) so that
     /// resizing work is minimized and overall latency is reduced. This version
     /// computes a conservative required_side up-front (no retries).
-    fn encrypt_data(
+    fn encrypt_data( 
         request: EncryptionRequest,
         tmp_dir: &PathBuf,
         covers: &Arc<Vec<CachedCover>>,
         password_hex: &Arc<String>,
     ) -> EncryptionResponse {
         println!(
-            "[Server] [Req #{}] Starting encryption: {} ({} bytes) (views: {})",
+            "[Server] [Req #{}] Starting encryption: {} ({} bytes) (views: {:?})",
             request.request_id,
             request.filename,
             request.file_data.len(),
-            request.views
+            request.views //VIEWS NEED TO CHANGE
         );
 
         // original_size to return in responses
@@ -388,14 +396,46 @@ impl Server {
             }
         }
 
+
+        let key_bytes = hex::decode(password_hex.as_ref()).expect("Invalid hex key");
+        let key = Key::from_slice(&key_bytes);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let json = match serde_json::to_vec(&request.views) {
+            Ok(j) => j,
+            Err(e) => return EncryptionResponse { request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to Serialize Views: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0, },
+        };
+        //VIEW ENCRYPTION LOGIC
+        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: &json, aad: &[] }) {
+            Ok(c) => c,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to encrypt views: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                }
+            }
+        };
+        let mut full = Vec::new();
+        full.extend_from_slice(&nonce.as_slice());
+        full.extend_from_slice(&ciphertext);
+        let encoded_views=hex::encode(full);
+
         // Build payload and serialize with bincode
         let payload = HiddenPayload {
             message: format!("Hidden from file: {}", request.filename),
-            views: request.views,
+            //views: request.views, //VIEWS NEED TO CHANGE
             image_bytes: working_image_bytes.clone(),
-            extra: Some("Metadata info".to_string()),
+            //extra: Some("Metadata info".to_string()),
         };
-
         let serialized = match bincode::serialize(&payload) {
             Ok(s) => s,
             Err(e) => {
@@ -412,7 +452,7 @@ impl Server {
         };
 
         println!(
-            "[Server] [Req #{}] Serialized payload: {} bytes (views: {})",
+            "[Server] [Req #{}] Serialized payload: {} bytes (views: {:?})",
             request.request_id,
             serialized.len(),
             request.views
@@ -580,7 +620,123 @@ impl Server {
                 encrypted_size: 0,
             };
         }
+        println!(
+            "[Server] [Req #{}] Steganography Finished, Updating Views",
+            request.request_id
+        );
+        let file = match File::open(&output_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to open output file: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
+        };
+        let decoder = Decoder::new(BufReader::new(file));
+        let mut reader = match decoder.read_info() {
+            Ok(r) => r,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to read PNG info: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
+        };
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = match reader.next_frame(&mut buf) {
+            Ok(i) => i,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to read PNG frame: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
+        };
+        buf.truncate(info.buffer_size());
 
+        // Re-encode with a new iTXt chunk
+        let out = match File::create(&output_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to create output file: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
+        };
+        let w = BufWriter::new(out);
+
+        let mut encoder = Encoder::new(w, info.width, info.height);
+        encoder.set_color(info.color_type);
+        encoder.set_depth(info.bit_depth);
+
+        if let Err(e) = encoder.add_itxt_chunk(
+            "EncryptedViews".to_string(),
+            encoded_views.clone(),
+        ) {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to add EncryptedViews iTXt chunk: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+
+        let mut writer = match encoder.write_header() {
+            Ok(w) => w,
+            Err(e) => {
+                return EncryptionResponse {
+                    request_id: request.request_id,
+                    status: "error".into(),
+                    message: format!("Failed to write PNG header: {}", e),
+                    encrypted_data: None,
+                    original_size,
+                    encrypted_size: 0,
+                };
+            }
+        };
+        // Write PNG image data
+        if let Err(e) = writer.write_image_data(&buf) {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to write PNG image data: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
+
+        // Finish writing
+        if let Err(e) = writer.finish() {
+            return EncryptionResponse {
+                request_id: request.request_id,
+                status: "error".into(),
+                message: format!("Failed to finish PNG writing: {}", e),
+                encrypted_data: None,
+                original_size,
+                encrypted_size: 0,
+            };
+        }
         // Read stego output
         let stego_bytes = match fs::read(&output_path) {
             Ok(bytes) => bytes,
@@ -606,7 +762,7 @@ impl Server {
         let _ = fs::remove_file(&output_path);
 
         println!(
-            "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes (views: {})",
+            "[Server] [Req #{}] ✓ Encryption complete: {} bytes -> {} bytes (views: {:?})",
             request.request_id,
             original_size,
             stego_bytes.len(),
@@ -644,14 +800,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
         peers: vec![
-            PeerInfo {
-                server_id: 1,
-                address: "10.251.174.138:8001".to_string(),
-            },
-            PeerInfo {
-                server_id: 3,
-                address: "10.251.174.183:8001".to_string(),
-            },
+            // PeerInfo {
+            //     server_id: 1,
+            //     address: "10.251.174.138:8001".to_string(),
+            // },
+            // PeerInfo {
+            //     server_id: 3,
+            //     address: "10.251.174.183:8001".to_string(),
+            // },
         ],
         election_timeout_ms: 3500,
         failure_port: 8002,
