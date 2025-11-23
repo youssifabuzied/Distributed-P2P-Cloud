@@ -151,19 +151,12 @@ pub async fn fetch_user_images(
     if response.status().is_success() {
         let body: Value = response.json().await?;
 
-        println!("[Directory Service] Response body: {:?}", body);
-
         let is_online = body["is_online"].as_bool().unwrap_or(false);
 
         println!("[Directory Service] is_online: {}", is_online);
 
         // Parse images from response: Vec<(image_name, image_bytes_base64)>
         if let Some(images_array) = body["images"].as_array() {
-            println!(
-                "[Directory Service] Images array length: {}",
-                images_array.len()
-            );
-
             let images: Vec<(String, String)> = images_array
                 .iter()
                 .filter_map(|img| {
@@ -173,8 +166,6 @@ pub async fn fetch_user_images(
                 })
                 .collect();
 
-            println!("[Directory Service] Parsed {} images", images.len());
-
             Ok((is_online, images))
         } else {
             println!("[Directory Service] No images array found");
@@ -182,5 +173,39 @@ pub async fn fetch_user_images(
         }
     } else {
         Err(format!("Fetch images failed with status: {}", response.status()).into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn request_image_access(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+    prop_views: u64,
+) -> Result<(), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "request_image_access",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+        "prop_views": prop_views,
+    });
+
+    println!(
+        "[Directory Service] Requesting access: {} wants {} views of {}'s '{}'",
+        viewer, prop_views, owner, image_name
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        println!("[Directory Service] ✓ Access request created: {:?}", body);
+        Ok(())
+    } else {
+        Err(format!("Access request failed with status: {}", response.status()).into())
     }
 }

@@ -68,6 +68,13 @@ pub enum ClientRequest {
         request_id: u64,
         target_username: String,
     },
+    RequestImageAccess {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        prop_views: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -135,6 +142,55 @@ impl ClientMiddleware {
         }
     }
 
+    fn send_request_access_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        owner: &str,
+        viewer: &str,
+        image_name: &str,
+        prop_views: u64,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/request_access", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "prop_views": prop_views,
+        });
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Forwarding access request to server: {} -> {}'s '{}' ({} views)",
+            request_id, viewer, owner, image_name, prop_views
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                ),
+            },
+            Err(e) => {
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+
     fn send_fetch_images_to_server(
         server_urls: &[String],
         request_id: u64,
@@ -155,86 +211,95 @@ impl ClientMiddleware {
         });
 
         match client.post(&url).json(&payload).send() {
-    Ok(response) => {
-        println!("Got response from server!");
-        
-        match response.json::<serde_json::Value>() {
-            Ok(json_resp) => {
-                println!("Successfully parsed JSON response");
-                println!("Response: {:?}", json_resp);
-                
-                let status = json_resp["status"].as_str().unwrap_or("error");
-                println!("Status: {}", status);
-                
-                if status == "success" {
-                    // Parse images array
-                    if let Some(images_array) = json_resp["images"].as_array() {
-                        println!("Found {} images", images_array.len());
-                        println!("\n========================================");
-                        println!("Images for user '{}':", target_username);
-                        println!("========================================");
-                        
-                        // Create client_storage directory if it doesn't exist
-                        let storage_dir = "client_storage";
-                        if let Err(e) = std::fs::create_dir_all(storage_dir) {
-                            eprintln!("Failed to create storage directory: {}", e);
-                        }
-                        
-                        for img in images_array {
-                            let image_name = img["image_name"].as_str().unwrap_or("unknown");
-                            let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
-                            
-                            println!("Processing image: {}", image_name);
-                            
-                            // Decode base64 to get actual bytes
-                            match general_purpose::STANDARD.decode(image_bytes_b64) {
-                                Ok(bytes) => {
-                                    println!("  {} ({} bytes)", image_name, bytes.len());
-                                    
-                                    // Save to client_storage as PNG
-                                    let output_path = format!("{}/{}", storage_dir, image_name);
-                                    match std::fs::write(&output_path, &bytes) {
-                                        Ok(_) => {
-                                            println!("  ✓ Saved to: {}", output_path);
+            Ok(response) => {
+                println!("Got response from server!");
+
+                match response.json::<serde_json::Value>() {
+                    Ok(json_resp) => {
+                        println!("Successfully parsed JSON response");
+                        println!("Response: {:?}", json_resp);
+
+                        let status = json_resp["status"].as_str().unwrap_or("error");
+                        println!("Status: {}", status);
+
+                        if status == "success" {
+                            // Parse images array
+                            if let Some(images_array) = json_resp["images"].as_array() {
+                                println!("Found {} images", images_array.len());
+                                println!("\n========================================");
+                                println!("Images for user '{}':", target_username);
+                                println!("========================================");
+
+                                // Create client_storage directory if it doesn't exist
+                                let storage_dir = "client_storage";
+                                if let Err(e) = std::fs::create_dir_all(storage_dir) {
+                                    eprintln!("Failed to create storage directory: {}", e);
+                                }
+
+                                for img in images_array {
+                                    let image_name =
+                                        img["image_name"].as_str().unwrap_or("unknown");
+                                    let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
+
+                                    println!("Processing image: {}", image_name);
+
+                                    // Decode base64 to get actual bytes
+                                    match general_purpose::STANDARD.decode(image_bytes_b64) {
+                                        Ok(bytes) => {
+                                            println!("  {} ({} bytes)", image_name, bytes.len());
+
+                                            // Save to client_storage as PNG
+                                            let output_path =
+                                                format!("{}/{}", storage_dir, image_name);
+                                            match std::fs::write(&output_path, &bytes) {
+                                                Ok(_) => {
+                                                    println!("  ✓ Saved to: {}", output_path);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "  ✗ Failed to save {}: {}",
+                                                        image_name, e
+                                                    );
+                                                }
+                                            }
                                         }
                                         Err(e) => {
-                                            eprintln!("  ✗ Failed to save {}: {}", image_name, e);
+                                            println!("  {} (decode error: {})", image_name, e);
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    println!("  {} (decode error: {})", image_name, e);
-                                }
+
+                                println!("========================================\n");
+
+                                MiddlewareResponse::success(
+                                    request_id,
+                                    "Images fetched and saved",
+                                    None,
+                                )
+                            } else {
+                                println!("No images array found in response");
+                                MiddlewareResponse::error(request_id, "No images array in response")
                             }
+                        } else {
+                            let message = json_resp["message"].as_str().unwrap_or("Unknown error");
+                            println!("Error: {}", message);
+                            MiddlewareResponse::error(request_id, message)
                         }
-                        
-                        println!("========================================\n");
-                        
-                        MiddlewareResponse::success(request_id, "Images fetched and saved", None)
-                    } else {
-                        println!("No images array found in response");
-                        MiddlewareResponse::error(request_id, "No images array in response")
                     }
-                } else {
-                    let message = json_resp["message"].as_str().unwrap_or("Unknown error");
-                    println!("Error: {}", message);
-                    MiddlewareResponse::error(request_id, message)
+                    Err(e) => {
+                        println!("Failed to parse JSON: {}", e);
+                        MiddlewareResponse::error(
+                            request_id,
+                            &format!("Failed to parse response: {}", e),
+                        )
+                    }
                 }
             }
             Err(e) => {
-                println!("Failed to parse JSON: {}", e);
-                MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to parse response: {}", e),
-                )
+                println!("Failed to send request: {}", e);
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
             }
         }
-    }
-    Err(e) => {
-        println!("Failed to send request: {}", e);
-        MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-    }
-}
     }
 
     fn send_fetch_users_to_server(server_urls: &[String], request_id: u64) -> MiddlewareResponse {
@@ -385,6 +450,7 @@ impl ClientMiddleware {
                     ClientRequest::Heartbeat { request_id, .. } => *request_id,
                     ClientRequest::FetchActiveUsers { request_id } => *request_id,
                     ClientRequest::FetchUserImages { request_id, .. } => *request_id,
+                    ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -460,6 +526,20 @@ impl ClientMiddleware {
                 request_id,
                 target_username,
             } => Self::send_fetch_images_to_server(server_urls, request_id, &target_username),
+            ClientRequest::RequestImageAccess {
+                request_id,
+                owner,
+                viewer,
+                image_name,
+                prop_views,
+            } => Self::send_request_access_to_server(
+                server_urls,
+                request_id,
+                &owner,
+                &viewer,
+                &image_name,
+                prop_views,
+            ),
         }
     }
     /// Send encryption request to ALL servers simultaneously

@@ -423,6 +423,7 @@ impl ServerMiddleware {
             .route("/heartbeat", post(heartbeat_handler))
             .route("/fetch_users", post(fetch_users_handler))
             .route("/fetch_images", post(fetch_images_handler))
+            .route("/request_access", post(request_access_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1352,6 +1353,35 @@ async fn fetch_images_handler(
                 "message": format!("Failed to fetch images: {}", e),
             })))
         }
+    }
+}
+
+async fn request_access_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let prop_views = payload["prop_views"].as_u64().unwrap_or(0);
+
+    println!(
+        "[Server Middleware] [Req #{}] Access request: {} -> {}'s '{}' ({} views)",
+        request_id, viewer, owner, image_name, prop_views
+    );
+
+    match directory_service::request_image_access(owner, viewer, image_name, prop_views).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "success",
+            "message": format!("Access request created for {} views of {}", prop_views, image_name),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to create access request: {}", e),
+        }))),
     }
 }
 

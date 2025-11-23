@@ -53,6 +53,13 @@ pub enum ClientRequest {
         request_id: u64,
         target_username: String,
     },
+    RequestImageAccess {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        prop_views: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -134,6 +141,29 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn request_image_access(
+        &self,
+        owner: &str,
+        image_name: &str,
+        prop_views: u64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::RequestImageAccess {
+            request_id,
+            owner: owner.to_string(),
+            viewer: self.metadata.username.clone(),
+            image_name: image_name.to_string(),
+            prop_views,
+        };
+
+        let id = self.send_request_async(request);
+        println!(
+            "[Client] Queued access request #{} for {}'s '{}' ({} views)",
+            id, owner, image_name, prop_views
+        );
+        Ok(id)
+    }
+
     fn resize_image_to_100x100(image_path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         // Open the image
         let img = ImageReader::open(image_path)?.decode()?;
@@ -199,6 +229,7 @@ impl Client {
             ClientRequest::Heartbeat { request_id, .. } => *request_id,
             ClientRequest::FetchActiveUsers { request_id } => *request_id,
             ClientRequest::FetchUserImages { request_id, .. } => *request_id,
+            ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -401,7 +432,7 @@ impl Client {
         println!("  decrypt <image_path>     - Queue decryption (returns immediately)");
         println!("  fetch_users                      - Fetch all active users");
         println!("  fetch_images <username>          - Fetch all images of a user");
-
+        println!("  request_access <owner> <image_name> <views>  - Request access to an image");
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
@@ -535,6 +566,19 @@ impl Client {
                         "Request #{id} queued (fetching images for '{}')",
                         target_username
                     );
+                }
+                "request_access" if tokens.len() == 4 => {
+                    let owner = tokens[1];
+                    let image_name = tokens[2];
+                    match tokens[3].parse::<u64>() {
+                        Ok(prop_views) => {
+                            match self.request_image_access(owner, image_name, prop_views) {
+                                Ok(id) => println!("Request #{id} queued (requesting access)"),
+                                Err(e) => eprintln!("Error: {e}"),
+                            }
+                        }
+                        Err(_) => eprintln!("Error: prop_views must be a valid number"),
+                    }
                 }
                 "exit" => {
                     let pending = self.tracker.pending_count();
