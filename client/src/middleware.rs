@@ -6,6 +6,7 @@
 // Forwards encryption/decryption requests to server middleware via HTTP
 //
 //use aes_gcm::{Aes256Gcm, Key};
+use crate::client::PendingRequest;
 use base64::{Engine as _, engine::general_purpose};
 use bincode;
 use chacha20poly1305::{
@@ -237,7 +238,8 @@ impl ClientMiddleware {
         server_urls: &[String],
         request_id: u64,
         username: &str,
-    ) -> MiddlewareResponse {
+    ) -> Result<Vec<PendingRequest>, String> {
+        // ← Changed return type
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -268,20 +270,32 @@ impl ClientMiddleware {
                         println!("{}", message);
                         println!("========================================\n");
 
-                        MiddlewareResponse::success(request_id, message, None)
+                        // ✅ NEW: Parse and return the requests
+                        let mut requests = Vec::new();
+                        if let Some(requests_array) = json_resp["requests"].as_array() {
+                            for req in requests_array {
+                                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
+                                let image_name =
+                                    req["image_name"].as_str().unwrap_or("").to_string();
+                                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
+
+                                requests.push(PendingRequest {
+                                    viewer,
+                                    image_name,
+                                    prop_views,
+                                });
+                            }
+                        }
+
+                        Ok(requests) // ✅ Return the data
                     } else {
                         let message = json_resp["message"].as_str().unwrap_or("Unknown error");
-                        MiddlewareResponse::error(request_id, message)
+                        Err(message.to_string())
                     }
                 }
-                Err(e) => MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to parse response: {}", e),
-                ),
+                Err(e) => Err(format!("Failed to parse response: {}", e)),
             },
-            Err(e) => {
-                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-            }
+            Err(e) => Err(format!("Failed to contact server: {}", e)),
         }
     }
 
@@ -688,7 +702,21 @@ impl ClientMiddleware {
             ClientRequest::ViewPendingRequests {
                 request_id,
                 username,
-            } => Self::send_view_pending_requests_to_server(server_urls, request_id, &username),
+            } => {
+                match Self::send_view_pending_requests_to_server(server_urls, request_id, &username)
+                {
+                    Ok(requests) => {
+                        // ✅ Serialize and store in output_path
+                        let requests_json = serde_json::to_string(&requests).unwrap_or_default();
+                        MiddlewareResponse::success(
+                            request_id,
+                            "Pending requests fetched successfully",
+                            Some(requests_json),
+                        )
+                    }
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }
             ClientRequest::ApproveOrRejectAccess {
                 request_id,
                 owner,

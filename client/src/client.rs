@@ -145,7 +145,7 @@ impl RequestTracker {
 
 // Async Client Definition
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)] // ✅ Added Serialize, Deserialize
 pub struct PendingRequest {
     pub viewer: String,
     pub image_name: String,
@@ -167,12 +167,60 @@ impl Client {
             username: self.metadata.username.clone(),
         };
 
-        let id = self.send_request_async(request);
+        // ✅ Clone for background thread
+        let tracker = self.tracker.requests.clone();
+        let pending_requests = self.pending_requests.clone();
+        let middleware_addr = self.middleware_addr.clone();
+
+        self.tracker
+            .update_status(request_id, RequestStatus::InProgress);
+
+        // ✅ Custom thread that stores the data
+        thread::spawn(move || {
+            println!(
+                "[Client] [Req #{}] Sending view pending requests in background...",
+                request_id
+            );
+
+            match Client::send_request_sync(&middleware_addr, &request) {
+                Ok(response) => {
+                    println!("[Client] [Req #{}] ✓ Completed", request_id);
+
+                    // ✅ Parse and store the pending requests
+                    if let Some(output_path) = &response.output_path {
+                        if let Ok(requests) =
+                            serde_json::from_str::<Vec<PendingRequest>>(output_path)
+                        {
+                            let mut pending = pending_requests.lock().unwrap();
+                            *pending = requests.clone();
+                            println!(
+                                "[Client] [Req #{}] ✓ Stored {} pending requests locally",
+                                request_id,
+                                requests.len()
+                            );
+                        }
+                    }
+
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Completed(response));
+                }
+                Err(e) => {
+                    eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Failed(e.to_string()));
+                }
+            }
+        });
+
         println!(
             "[Client] Queued view pending requests #{} for '{}'",
-            id, self.metadata.username
+            request_id, self.metadata.username
         );
-        Ok(id)
+        Ok(request_id)
     }
 
     pub fn approve_or_reject_access(
