@@ -42,7 +42,7 @@ def update_timestamp(user_name):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE Client SET time_stamp = ?, status = 1 WHERE user_name = ?",
+        "UPDATE Client SET time_stamp = ?, status = 1 WHERE user_name = ? AND status = 0",
         (time_stamp, user_name),
     )
     conn.commit()
