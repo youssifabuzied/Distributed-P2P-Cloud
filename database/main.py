@@ -47,7 +47,7 @@ def update_timestamp(user_name):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE Client SET time_stamp = ?, status = 1 WHERE user_name = ? AND status = 0",
+        "UPDATE Client SET time_stamp = ?, status = 1 WHERE user_name = ?",
         (time_stamp, user_name),
     )
     conn.commit()
@@ -248,7 +248,66 @@ def get_my_requests(username):
     conn.close()
     return requests
 
-
+def approve_or_reject_access_request(owner, viewer, image_name, accep_views):
+    """
+    Approve or reject an access request
+    
+    Args:
+        owner: Username of the image owner
+        viewer: Username requesting access
+        image_name: Name of the image
+        accep_views: Accepted views (-1 to reject, >0 to approve)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Check if request exists with status=2 (pending)
+        cursor.execute("""
+            SELECT prop_views FROM ImageAccess 
+            WHERE owner = ? AND viewer = ? AND image_name = ? AND status = 2
+        """, (owner, viewer, image_name))
+        
+        result = cursor.fetchone()
+        
+        if result is None:
+            print(f"Error: No pending request found for {viewer} -> {owner}'s '{image_name}'")
+            conn.close()
+            return False
+        
+        # Determine status: 0 = rejected, 1 = approved
+        if accep_views == -1:
+            status = 0
+            accep_views = 0
+            action = "rejected"
+        elif accep_views > 0:
+            status = 1
+            action = "approved"
+        else:
+            print(f"Error: Invalid accep_views value: {accep_views}")
+            conn.close()
+            return False
+        
+        # Update the request
+        cursor.execute("""
+            UPDATE ImageAccess 
+            SET status = ?, accep_views = ?
+            WHERE owner = ? AND viewer = ? AND image_name = ?
+        """, (status, accep_views, owner, viewer, image_name))
+        
+        conn.commit()
+        print(f"Access request {action}: {viewer} -> {owner}'s '{image_name}' ({accep_views} views)")
+        
+        conn.close()
+        return True
+        
+    except Exception as e:
+        print(f"Error updating access request: {e}")
+        conn.close()
+        return False
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -377,7 +436,28 @@ def handle_request():
                     {'owner': r[0], 'image_name': r[1], 'prop_views': r[2], 'status': r[3]}
                     for r in requests
                 ]
+
             }), 200
+        
+        elif operation == 'approve_or_reject_access':
+            owner = data.get('owner')
+            viewer = data.get('viewer')
+            image_name = data.get('image_name')
+            accep_views = data.get('accep_views')
+            
+            success = approve_or_reject_access_request(owner, viewer, image_name, accep_views)
+            
+            if success:
+                action = "rejected" if accep_views == -1 else "approved"
+                return jsonify({
+                    'status': 'success',
+                    'message': f'Access request {action}'
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Failed to update access request'
+                }), 400
 
         else:
             return jsonify({'status': 'error', 'message': 'Unknown operation'}), 400

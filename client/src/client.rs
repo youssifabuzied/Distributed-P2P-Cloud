@@ -60,6 +60,17 @@ pub enum ClientRequest {
         image_name: String,
         prop_views: u64,
     },
+    ViewPendingRequests {
+        request_id: u64,
+        username: String,
+    },
+    ApproveOrRejectAccess {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        accep_views: i64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -134,13 +145,74 @@ impl RequestTracker {
 
 // Async Client Definition
 
+#[derive(Clone, Debug)]
+pub struct PendingRequest {
+    pub viewer: String,
+    pub image_name: String,
+    pub prop_views: u64,
+}
+
 pub struct Client {
     pub metadata: ClientMetadata,
     pub middleware_addr: String,
     pub tracker: RequestTracker,
+    pub pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
 }
 
 impl Client {
+    pub fn view_pending_requests(&self) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::ViewPendingRequests {
+            request_id,
+            username: self.metadata.username.clone(),
+        };
+
+        let id = self.send_request_async(request);
+        println!(
+            "[Client] Queued view pending requests #{} for '{}'",
+            id, self.metadata.username
+        );
+        Ok(id)
+    }
+
+    pub fn approve_or_reject_access(
+        &self,
+        request_number: usize,
+        accep_views: i64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let pending = self.pending_requests.lock().unwrap();
+
+        if request_number == 0 || request_number > pending.len() {
+            return Err(
+                format!("Invalid request number. Please choose 1-{}", pending.len()).into(),
+            );
+        }
+
+        let req = &pending[request_number - 1];
+
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::ApproveOrRejectAccess {
+            request_id,
+            owner: self.metadata.username.clone(),
+            viewer: req.viewer.clone(),
+            image_name: req.image_name.clone(),
+            accep_views,
+        };
+
+        let id = self.send_request_async(request);
+
+        let action = if accep_views == -1 {
+            "rejection"
+        } else {
+            "approval"
+        };
+        println!(
+            "[Client] Queued access {} #{} for {}'s request",
+            action, id, req.viewer
+        );
+        Ok(id)
+    }
+
     pub fn request_image_access(
         &self,
         owner: &str,
@@ -216,6 +288,7 @@ impl Client {
             },
             middleware_addr: middleware_addr.to_string(),
             tracker: RequestTracker::new(),
+            pending_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -230,6 +303,8 @@ impl Client {
             ClientRequest::FetchActiveUsers { request_id } => *request_id,
             ClientRequest::FetchUserImages { request_id, .. } => *request_id,
             ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
+            ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
+            ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -433,6 +508,10 @@ impl Client {
         println!("  fetch_users                      - Fetch all active users");
         println!("  fetch_images <username>          - Fetch all images of a user");
         println!("  request_access <owner> <image_name> <views>  - Request access to an image");
+        println!("  view_pending_requests            - View access requests for your images");
+        println!(
+            "  approve_access_request <number> <views>  - Approve (views>0) or reject (views=-1) a request"
+        );
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
@@ -578,6 +657,57 @@ impl Client {
                             }
                         }
                         Err(_) => eprintln!("Error: prop_views must be a valid number"),
+                    }
+                }
+                "view_pending_requests" => match self.view_pending_requests() {
+                    Ok(id) => println!("Request #{id} queued (fetching pending requests)"),
+                    Err(e) => eprintln!("Error: {e}"),
+                },
+                "approve_access_request" if tokens.len() == 3 => {
+                    let request_number = match tokens[1].parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("Error: request number must be a valid integer");
+                            continue;
+                        }
+                    };
+
+                    let accep_views = match tokens[2].parse::<i64>() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            eprintln!("Error: views must be a valid integer (use -1 to reject)");
+                            continue;
+                        }
+                    };
+
+                    if accep_views != -1 && accep_views <= 0 {
+                        eprintln!("Error: views must be greater than 0 or -1 to reject");
+                        continue;
+                    }
+
+                    match self.approve_or_reject_access(request_number, accep_views) {
+                        Ok(id) => {
+                            let action = if accep_views == -1 {
+                                "rejection"
+                            } else {
+                                "approval"
+                            };
+                            println!("Request #{id} queued (access {})", action);
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "check_stored" => {
+                    let pending = self.pending_requests.lock().unwrap();
+                    println!("Stored requests: {}", pending.len());
+                    for (i, req) in pending.iter().enumerate() {
+                        println!(
+                            "  [{}] {} - {} - {}",
+                            i + 1,
+                            req.viewer,
+                            req.image_name,
+                            req.prop_views
+                        );
                     }
                 }
                 "exit" => {

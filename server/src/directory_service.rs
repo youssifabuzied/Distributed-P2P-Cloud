@@ -1,10 +1,18 @@
 use base64::{Engine as _, engine::general_purpose};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
 use std::error::Error;
 
 const DIRECTORY_URL: &str = "http://127.0.0.1:5000/api";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAccessRequest {
+    pub viewer: String,
+    pub image_name: String,
+    pub prop_views: u64,
+}
 
 // ------------------------------------------------------------------------------------
 
@@ -207,5 +215,89 @@ pub async fn request_image_access(
         Ok(())
     } else {
         Err(format!("Access request failed with status: {}", response.status()).into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn get_pending_access_requests(
+    username: &str,
+) -> Result<Vec<PendingAccessRequest>, Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "get_pending_requests",
+        "user_name": username,
+    });
+
+    println!(
+        "[Directory Service] Fetching pending access requests for: {}",
+        username
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+
+        let mut requests = Vec::new();
+
+        if let Some(requests_array) = body["requests"].as_array() {
+            for req in requests_array {
+                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
+                let image_name = req["image_name"].as_str().unwrap_or("").to_string();
+                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
+
+                requests.push(PendingAccessRequest {
+                    viewer,
+                    image_name,
+                    prop_views,
+                });
+            }
+        }
+
+        Ok(requests)
+    } else {
+        Err(format!("Failed to fetch pending requests: {}", response.status()).into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn approve_or_reject_access_request(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+    accep_views: i64, // Can be -1 for reject
+) -> Result<(), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "approve_or_reject_access",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+        "accep_views": accep_views,
+    });
+
+    let action = if accep_views == -1 {
+        "Rejecting"
+    } else {
+        "Approving"
+    };
+
+    println!(
+        "[Directory Service] {} access: {} -> {}'s '{}' ({} views)",
+        action, viewer, owner, image_name, accep_views
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        println!("[Directory Service] ✓ Access request updated: {:?}", body);
+        Ok(())
+    } else {
+        Err(format!("Failed to update access request: {}", response.status()).into())
     }
 }

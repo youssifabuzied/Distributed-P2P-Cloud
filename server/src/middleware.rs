@@ -424,6 +424,11 @@ impl ServerMiddleware {
             .route("/fetch_users", post(fetch_users_handler))
             .route("/fetch_images", post(fetch_images_handler))
             .route("/request_access", post(request_access_handler))
+            .route(
+                "/view_pending_requests",
+                post(view_pending_requests_handler),
+            )
+            .route("/approve_access", post(approve_access_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1382,6 +1387,125 @@ async fn request_access_handler(
             "status": "error",
             "message": format!("Failed to create access request: {}", e),
         }))),
+    }
+}
+
+async fn view_pending_requests_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Fetching pending requests for: {}",
+        request_id, username
+    );
+
+    match directory_service::get_pending_access_requests(username).await {
+        Ok(requests) => {
+            // Format requests as readable string
+            let request_list = if requests.is_empty() {
+                "No pending access requests".to_string()
+            } else {
+                let mut lines = vec!["Pending Access Requests:".to_string()];
+                for (i, req) in requests.iter().enumerate() {
+                    lines.push(format!(
+                        "  [{}] {} wants {} views of '{}'",
+                        i + 1,
+                        req.viewer,
+                        req.prop_views,
+                        req.image_name
+                    ));
+                }
+                lines.join("\n")
+            };
+
+            // Also return structured data
+            let requests_json: Vec<_> = requests
+                .iter()
+                .map(|req| {
+                    serde_json::json!({
+                        "viewer": req.viewer,
+                        "image_name": req.image_name,
+                        "prop_views": req.prop_views
+                    })
+                })
+                .collect();
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "message": request_list,
+                "requests": requests_json,
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to fetch pending requests: {}", e),
+        }))),
+    }
+}
+
+async fn approve_access_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let accep_views = payload["accep_views"].as_i64().unwrap_or(0);
+
+    let action = if accep_views == -1 {
+        "Rejecting"
+    } else {
+        "Approving"
+    };
+
+    println!(
+        "[Server Middleware] [Req #{}] {} access: {} -> {}'s '{}' ({} views)",
+        request_id, action, viewer, owner, image_name, accep_views
+    );
+
+    match directory_service::approve_or_reject_access_request(
+        owner,
+        viewer,
+        image_name,
+        accep_views,
+    )
+    .await
+    {
+        Ok(_) => {
+            let message = if accep_views == -1 {
+                format!("Access request rejected for {}", viewer)
+            } else {
+                format!(
+                    "Access request approved: {} can view '{}' {} times",
+                    viewer, image_name, accep_views
+                )
+            };
+
+            println!("[Server Middleware] [Req #{}] ✓ {}", request_id, message);
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "message": message,
+            })))
+        }
+        Err(e) => {
+            eprintln!(
+                "[Server Middleware] [Req #{}] Error updating access request: {}",
+                request_id, e
+            );
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "error",
+                "message": format!("Failed to update access request: {}", e),
+            })))
+        }
     }
 }
 

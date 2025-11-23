@@ -75,6 +75,17 @@ pub enum ClientRequest {
         image_name: String,
         prop_views: u64,
     },
+    ViewPendingRequests {
+        request_id: u64,
+        username: String,
+    },
+    ApproveOrRejectAccess {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        accep_views: i64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -139,6 +150,138 @@ impl ClientMiddleware {
             ip: ip.to_string(),
             port,
             server_urls,
+        }
+    }
+
+    fn send_approve_access_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        owner: &str,
+        viewer: &str,
+        image_name: &str,
+        accep_views: i64,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/approve_access", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "accep_views": accep_views,
+        });
+
+        let action = if accep_views == -1 {
+            "Rejecting"
+        } else {
+            "Approving"
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] {} access request: {} -> {}'s '{}' ({} views)",
+            request_id, action, viewer, owner, image_name, accep_views
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => {
+                println!(
+                    "[ClientMiddleware] [Req #{}] Received response from server",
+                    request_id
+                );
+
+                match response.json::<ServerResponse>() {
+                    Ok(server_resp) => {
+                        if server_resp.status == "success" {
+                            println!(
+                                "[ClientMiddleware] [Req #{}] ✓ {}",
+                                request_id, server_resp.message
+                            );
+                            MiddlewareResponse::success(request_id, &server_resp.message, None)
+                        } else {
+                            eprintln!(
+                                "[ClientMiddleware] [Req #{}] Error: {}",
+                                request_id, server_resp.message
+                            );
+                            MiddlewareResponse::error(request_id, &server_resp.message)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ClientMiddleware] [Req #{}] Failed to parse response: {}",
+                            request_id, e
+                        );
+                        MiddlewareResponse::error(
+                            request_id,
+                            &format!("Failed to parse response: {}", e),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to contact server: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+
+    fn send_view_pending_requests_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        username: &str,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/view_pending_requests", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "username": username,
+        });
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Fetching pending requests for: {}",
+            request_id, username
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<serde_json::Value>() {
+                Ok(json_resp) => {
+                    let status = json_resp["status"].as_str().unwrap_or("error");
+
+                    if status == "success" {
+                        let message = json_resp["message"].as_str().unwrap_or("No requests");
+
+                        println!("\n========================================");
+                        println!("{}", message);
+                        println!("========================================\n");
+
+                        MiddlewareResponse::success(request_id, message, None)
+                    } else {
+                        let message = json_resp["message"].as_str().unwrap_or("Unknown error");
+                        MiddlewareResponse::error(request_id, message)
+                    }
+                }
+                Err(e) => MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to parse response: {}", e),
+                ),
+            },
+            Err(e) => {
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
         }
     }
 
@@ -451,6 +594,8 @@ impl ClientMiddleware {
                     ClientRequest::FetchActiveUsers { request_id } => *request_id,
                     ClientRequest::FetchUserImages { request_id, .. } => *request_id,
                     ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
+                    ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
+                    ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -539,6 +684,24 @@ impl ClientMiddleware {
                 &viewer,
                 &image_name,
                 prop_views,
+            ),
+            ClientRequest::ViewPendingRequests {
+                request_id,
+                username,
+            } => Self::send_view_pending_requests_to_server(server_urls, request_id, &username),
+            ClientRequest::ApproveOrRejectAccess {
+                request_id,
+                owner,
+                viewer,
+                image_name,
+                accep_views,
+            } => Self::send_approve_access_to_server(
+                server_urls,
+                request_id,
+                &owner,
+                &viewer,
+                &image_name,
+                accep_views,
             ),
         }
     }
