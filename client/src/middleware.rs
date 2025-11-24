@@ -97,6 +97,15 @@ pub struct MiddlewareResponse {
     pub output_path: Option<String>,
 }
 
+// Add this near the top with other structures
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ImageMetadata {
+    owner: String,
+    image_name: String,
+    accepted_views: u64,
+    views_count: u64,
+}
+
 impl MiddlewareResponse {
     pub fn success(request_id: u64, message: &str, output_path: Option<String>) -> Self {
         MiddlewareResponse {
@@ -284,7 +293,14 @@ impl ClientMiddleware {
         );
 
         // Step 5: Send encrypted image to viewer's client middleware
-        match Self::send_encrypted_to_viewer(request_id, &viewer_ip, image_name, &encrypted_bytes) {
+        match Self::send_encrypted_to_viewer(
+            request_id,
+            &viewer_ip,
+            owner,
+            image_name,
+            &encrypted_bytes,
+            accep_views,
+        ) {
             Ok(_) => {
                 println!(
                     "[ClientMiddleware] [Req #{}] ✓ Successfully delivered encrypted image to {}",
@@ -363,8 +379,10 @@ impl ClientMiddleware {
     fn send_encrypted_to_viewer(
         request_id: u64,
         viewer_ip: &str,
+        owner: &str,
         image_name: &str,
         encrypted_data: &[u8],
+        accepted_views: u64,
     ) -> Result<(), String> {
         use std::io::Write;
         use std::net::TcpStream;
@@ -384,8 +402,10 @@ impl ClientMiddleware {
         let delivery_request = serde_json::json!({
             "type": "ReceiveEncryptedImage",
             "request_id": request_id,
+            "owner": owner,
             "image_name": image_name,
             "encrypted_data": general_purpose::STANDARD.encode(encrypted_data),
+            "accepted_views": accepted_views,
         });
 
         let request_json = serde_json::to_string(&delivery_request)
@@ -874,19 +894,24 @@ impl ClientMiddleware {
         let json_value: serde_json::Value = serde_json::from_str(request_line.trim())?;
 
         // Check if this is a delivery request (ReceiveEncryptedImage)
+        // Check if this is a delivery request (ReceiveEncryptedImage)
         if let Some(req_type) = json_value["type"].as_str() {
             if req_type == "ReceiveEncryptedImage" {
                 println!("[ClientMiddleware] Received encrypted image delivery");
 
                 let request_id = json_value["request_id"].as_u64().unwrap_or(0);
+                let owner = json_value["owner"].as_str().unwrap_or("unknown"); // ✅ Extract owner
                 let image_name = json_value["image_name"].as_str().unwrap_or("");
                 let encrypted_data_b64 = json_value["encrypted_data"].as_str().unwrap_or("");
+                let accepted_views = json_value["accepted_views"].as_u64().unwrap_or(0); // ✅ Extract accepted_views
 
-                // Handle the delivery
+                // ✅ Handle the delivery with new parameters
                 let response = Self::handle_receive_encrypted_image(
                     request_id,
+                    owner,
                     image_name,
                     encrypted_data_b64,
+                    accepted_views,
                 );
 
                 // Send acknowledgment back
@@ -939,14 +964,17 @@ impl ClientMiddleware {
     }
 
     // New handler for receiving encrypted images
+    // New handler for receiving encrypted images
     fn handle_receive_encrypted_image(
         request_id: u64,
+        owner: &str,
         image_name: &str,
         encrypted_data_b64: &str,
+        accepted_views: u64,
     ) -> MiddlewareResponse {
         println!(
-            "[ClientMiddleware] [Req #{}] Processing received encrypted image: {}",
-            request_id, image_name
+            "[ClientMiddleware] [Req #{}] Processing received encrypted image: {} from {}",
+            request_id, image_name, owner
         );
 
         // Decode base64 data
@@ -970,57 +998,115 @@ impl ClientMiddleware {
             encrypted_bytes.len()
         );
 
-        // Save to client_storage
-        let storage_dir = "client_storage";
+        // ✅ Create shared_images directory
+        let storage_dir = "shared_images";
         if let Err(e) = std::fs::create_dir_all(storage_dir) {
             eprintln!(
-                "[ClientMiddleware] [Req #{}] Failed to create storage directory: {}",
+                "[ClientMiddleware] [Req #{}] Failed to create shared_images directory: {}",
                 request_id, e
             );
             return MiddlewareResponse::error(
                 request_id,
-                &format!("Failed to create storage directory: {}", e),
+                &format!("Failed to create shared_images directory: {}", e),
             );
         }
 
-        let output_path = format!("{}/{}", storage_dir, image_name);
-
-        match std::fs::write(&output_path, &encrypted_bytes) {
+        // ✅ Save encrypted image file
+        let image_path = format!("{}/{}", storage_dir, image_name);
+        match std::fs::write(&image_path, &encrypted_bytes) {
             Ok(_) => {
                 println!(
                     "[ClientMiddleware] [Req #{}] ✓ Saved encrypted image to: {}",
-                    request_id, output_path
+                    request_id, image_path
                 );
-
-                // Notify user
-                println!("\n========================================");
-                println!("📥 NEW ENCRYPTED IMAGE RECEIVED");
-                println!("========================================");
-                println!("Image: {}", image_name);
-                println!("Saved to: {}", output_path);
-                println!("Size: {} bytes", encrypted_bytes.len());
-                println!("========================================\n");
-
-                MiddlewareResponse::success(
-                    request_id,
-                    &format!(
-                        "Encrypted image '{}' received and saved successfully",
-                        image_name
-                    ),
-                    Some(output_path),
-                )
             }
             Err(e) => {
                 eprintln!(
                     "[ClientMiddleware] [Req #{}] Failed to save encrypted image: {}",
                     request_id, e
                 );
-                MiddlewareResponse::error(
+                return MiddlewareResponse::error(
                     request_id,
                     &format!("Failed to save encrypted image: {}", e),
-                )
+                );
             }
         }
+
+        // ✅ Create metadata
+        let metadata = ImageMetadata {
+            owner: owner.to_string(),
+            image_name: image_name.to_string(),
+            accepted_views: accepted_views,
+            views_count: 0, // Initialize to 0
+        };
+
+        // ✅ Save metadata file
+        let metadata_filename = format!(
+            "{}_metadata.json",
+            std::path::Path::new(image_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+        );
+        let metadata_path = format!("{}/{}", storage_dir, metadata_filename);
+
+        let metadata_json = match serde_json::to_string_pretty(&metadata) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to serialize metadata: {}",
+                    request_id, e
+                );
+                // Clean up image file
+                let _ = std::fs::remove_file(&image_path);
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to serialize metadata: {}", e),
+                );
+            }
+        };
+
+        match std::fs::write(&metadata_path, metadata_json) {
+            Ok(_) => {
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Saved metadata to: {}",
+                    request_id, metadata_path
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to save metadata: {}",
+                    request_id, e
+                );
+                // Clean up image file
+                let _ = std::fs::remove_file(&image_path);
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to save metadata: {}", e),
+                );
+            }
+        }
+
+        // ✅ Notify user
+        println!("\n========================================");
+        println!("📥 NEW SHARED IMAGE RECEIVED");
+        println!("========================================");
+        println!("Owner: {}", owner);
+        println!("Image: {}", image_name);
+        println!("Accepted Views: {}", accepted_views);
+        println!("Current Views: 0");
+        println!("Image saved to: {}", image_path);
+        println!("Metadata saved to: {}", metadata_path);
+        println!("========================================\n");
+
+        MiddlewareResponse::success(
+            request_id,
+            &format!(
+                "Encrypted image '{}' from '{}' received and saved with metadata (views: {}/{})",
+                image_name, owner, 0, accepted_views
+            ),
+            Some(image_path),
+        )
     }
 
     fn forward_to_servers(server_urls: &[String], request: ClientRequest) -> MiddlewareResponse {
@@ -1328,26 +1414,26 @@ impl ClientMiddleware {
             {
                 let file_data = general_purpose::STANDARD.decode(file_data_b64)?;
                 let output_dir = "client_storage";
-                std::fs::create_dir_all(output_dir)?; // ensure dir exists
+                std::fs::create_dir_all(output_dir)?;
                 let output_stem = Path::new(output_filename)
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("output");
                 let output_path = format!("{}/{}.png", output_dir, output_stem);
-                //let output_path = format!("{}/{}", output_dir, output_filename);
                 std::fs::write(&output_path, file_data)?;
 
+                // ✅ Return base64 data in output_path for post-approval workflow
                 return Ok(MiddlewareResponse::success(
                     request_id,
                     &server_resp.message,
-                    Some(output_path.to_string()),
+                    Some(file_data_b64.clone()), // ← Return base64 string here
                 ));
             }
 
             Ok(MiddlewareResponse::success(
                 request_id,
                 &server_resp.message,
-                server_resp.output_filename.clone(),
+                server_resp.file_data.clone(), // ← Or this for consistency
             ))
         } else {
             Err(format!("Server returned error: {}", server_resp.message).into())
