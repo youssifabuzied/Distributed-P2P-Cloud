@@ -3,9 +3,11 @@ use image::io::Reader as ImageReader;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -158,6 +160,14 @@ pub struct PendingRequest {
     pub prop_views: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageMetadata {
+    pub owner: String,
+    pub image_name: String,
+    pub accepted_views: u64,
+    pub views_count: u64,
+}
+
 pub struct Client {
     pub metadata: ClientMetadata,
     pub middleware_addr: String,
@@ -181,6 +191,230 @@ impl Client {
             id, owner, image_name
         );
         Ok(id)
+    }
+
+    pub fn view_image(&self, owner: &str, image_name: &str) -> Result<(), Box<dyn Error>> {
+        let storage_dir = "shared_images";
+        let image_path = format!("{}/{}", storage_dir, image_name);
+
+        // Check if image exists
+        if !Path::new(&image_path).exists() {
+            return Err(format!("Image '{}' not found in shared_images", image_name).into());
+        }
+
+        println!("[Client] Viewing image: {}'s '{}'", owner, image_name);
+
+        // Step 1: Read metadata file
+        let metadata_filename = format!(
+            "{}_metadata.json",
+            std::path::Path::new(image_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+        );
+        let metadata_path = format!("{}/{}", storage_dir, metadata_filename);
+
+        let mut metadata: ImageMetadata = if Path::new(&metadata_path).exists() {
+            let metadata_json = fs::read_to_string(&metadata_path)?;
+            serde_json::from_str(&metadata_json)?
+        } else {
+            return Err(format!("Metadata file not found: {}", metadata_path).into());
+        };
+
+        println!(
+            "[Client] Current metadata - Accepted: {}, Used: {}",
+            metadata.accepted_views, metadata.views_count
+        );
+
+        // Step 2: Try to contact server to get database views
+        println!("[Client] Attempting to sync with server...");
+        match self.get_accepted_views(owner, image_name) {
+            Ok(request_id) => {
+                // Wait a bit for the response
+                println!(
+                    "[Client] Waiting for server response (request #{})...",
+                    request_id
+                );
+                std::thread::sleep(Duration::from_secs(2));
+
+                // Check if we got a completed response
+                if let Some(RequestStatus::Completed(response)) =
+                    self.tracker.get_status(request_id)
+                {
+                    if response.status == "OK" {
+                        // Step 3: Parse accepted views from server response
+                        if let Some(message) = &response.message {
+                            // Extract views from message like "Approved: 10 views remaining"
+                            if let Some(views_str) = message
+                                .split_whitespace()
+                                .find(|s| s.parse::<u64>().is_ok())
+                            {
+                                if let Ok(server_views) = views_str.parse::<u64>() {
+                                    println!(
+                                        "[Client] ✓ Server sync successful - updating accepted views: {} -> {}",
+                                        metadata.accepted_views, server_views
+                                    );
+                                    metadata.accepted_views = server_views;
+
+                                    // Write updated metadata back to file
+                                    let updated_json = serde_json::to_string_pretty(&metadata)?;
+                                    fs::write(&metadata_path, updated_json)?;
+                                    println!("[Client] ✓ Metadata updated with server views");
+                                }
+                            }
+                        }
+                    } else {
+                        println!("[Client] ⚠ Server returned error, using local metadata");
+                    }
+                } else {
+                    println!("[Client] ⚠ Server did not respond in time, using local metadata");
+                }
+            }
+            Err(e) => {
+                println!(
+                    "[Client] ⚠ Could not contact server: {}, using local metadata",
+                    e
+                );
+            }
+        }
+
+        // Step 4: Check if we have remaining views
+        let remaining_views = metadata.accepted_views.saturating_sub(metadata.views_count);
+        println!(
+            "[Client] Remaining views: {} (accepted: {}, used: {})",
+            remaining_views, metadata.accepted_views, metadata.views_count
+        );
+
+        let should_decrypt = remaining_views > 0;
+        let image_to_display: String;
+
+        if should_decrypt {
+            println!(
+                "[Client] ✓ You have {} views remaining - decrypting image...",
+                remaining_views
+            );
+
+            // Increment view count
+            metadata.views_count += 1;
+
+            // Save updated metadata
+            let updated_json = serde_json::to_string_pretty(&metadata)?;
+            fs::write(&metadata_path, updated_json)?;
+            println!(
+                "[Client] ✓ View count incremented: {} -> {}",
+                metadata.views_count - 1,
+                metadata.views_count
+            );
+
+            // Decrypt the image
+            match self.request_decryption(&image_path) {
+                Ok(request_id) => {
+                    println!(
+                        "[Client] Decryption request #{} queued, waiting...",
+                        request_id
+                    );
+
+                    // Wait for decryption to complete (with timeout)
+                    let mut wait_time = 0;
+                    let max_wait = 30; // 30 seconds timeout
+
+                    loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                        wait_time += 1;
+
+                        match self.tracker.get_status(request_id) {
+                            Some(RequestStatus::Completed(response)) => {
+                                if let Some(output_path) = response.output_path {
+                                    println!("[Client] ✓ Decryption complete: {}", output_path);
+                                    image_to_display = output_path;
+                                    break;
+                                } else {
+                                    return Err("Decryption completed but no output path".into());
+                                }
+                            }
+                            Some(RequestStatus::Failed(err)) => {
+                                return Err(format!("Decryption failed: {}", err).into());
+                            }
+                            _ => {
+                                if wait_time >= max_wait {
+                                    return Err("Decryption timed out".into());
+                                }
+                                // Still waiting...
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Failed to queue decryption: {}", e).into());
+                }
+            }
+        } else {
+            println!("[Client] ⚠ No views remaining - displaying encrypted image");
+            image_to_display = image_path.clone();
+        }
+
+        // Step 5: Display the image in a popup window
+        println!("[Client] Opening image viewer for: {}", image_to_display);
+
+        #[cfg(target_os = "linux")]
+        {
+            // Try common Linux image viewers
+            let viewers = ["xdg-open", "eog", "feh", "display"];
+            let mut opened = false;
+
+            for viewer in &viewers {
+                match Command::new(viewer).arg(&image_to_display).spawn() {
+                    Ok(_) => {
+                        println!("[Client] ✓ Image opened with {}", viewer);
+                        opened = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            if !opened {
+                eprintln!(
+                    "[Client] ✗ Could not open image viewer. Image saved at: {}",
+                    image_to_display
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            match Command::new("open").arg(&image_to_display).spawn() {
+                Ok(_) => println!("[Client] ✓ Image opened"),
+                Err(e) => eprintln!("[Client] ✗ Could not open image: {}", e),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            match Command::new("cmd")
+                .args(&["/C", "start", "", &image_to_display])
+                .spawn()
+            {
+                Ok(_) => println!("[Client] ✓ Image opened"),
+                Err(e) => eprintln!("[Client] ✗ Could not open image: {}", e),
+            }
+        }
+
+        println!("\n========================================");
+        println!("Image Viewing Summary");
+        println!("========================================");
+        println!("Owner: {}", owner);
+        println!("Image: {}", image_name);
+        println!("Accepted Views: {}", metadata.accepted_views);
+        println!("Views Used: {}", metadata.views_count);
+        println!(
+            "Remaining Views: {}",
+            metadata.accepted_views.saturating_sub(metadata.views_count)
+        );
+        println!("Decrypted: {}", if should_decrypt { "Yes" } else { "No" });
+        println!("========================================\n");
+
+        Ok(())
     }
     pub fn view_pending_requests(&self) -> Result<u64, Box<dyn Error>> {
         let request_id = self.tracker.create_request();
@@ -584,6 +818,7 @@ impl Client {
             "  approve_access_request <number> <views>  - Approve (views>0) or reject (views=-1) a request"
         );
         println!("  get_views <owner> <image_name>  - Get accepted views for an image");
+        println!("  view_image <owner> <image_name>  - View a shared image from shared_images");
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
@@ -789,6 +1024,15 @@ impl Client {
                     match self.get_accepted_views(owner, image_name) {
                         Ok(id) => println!("Request #{id} queued (getting accepted views)"),
                         Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "view_image" if tokens.len() == 3 => {
+                    let owner = tokens[1];
+                    let image_name = tokens[2];
+
+                    match self.view_image(owner, image_name) {
+                        Ok(_) => println!("Image viewing complete"),
+                        Err(e) => eprintln!("Error viewing image: {}", e),
                     }
                 }
                 "exit" => {
