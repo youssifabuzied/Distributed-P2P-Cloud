@@ -58,7 +58,7 @@ def add_image(image_name, image_bytes, user_name):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     print("--Adding image--")
-    print(f'Image name: image_name')
+    print(f'Image name: {image_name}')
     print(f'Username: {user_name}')
     # print(image_bytes)
     # print(type(image_bytes))

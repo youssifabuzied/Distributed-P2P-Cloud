@@ -154,6 +154,263 @@ impl ClientMiddleware {
         }
     }
 
+    pub fn handle_post_approval(
+        server_urls: &[String],
+        request_id: u64,
+        owner: &str,
+        viewer: &str,
+        image_name: &str,
+        accep_views: u64,
+    ) -> MiddlewareResponse {
+        println!(
+            "[ClientMiddleware] [Req #{}] Starting post-approval workflow: {} -> {}'s '{}'",
+            request_id, viewer, owner, image_name
+        );
+
+        // Step 1: Read the image from local disk
+        let image_path = format!("{}", image_name);
+        let image_bytes = match std::fs::read(&image_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to read image from disk: {}",
+                    request_id, e
+                );
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to read image '{}': {}", image_name, e),
+                );
+            }
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Read image from disk ({} bytes)",
+            request_id,
+            image_bytes.len()
+        );
+
+        // Step 2: Prepare views HashMap for encryption (only viewer with approved views)
+        let mut views: HashMap<String, u64> = HashMap::new();
+        views.insert(viewer.to_string(), accep_views);
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Sending image for encryption with {} views for {}",
+            request_id, accep_views, viewer
+        );
+
+        // Step 3: Send for encryption using existing encrypt function
+        let encrypted_bytes = match Self::send_encrypt_to_single_server(
+            &server_urls[0],
+            request_id,
+            image_name,
+            &image_bytes,
+            views,
+        ) {
+            Ok(response) => {
+                if response.status != "OK" {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] Encryption failed: {:?}",
+                        request_id, response.message
+                    );
+                    return MiddlewareResponse::error(
+                        request_id,
+                        &format!(
+                            "Encryption failed: {}",
+                            response.message.unwrap_or_default()
+                        ),
+                    );
+                }
+
+                // Extract encrypted data from response
+                if let Some(file_data_b64) = response.output_path {
+                    // output_path actually contains base64 data in our response
+                    match general_purpose::STANDARD.decode(&file_data_b64) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            eprintln!(
+                                "[ClientMiddleware] [Req #{}] Failed to decode encrypted data: {}",
+                                request_id, e
+                            );
+                            return MiddlewareResponse::error(
+                                request_id,
+                                &format!("Failed to decode encrypted data: {}", e),
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] No encrypted data in response",
+                        request_id
+                    );
+                    return MiddlewareResponse::error(request_id, "No encrypted data in response");
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Encryption request failed: {}",
+                    request_id, e
+                );
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Encryption request failed: {}", e),
+                );
+            }
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Encryption complete ({} bytes)",
+            request_id,
+            encrypted_bytes.len()
+        );
+
+        // Step 4: Fetch active users to get viewer's IP
+        let viewer_ip = match Self::fetch_viewer_ip_from_server(server_urls, request_id, viewer) {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to fetch viewer IP: {}",
+                    request_id, e
+                );
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to fetch viewer IP: {}", e),
+                );
+            }
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Found viewer IP: {}",
+            request_id, viewer_ip
+        );
+
+        // Step 5: Send encrypted image to viewer's client middleware
+        match Self::send_encrypted_to_viewer(request_id, &viewer_ip, image_name, &encrypted_bytes) {
+            Ok(_) => {
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Successfully delivered encrypted image to {}",
+                    request_id, viewer
+                );
+                MiddlewareResponse::success(
+                    request_id,
+                    &format!("Image encrypted and delivered to {} successfully", viewer),
+                    None,
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to deliver to viewer: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to deliver encrypted image: {}", e),
+                )
+            }
+        }
+    }
+
+    // Helper: Fetch viewer's IP from server
+    fn fetch_viewer_ip_from_server(
+        server_urls: &[String],
+        request_id: u64,
+        viewer: &str,
+    ) -> Result<String, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/fetch_users", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+        });
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Fetching active users to find viewer IP...",
+            request_id
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<serde_json::Value>() {
+                Ok(json_resp) => {
+                    let message = json_resp["message"].as_str().unwrap_or("");
+
+                    // Parse the message to extract user list
+                    // Format: "  username - ip\n  username - ip\n..."
+                    for line in message.lines() {
+                        let parts: Vec<&str> = line.trim().split(" - ").collect();
+                        if parts.len() == 2 {
+                            let username = parts[0].trim();
+                            let ip = parts[1].trim();
+
+                            if username == viewer {
+                                return Ok(ip.to_string());
+                            }
+                        }
+                    }
+
+                    Err(format!("Viewer '{}' not found in active users", viewer))
+                }
+                Err(e) => Err(format!("Failed to parse response: {}", e)),
+            },
+            Err(e) => Err(format!("Failed to contact server: {}", e)),
+        }
+    }
+
+    // Helper: Send encrypted image to viewer's middleware via TCP
+    fn send_encrypted_to_viewer(
+        request_id: u64,
+        viewer_ip: &str,
+        image_name: &str,
+        encrypted_data: &[u8],
+    ) -> Result<(), String> {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        // Connect to viewer's client middleware (port 9000)
+        let viewer_addr = format!("{}:9000", viewer_ip);
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Connecting to viewer middleware at {}...",
+            request_id, viewer_addr
+        );
+
+        let mut stream = TcpStream::connect(&viewer_addr)
+            .map_err(|e| format!("Failed to connect to viewer middleware: {}", e))?;
+
+        // Create a delivery request message
+        let delivery_request = serde_json::json!({
+            "type": "ReceiveEncryptedImage",
+            "request_id": request_id,
+            "image_name": image_name,
+            "encrypted_data": general_purpose::STANDARD.encode(encrypted_data),
+        });
+
+        let request_json = serde_json::to_string(&delivery_request)
+            .map_err(|e| format!("Failed to serialize request: {}", e))?;
+
+        // Send the request
+        stream
+            .write_all(request_json.as_bytes())
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+        stream
+            .write_all(b"\n")
+            .map_err(|e| format!("Failed to send newline: {}", e))?;
+        stream
+            .flush()
+            .map_err(|e| format!("Failed to flush stream: {}", e))?;
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Sent encrypted image to viewer",
+            request_id
+        );
+
+        Ok(())
+    }
+
+    // Update the send_approve_access_to_server to trigger post-approval workflow
     fn send_approve_access_to_server(
         server_urls: &[String],
         request_id: u64,
@@ -203,6 +460,28 @@ impl ClientMiddleware {
                                 "[ClientMiddleware] [Req #{}] ✓ {}",
                                 request_id, server_resp.message
                             );
+
+                            // If approval (not rejection), start post-approval workflow
+                            if accep_views > 0 {
+                                println!(
+                                    "[ClientMiddleware] [Req #{}] Starting encryption and delivery workflow...",
+                                    request_id
+                                );
+
+                                // Clone server_urls for the workflow
+                                let server_urls_vec = server_urls.to_vec();
+
+                                // Execute post-approval workflow
+                                return ClientMiddleware::handle_post_approval(
+                                    &server_urls_vec,
+                                    request_id,
+                                    owner,
+                                    viewer,
+                                    image_name,
+                                    accep_views as u64,
+                                );
+                            }
+
                             MiddlewareResponse::success(request_id, &server_resp.message, None)
                         } else {
                             eprintln!(
@@ -591,12 +870,36 @@ impl ClientMiddleware {
             return Ok(());
         }
 
-        // println!(
-        //     "[ClientMiddleware] Received from client: {}",
-        //     request_line.trim()
-        // );
+        // Try to parse as JSON to determine request type
+        let json_value: serde_json::Value = serde_json::from_str(request_line.trim())?;
 
-        // Parse request
+        // Check if this is a delivery request (ReceiveEncryptedImage)
+        if let Some(req_type) = json_value["type"].as_str() {
+            if req_type == "ReceiveEncryptedImage" {
+                println!("[ClientMiddleware] Received encrypted image delivery");
+
+                let request_id = json_value["request_id"].as_u64().unwrap_or(0);
+                let image_name = json_value["image_name"].as_str().unwrap_or("");
+                let encrypted_data_b64 = json_value["encrypted_data"].as_str().unwrap_or("");
+
+                // Handle the delivery
+                let response = Self::handle_receive_encrypted_image(
+                    request_id,
+                    image_name,
+                    encrypted_data_b64,
+                );
+
+                // Send acknowledgment back
+                let response_json = serde_json::to_string(&response)?;
+                writer.write_all(response_json.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+
+                return Ok(());
+            }
+        }
+
+        // Otherwise, parse as normal ClientRequest
         let response = match serde_json::from_str::<ClientRequest>(request_line.trim()) {
             Ok(request) => {
                 let request_id = match &request {
@@ -633,6 +936,91 @@ impl ClientMiddleware {
         );
 
         Ok(())
+    }
+
+    // New handler for receiving encrypted images
+    fn handle_receive_encrypted_image(
+        request_id: u64,
+        image_name: &str,
+        encrypted_data_b64: &str,
+    ) -> MiddlewareResponse {
+        println!(
+            "[ClientMiddleware] [Req #{}] Processing received encrypted image: {}",
+            request_id, image_name
+        );
+
+        // Decode base64 data
+        let encrypted_bytes = match general_purpose::STANDARD.decode(encrypted_data_b64) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to decode encrypted data: {}",
+                    request_id, e
+                );
+                return MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to decode encrypted data: {}", e),
+                );
+            }
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Decoded {} bytes",
+            request_id,
+            encrypted_bytes.len()
+        );
+
+        // Save to client_storage
+        let storage_dir = "client_storage";
+        if let Err(e) = std::fs::create_dir_all(storage_dir) {
+            eprintln!(
+                "[ClientMiddleware] [Req #{}] Failed to create storage directory: {}",
+                request_id, e
+            );
+            return MiddlewareResponse::error(
+                request_id,
+                &format!("Failed to create storage directory: {}", e),
+            );
+        }
+
+        let output_path = format!("{}/{}", storage_dir, image_name);
+
+        match std::fs::write(&output_path, &encrypted_bytes) {
+            Ok(_) => {
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Saved encrypted image to: {}",
+                    request_id, output_path
+                );
+
+                // Notify user
+                println!("\n========================================");
+                println!("📥 NEW ENCRYPTED IMAGE RECEIVED");
+                println!("========================================");
+                println!("Image: {}", image_name);
+                println!("Saved to: {}", output_path);
+                println!("Size: {} bytes", encrypted_bytes.len());
+                println!("========================================\n");
+
+                MiddlewareResponse::success(
+                    request_id,
+                    &format!(
+                        "Encrypted image '{}' received and saved successfully",
+                        image_name
+                    ),
+                    Some(output_path),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to save encrypted image: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(
+                    request_id,
+                    &format!("Failed to save encrypted image: {}", e),
+                )
+            }
+        }
     }
 
     fn forward_to_servers(server_urls: &[String], request: ClientRequest) -> MiddlewareResponse {
