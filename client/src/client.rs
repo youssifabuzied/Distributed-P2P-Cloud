@@ -358,26 +358,12 @@ impl Client {
 
         #[cfg(target_os = "linux")]
         {
-            // Try common Linux image viewers
-            let viewers = ["xdg-open", "eog", "feh", "display"];
-            let mut opened = false;
-
-            for viewer in &viewers {
-                match Command::new(viewer).arg(&image_to_display).spawn() {
-                    Ok(_) => {
-                        println!("[Client] ✓ Image opened with {}", viewer);
-                        opened = true;
-                        break;
-                    }
-                    Err(_) => continue,
+            match Command::new("xdg-open").arg(&image_to_display).spawn() {
+                Ok(_) => println!("[Client] ✓ Image opened with default viewer"),
+                Err(e) => {
+                    eprintln!("[Client] ✗ Could not open image viewer: {}", e);
+                    eprintln!("[Client] Image saved at: {}", image_to_display);
                 }
-            }
-
-            if !opened {
-                eprintln!(
-                    "[Client] ✗ Could not open image viewer. Image saved at: {}",
-                    image_to_display
-                );
             }
         }
 

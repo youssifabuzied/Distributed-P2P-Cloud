@@ -1597,6 +1597,12 @@ impl ClientMiddleware {
         Ok(views)
     }
     // New local decryption function (dummy implementation)
+    // Replace the decrypt_image_locally function in client/src/middleware.rs
+    // Starting around line 590
+
+    // Replace the decrypt_image_locally function in client/src/middleware.rs
+    // Starting around line 590
+
     fn decrypt_image_locally(
         request_id: u64,
         image_path: &str,
@@ -1608,43 +1614,80 @@ impl ClientMiddleware {
         }
 
         println!(
-            "[ClientMiddleware] [Req #{}] Decrypting locally: {}",
+            "[ClientMiddleware] [Req #{}] Decrypting locally: {} (treating as PNG)",
             request_id, image_path
         );
 
-        //DECRYPTION LOGIC NEEDED
-        //EXTRACT VIEWS LIST
+        // Verify it's actually a PNG file (check magic bytes)
+        if let Ok(header) = std::fs::read(image_path) {
+            if header.len() >= 8 {
+                let png_signature = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+                if &header[..8] != png_signature {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] File '{}' is not a PNG (despite extension). \
+                    First 8 bytes: {:02X?}",
+                        request_id,
+                        image_path,
+                        &header[..8]
+                    );
+                    return MiddlewareResponse::error(
+                        request_id,
+                        "File is not a valid PNG - encrypted images must be PNG format",
+                    );
+                }
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Verified PNG format (magic bytes correct)",
+                    request_id
+                );
+            }
+        }
+
         let secret_key: &[u8] = b"supersecretkey_supersecretkey_32";
         let view_key = Key::from_slice(secret_key);
         let password_hex = hex::encode(view_key.as_slice());
-        //let password_hex = hex::encode(view_key);
-        //VIEWS EXTRACTED
+
+        // IMPORTANT: All encrypted images are PNG regardless of file extension
+        // The steganography library expects PNG format
+
+        // Extract views from PNG iTXt metadata (file extension is ignored)
         let mut parsed_views = match Self::extract_and_decrypt_views(image_path, &password_hex) {
             Ok(v) => v,
             Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to extract views from '{}'. \
+                The file may not be properly encrypted or may be corrupted.",
+                    request_id, image_path
+                );
                 return MiddlewareResponse::error(
                     request_id,
-                    &format!("Failed to extract/decrypt views: {}", e),
+                    &format!("Failed to extract views metadata: {}", e),
                 );
             }
         };
+
         println!(
             "[ClientMiddleware] [Req #{}] Image Users and Views: {:?}",
             request_id, parsed_views
         );
-        //CHECK IF WE CAN STILL VIEW (AGREE ON IMPLEMENTATION LATER)
-        //CHECK IF WE CAN STILL VIEW (AGREE ON IMPLEMENTATION LATER)
+
+        // Check if user has remaining views
         match parsed_views.get_mut(username) {
             Some(count) => {
                 if *count == 0 {
-                    return MiddlewareResponse::error(request_id, "Username Views Exceeded");
+                    return MiddlewareResponse::error(request_id, "No views remaining");
                 }
                 *count -= 1;
-                println!("User: {} has {} views remaining", username, *count);
+                println!(
+                    "[ClientMiddleware] [Req #{}] User {} has {} views remaining",
+                    request_id, username, *count
+                );
             }
-            None => return MiddlewareResponse::error(request_id, "Username Not Found"),
+            None => {
+                return MiddlewareResponse::error(request_id, "User not authorized for this image");
+            }
         }
 
+        // Create temporary extraction directory
         let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
             Ok(dir) => dir,
             Err(e) => {
@@ -1654,46 +1697,12 @@ impl ClientMiddleware {
                 );
             }
         };
+
+        // Extract hidden data using steganography
         println!(
-            "Temporary extraction folder: {}",
-            tmp_extract_dir.path().display()
+            "[ClientMiddleware] [Req #{}] Extracting hidden image...",
+            request_id
         );
-
-        println!("[ClientMiddleware] [Req #{}] Decryption Begin", request_id);
-
-        //let key = Key::<Aes256Gcm>::from_slice(secret_key);
-        let cipher = XChaCha20Poly1305::new(view_key);
-        //VIEW ENCRYPTION SETUP
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        //VIEW ENCRYPTION LOGIC
-        let json_bytes = match serde_json::to_vec(&parsed_views) {
-            Ok(j) => j,
-            Err(e) => {
-                return MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to Serialize Views: {}", e),
-                );
-            }
-        };
-        let ciphertext = match cipher.encrypt(
-            &nonce,
-            Payload {
-                msg: &json_bytes,
-                aad: &[],
-            },
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                return MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to Encrypt Views: {}", e),
-                );
-            }
-        };
-        let mut full = Vec::new();
-        full.extend_from_slice(&nonce.as_slice());
-        full.extend_from_slice(&ciphertext);
-        let encoded_views = hex::encode(full);
 
         if let Err(e) = extract_prepare()
             .using_password(password_hex.as_str())
@@ -1701,13 +1710,17 @@ impl ClientMiddleware {
             .into_output_folder(tmp_extract_dir.path())
             .execute()
         {
+            eprintln!(
+                "[ClientMiddleware] [Req #{}] Failed to extract hidden data: {}",
+                request_id, e
+            );
             return MiddlewareResponse::error(
                 request_id,
-                &format!("Failed to extract hidden data: {}", e),
+                &format!("Failed to extract hidden image: {}", e),
             );
         }
 
-        println!("Extracted payload to {}", tmp_extract_dir.path().display());
+        // Find the extracted file
         let extracted_file_path = match fs::read_dir(tmp_extract_dir.path()).and_then(|mut rd| {
             rd.next()
                 .ok_or_else(|| {
@@ -1717,172 +1730,170 @@ impl ClientMiddleware {
         }) {
             Ok(path) => path,
             Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to locate extracted file: {}",
+                    request_id, e
+                );
                 return MiddlewareResponse::error(
                     request_id,
-                    &format!("Failed to locate extracted file: {}", e),
+                    &format!("No extracted file found: {}", e),
                 );
             }
         };
-        println!("Found extracted file: {}", extracted_file_path.display());
+
+        // Read extracted bytes (this is the bincode-serialized HiddenPayload)
         let extracted_bytes = match fs::read(&extracted_file_path) {
             Ok(bytes) => bytes,
             Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to read extracted file: {}",
+                    request_id, e
+                );
                 return MiddlewareResponse::error(
                     request_id,
                     &format!("Failed to read extracted file: {}", e),
                 );
             }
         };
-        println!("Extracted size: {} bytes", extracted_bytes.len());
-        println!(
-            "First 32 bytes: {:?}",
-            &extracted_bytes[..32.min(extracted_bytes.len())]
-        );
 
+        // Deserialize to get the hidden image bytes
         let recovered: HiddenPayload = match bincode::deserialize(&extracted_bytes) {
             Ok(payload) => payload,
             Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to deserialize payload: {}",
+                    request_id, e
+                );
                 return MiddlewareResponse::error(
                     request_id,
-                    &format!("Failed to deserialize payload: {}", e),
+                    &format!("Failed to deserialize hidden image: {}", e),
                 );
             }
         };
-        println!("Recovered message: {}", recovered.message);
-        // if let Some(extra) = &recovered.extra {
-        //     println!("Extra: {}", extra);
-        // }
+
+        // Create output directory
         let output_dir = PathBuf::from("client_storage");
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
             return MiddlewareResponse::error(
                 request_id,
-                &format!("Failed to create directory: {}", e),
+                &format!("Failed to create output directory: {}", e),
             );
         }
 
-        //fs::create_dir_all(&output_dir)?;
+        // Save decrypted image
         let output_stem = Path::new(image_path)
-            .file_stem() // e.g. "encrypted_input"
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
         let output_path = output_dir.join(format!("decrypted_{}.png", output_stem));
 
-        match fs::write(&output_path, &recovered.image_bytes) {
-            Ok(_) => {
-                let file = match File::open(&image_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to Open Original Image: {}", e),
-                        );
-                    }
-                };
-                let decoder = Decoder::new(BufReader::new(file));
-                let mut reader = match decoder.read_info() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to Read Original Image Info: {}", e),
-                        );
-                    }
-                };
-                let mut buf = vec![0; reader.output_buffer_size()];
-                let info = match reader.next_frame(&mut buf) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        return MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to Match Buffer: {}", e),
-                        );
-                    }
-                };
-                buf.truncate(info.buffer_size());
-                let out_tmp = Path::new(image_path).with_extension("tmp.png");
-                // Re-encode with a new iTXt chunk
-                let out = match File::create(&out_tmp) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to Write to Original Image: {}", e),
-                        );
-                    }
-                };
-                let w = BufWriter::new(out);
-
-                let mut encoder = Encoder::new(w, info.width, info.height);
-                encoder.set_color(info.color_type);
-                encoder.set_depth(info.bit_depth);
-
-                if let Err(e) =
-                    encoder.add_itxt_chunk("EncryptedViews".to_string(), encoded_views.clone())
-                {
-                    return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Add ITXT Chunk: {}", e),
-                    );
-                }
-
-                let mut writer = match encoder.write_header() {
-                    Ok(w) => w,
-                    Err(e) => {
-                        return MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to Write Header: {}", e),
-                        );
-                    }
-                };
-                // Write PNG image data
-                if let Err(e) = writer.write_image_data(&buf) {
-                    return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Write PNG data: {}", e),
-                    );
-                }
-
-                // Finish writing
-                if let Err(e) = writer.finish() {
-                    return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to Finish Writing: {}", e),
-                    );
-                }
-                if let Err(e) = std::fs::rename(&out_tmp, &image_path) {
-                    // try best-effort cleanup
-                    let _ = std::fs::remove_file(&out_tmp);
-                    return MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to replace output file: {}", e),
-                    );
-                }
-                println!(
-                    "[ClientMiddleware] [Req #{}] Decryption complete → saved hidden image as: {} -> Updated Views: {:?}",
-                    request_id,
-                    output_path.display(),
-                    parsed_views
-                );
-                MiddlewareResponse::success(
-                    request_id,
-                    &format!(
-                        "Image successfully decrypted and saved to {}",
-                        output_path.display()
-                    ),
-                    Some(output_path.to_string_lossy().to_string()),
-                )
-            }
-            Err(e) => {
-                eprintln!(
-                    "[ClientMiddleware] [Req #{}] Failed to save decrypted image: {}",
-                    request_id, e
-                );
-                MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to save decrypted image: {}", e),
-                )
-            }
+        if let Err(e) = fs::write(&output_path, &recovered.image_bytes) {
+            eprintln!(
+                "[ClientMiddleware] [Req #{}] Failed to save decrypted image: {}",
+                request_id, e
+            );
+            return MiddlewareResponse::error(
+                request_id,
+                &format!("Failed to save decrypted image: {}", e),
+            );
         }
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Decrypted image saved to: {}",
+            request_id,
+            output_path.display()
+        );
+
+        // Update view count in the encrypted image's metadata (PNG iTXt chunk)
+        // If this fails, we still consider decryption successful
+        let _ = Self::update_view_count_in_image(image_path, &parsed_views, &view_key);
+
+        println!(
+            "[ClientMiddleware] [Req #{}] ✓ Decryption complete (Updated views: {:?})",
+            request_id, parsed_views
+        );
+
+        MiddlewareResponse::success(
+            request_id,
+            &format!("Image successfully decrypted"),
+            Some(output_path.to_string_lossy().to_string()),
+        )
+    }
+
+    // Helper function to update view count (non-critical)
+    fn update_view_count_in_image(
+        image_path: &str,
+        views: &HashMap<String, u64>,
+        view_key: &Key,
+    ) -> Result<(), String> {
+        let cipher = XChaCha20Poly1305::new(view_key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        let json_bytes =
+            serde_json::to_vec(views).map_err(|e| format!("Failed to serialize views: {}", e))?;
+
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &json_bytes,
+                    aad: &[],
+                },
+            )
+            .map_err(|e| format!("Failed to encrypt views: {}", e))?;
+
+        let mut full = Vec::new();
+        full.extend_from_slice(&nonce.as_slice());
+        full.extend_from_slice(&ciphertext);
+        let encoded_views = hex::encode(full);
+
+        // Read original PNG
+        let file = File::open(image_path).map_err(|e| format!("Failed to open image: {}", e))?;
+
+        let decoder = Decoder::new(BufReader::new(file));
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| format!("Failed to read PNG info: {}", e))?;
+
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut buf)
+            .map_err(|e| format!("Failed to read PNG frame: {}", e))?;
+        buf.truncate(info.buffer_size());
+
+        // Write new PNG with updated iTXt chunk
+        let out_tmp = Path::new(image_path).with_extension("tmp.png");
+        let out =
+            File::create(&out_tmp).map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+        let w = BufWriter::new(out);
+        let mut encoder = Encoder::new(w, info.width, info.height);
+        encoder.set_color(info.color_type);
+        encoder.set_depth(info.bit_depth);
+
+        encoder
+            .add_itxt_chunk("EncryptedViews".to_string(), encoded_views)
+            .map_err(|e| format!("Failed to add iTXt chunk: {}", e))?;
+
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+
+        writer
+            .write_image_data(&buf)
+            .map_err(|e| format!("Failed to write image data: {}", e))?;
+
+        writer
+            .finish()
+            .map_err(|e| format!("Failed to finish writing: {}", e))?;
+
+        // Replace original with updated version
+        std::fs::rename(&out_tmp, image_path).map_err(|e| {
+            let _ = std::fs::remove_file(&out_tmp);
+            format!("Failed to replace file: {}", e)
+        })?;
+
+        Ok(())
     }
     fn send_register_to_server(
         server_urls: &[String],
