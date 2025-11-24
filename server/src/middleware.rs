@@ -429,6 +429,7 @@ impl ServerMiddleware {
                 post(view_pending_requests_handler),
             )
             .route("/approve_access", post(approve_access_handler))
+            .route("/get_accepted_views", post(get_accepted_views_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1506,6 +1507,46 @@ async fn approve_access_handler(
                 "message": format!("Failed to update access request: {}", e),
             })))
         }
+    }
+}
+
+async fn get_accepted_views_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Getting accepted views: {} -> {}'s '{}'",
+        request_id, viewer, owner, image_name
+    );
+
+    match directory_service::get_accepted_views(owner, viewer, image_name).await {
+        Ok((success, accep_views, message)) => {
+            if success {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "success",
+                    "accep_views": accep_views,
+                    "message": message,
+                })))
+            } else {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "error",
+                    "accep_views": accep_views,
+                    "message": message,
+                })))
+            }
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to get accepted views: {}", e),
+        }))),
     }
 }
 

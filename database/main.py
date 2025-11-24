@@ -308,6 +308,57 @@ def approve_or_reject_access_request(owner, viewer, image_name, accep_views):
         print(f"Error updating access request: {e}")
         conn.close()
         return False
+    
+def get_accepted_views(owner, viewer, image_name):
+    """
+    Get the number of accepted views for a specific image access request
+    
+    Args:
+        owner: Username of the image owner
+        viewer: Username of the viewer
+        image_name: Name of the image
+    
+    Returns:
+        tuple: (success: bool, accep_views: int or None, message: str)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Query for access record (status: 0=rejected, 1=approved, 2=pending)
+        cursor.execute("""
+            SELECT accep_views, status
+            FROM ImageAccess 
+            WHERE owner = ? AND viewer = ? AND image_name = ?
+        """, (owner, viewer, image_name))
+        
+        result = cursor.fetchone()
+        
+        if result is None:
+            conn.close()
+            return False, None, f"No access record found for {viewer} to view {owner}'s '{image_name}'"
+        
+        accep_views, status = result
+        
+        if status == 0:
+            conn.close()
+            return False, 0, f"Access request was rejected"
+        elif status == 1:
+            conn.close()
+            print(f"Accepted views remaining: {accep_views}")
+            return True, accep_views, f"Approved: {accep_views} views remaining"
+        elif status == 2:
+            conn.close()
+            return False, None, f"Access request is still pending approval"
+        else:
+            conn.close()
+            return False, None, f"Unknown status: {status}"
+        
+    except Exception as e:
+        print(f"Error fetching accepted views: {e}")
+        conn.close()
+        return False, None, f"Database error: {e}"
+    
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -457,6 +508,27 @@ def handle_request():
                 return jsonify({
                     'status': 'error',
                     'message': 'Failed to update access request'
+                }), 400
+            
+        
+        elif operation == 'get_accepted_views':
+            owner = data.get('owner')
+            viewer = data.get('viewer')
+            image_name = data.get('image_name')
+            
+            success, accep_views, message = get_accepted_views(owner, viewer, image_name)
+            
+            if success:
+                return jsonify({
+                    'status': 'success',
+                    'accep_views': accep_views,
+                    'message': message
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'accep_views': accep_views,
+                    'message': message
                 }), 400
 
         else:

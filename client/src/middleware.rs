@@ -87,6 +87,12 @@ pub enum ClientRequest {
         image_name: String,
         accep_views: i64,
     },
+    GetAcceptedViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -533,6 +539,72 @@ impl ClientMiddleware {
         }
     }
 
+    fn send_get_accepted_views_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        owner: &str,
+        viewer: &str,
+        image_name: &str,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/get_accepted_views", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+        });
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Getting accepted views: {} -> {}'s '{}'",
+            request_id, viewer, owner, image_name
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        // Extract accep_views from response (it's in the message or we can parse it)
+                        println!(
+                            "[ClientMiddleware] [Req #{}] ✓ {}",
+                            request_id, server_resp.message
+                        );
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        eprintln!(
+                            "[ClientMiddleware] [Req #{}] Error: {}",
+                            request_id, server_resp.message
+                        );
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] Failed to parse response: {}",
+                        request_id, e
+                    );
+                    MiddlewareResponse::error(
+                        request_id,
+                        &format!("Failed to parse response: {}", e),
+                    )
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to contact server: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+
     fn send_view_pending_requests_to_server(
         server_urls: &[String],
         request_id: u64,
@@ -938,6 +1010,7 @@ impl ClientMiddleware {
                     ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
                     ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
                     ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
+                    ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -1204,6 +1277,18 @@ impl ClientMiddleware {
                 &viewer,
                 &image_name,
                 accep_views,
+            ),
+            ClientRequest::GetAcceptedViews {
+                request_id,
+                owner,
+                viewer,
+                image_name,
+            } => Self::send_get_accepted_views_to_server(
+                server_urls,
+                request_id,
+                &owner,
+                &viewer,
+                &image_name,
             ),
         }
     }

@@ -71,6 +71,12 @@ pub enum ClientRequest {
         image_name: String,
         accep_views: i64,
     },
+    GetAcceptedViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -160,6 +166,22 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn get_accepted_views(&self, owner: &str, image_name: &str) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::GetAcceptedViews {
+            request_id,
+            owner: owner.to_string(),
+            viewer: self.metadata.username.clone(),
+            image_name: image_name.to_string(),
+        };
+
+        let id = self.send_request_async(request);
+        println!(
+            "[Client] Queued get accepted views request #{} for {}'s '{}'",
+            id, owner, image_name
+        );
+        Ok(id)
+    }
     pub fn view_pending_requests(&self) -> Result<u64, Box<dyn Error>> {
         let request_id = self.tracker.create_request();
         let request = ClientRequest::ViewPendingRequests {
@@ -353,6 +375,7 @@ impl Client {
             ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
             ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
             ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
+            ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -560,6 +583,7 @@ impl Client {
         println!(
             "  approve_access_request <number> <views>  - Approve (views>0) or reject (views=-1) a request"
         );
+        println!("  get_views <owner> <image_name>  - Get accepted views for an image");
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
@@ -756,6 +780,15 @@ impl Client {
                             req.image_name,
                             req.prop_views
                         );
+                    }
+                }
+                "get_views" if tokens.len() == 3 => {
+                    let owner = tokens[1];
+                    let image_name = tokens[2];
+
+                    match self.get_accepted_views(owner, image_name) {
+                        Ok(id) => println!("Request #{id} queued (getting accepted views)"),
+                        Err(e) => eprintln!("Error: {e}"),
                     }
                 }
                 "exit" => {

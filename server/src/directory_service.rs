@@ -301,3 +301,46 @@ pub async fn approve_or_reject_access_request(
         Err(format!("Failed to update access request: {}", response.status()).into())
     }
 }
+
+// ------------------------------------------------------------------------------------
+
+pub async fn get_accepted_views(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "get_accepted_views",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+    });
+
+    println!(
+        "[Directory Service] Getting accepted views: {} -> {}'s '{}'",
+        viewer, owner, image_name
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        let status = body["status"].as_str().unwrap_or("error");
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string();
+
+        if status == "success" {
+            let accep_views = body["accep_views"].as_u64();
+            Ok((true, accep_views, message))
+        } else {
+            let accep_views = body["accep_views"].as_u64();
+            Ok((false, accep_views, message))
+        }
+    } else {
+        Err(format!("Failed to get accepted views: {}", response.status()).into())
+    }
+}
