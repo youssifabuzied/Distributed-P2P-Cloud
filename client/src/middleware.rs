@@ -837,7 +837,7 @@ impl ClientMiddleware {
     }
 
     pub fn start(&self) -> Result<(), Box<dyn Error>> {
-        let addr = format!("{}:{}", self.ip, self.port);
+        let addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&addr)?;
 
         println!("========================================");
