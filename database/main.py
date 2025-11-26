@@ -468,6 +468,93 @@ def request_additional_views(owner, viewer, image_name, additional_views):
         conn.close()
         return False, None, f"Database error: {e}"
     
+def get_additional_views_requests(username):
+    """
+    Get all additional views requests for a user (as owner)
+    
+    Args:
+        username: Username of the owner
+    
+    Returns:
+        list: List of tuples (viewer, image_name, prop_views, accep_views)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT viewer, image_name, prop_views, accep_views
+        FROM ImageAccess 
+        WHERE owner = ? AND status = 3
+    """, (username,))
+    
+    requests = cursor.fetchall()
+    conn.close()
+    return requests
+
+def accept_or_reject_additional_views(owner, viewer, image_name, result):
+    """
+    Accept or reject an additional views request
+    
+    Args:
+        owner: Username of the image owner
+        viewer: Username requesting additional views
+        image_name: Name of the image
+        result: 0 to reject (keep current accep_views), 1 to accept (update to prop_views)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Check if request exists with status=3 (additional views requested)
+        cursor.execute("""
+            SELECT prop_views, accep_views FROM ImageAccess 
+            WHERE owner = ? AND viewer = ? AND image_name = ? AND status = 3
+        """, (owner, viewer, image_name))
+        
+        result_row = cursor.fetchone()
+        
+        if result_row is None:
+            print(f"Error: No additional views request found for {viewer} -> {owner}'s '{image_name}'")
+            conn.close()
+            return False
+        
+        prop_views, current_accep_views = result_row
+        
+        # Determine new accep_views based on result
+        if result == 1:
+            # Accept: update accep_views to prop_views
+            new_accep_views = prop_views
+            action = "accepted"
+        elif result == 0:
+            # Reject: keep current accep_views
+            new_accep_views = current_accep_views
+            action = "rejected"
+        else:
+            print(f"Error: Invalid result value: {result}")
+            conn.close()
+            return False
+        
+        # Update status back to 1 (approved) and set accep_views
+        cursor.execute("""
+            UPDATE ImageAccess 
+            SET status = 1, accep_views = ?
+            WHERE owner = ? AND viewer = ? AND image_name = ?
+        """, (new_accep_views, owner, viewer, image_name))
+        
+        conn.commit()
+        print(f"Additional views request {action}: {viewer} -> {owner}'s '{image_name}' (accep_views: {current_accep_views} -> {new_accep_views})")
+        
+        conn.close()
+        return True
+        
+    except Exception as e:
+        print(f"Error processing additional views request: {e}")
+        conn.close()
+        return False
+    
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -678,6 +765,36 @@ def handle_request():
                 return jsonify({
                     'status': 'error',
                     'message': message
+                }), 400
+            
+        elif operation == 'get_additional_views_requests':
+            requests = get_additional_views_requests(data.get('user_name'))
+            return jsonify({
+                'status': 'success',
+                'requests': [
+                    {'viewer': r[0], 'image_name': r[1], 'prop_views': r[2], 'accep_views': r[3]}
+                    for r in requests
+                ]
+            }), 200
+        
+        elif operation == 'accept_or_reject_additional_views':
+            owner = data.get('owner')
+            viewer = data.get('viewer')
+            image_name = data.get('image_name')
+            result = data.get('result')
+            
+            success = accept_or_reject_additional_views(owner, viewer, image_name, result)
+            
+            if success:
+                action = "rejected" if result == 0 else "accepted"
+                return jsonify({
+                    'status': 'success',
+                    'message': f'Additional views request {action}'
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Failed to process additional views request'
                 }), 400
             
         else:

@@ -14,6 +14,13 @@ pub struct PendingAccessRequest {
     pub prop_views: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdditionalViewsRequest {
+    pub viewer: String,
+    pub image_name: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
+}
 // ------------------------------------------------------------------------------------
 
 pub async fn register_client(username: &str, ip: &str) -> Result<(), Box<dyn Error>> {
@@ -430,5 +437,102 @@ pub async fn request_additional_views(
         }
     } else {
         Err(format!("Failed to request additional views: {}", response.status()).into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn get_additional_views_requests(
+    username: &str,
+) -> Result<Vec<AdditionalViewsRequest>, Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "get_additional_views_requests",
+        "user_name": username,
+    });
+
+    println!(
+        "[Directory Service] Fetching additional views requests for: {}",
+        username
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+
+        let mut requests = Vec::new();
+
+        if let Some(requests_array) = body["requests"].as_array() {
+            for req in requests_array {
+                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
+                let image_name = req["image_name"].as_str().unwrap_or("").to_string();
+                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
+                let accep_views = req["accep_views"].as_u64().unwrap_or(0);
+
+                requests.push(AdditionalViewsRequest {
+                    viewer,
+                    image_name,
+                    prop_views,
+                    accep_views,
+                });
+            }
+        }
+
+        Ok(requests)
+    } else {
+        Err(format!(
+            "Failed to fetch additional views requests: {}",
+            response.status()
+        )
+        .into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn accept_or_reject_additional_views(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+    result: i32, // 0 = reject, 1 = accept
+) -> Result<(), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "accept_or_reject_additional_views",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+        "result": result,
+    });
+
+    let action = if result == 0 {
+        "Rejecting"
+    } else {
+        "Accepting"
+    };
+
+    println!(
+        "[Directory Service] {} additional views: {} -> {}'s '{}'",
+        action, viewer, owner, image_name
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        println!(
+            "[Directory Service] ✓ Additional views request updated: {:?}",
+            body
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to update additional views request: {}",
+            response.status()
+        )
+        .into())
     }
 }

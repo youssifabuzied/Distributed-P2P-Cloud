@@ -93,6 +93,17 @@ pub enum ClientRequest {
         image_name: String,
         additional_views: u64,
     },
+    GetAdditionalViewsRequests {
+        request_id: u64,
+        username: String,
+    },
+    AcceptAdditionalViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        result: i32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -182,11 +193,20 @@ pub struct ImageMetadata {
     pub views_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdditionalViewsRequest {
+    pub viewer: String,
+    pub image_name: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
+}
+
 pub struct Client {
     pub metadata: ClientMetadata,
     pub middleware_addr: String,
     pub tracker: RequestTracker,
     pub pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
+    pub additional_views_requests: Arc<Mutex<Vec<AdditionalViewsRequest>>>,
 }
 
 impl Client {
@@ -205,6 +225,106 @@ impl Client {
             id, owner, image_name
         );
         Ok(id)
+    }
+
+    pub fn accept_additional_views(
+        &self,
+        request_number: usize,
+        result: i32,
+    ) -> Result<u64, Box<dyn Error>> {
+        let additional_requests = self.additional_views_requests.lock().unwrap();
+
+        if request_number == 0 || request_number > additional_requests.len() {
+            return Err(format!(
+                "Invalid request number. Please choose 1-{}",
+                additional_requests.len()
+            )
+            .into());
+        }
+
+        let req = &additional_requests[request_number - 1];
+
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::AcceptAdditionalViews {
+            request_id,
+            owner: self.metadata.username.clone(),
+            viewer: req.viewer.clone(),
+            image_name: req.image_name.clone(),
+            result,
+        };
+
+        let id = self.send_request_async(request);
+
+        let action = if result == 0 {
+            "rejection"
+        } else {
+            "acceptance"
+        };
+        println!(
+            "[Client] Queued additional views {} #{} for {}'s request",
+            action, id, req.viewer
+        );
+        Ok(id)
+    }
+
+    pub fn get_additional_views_requests(&self) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::GetAdditionalViewsRequests {
+            request_id,
+            username: self.metadata.username.clone(),
+        };
+
+        let tracker = self.tracker.requests.clone();
+        let additional_requests = self.additional_views_requests.clone();
+        let middleware_addr = self.middleware_addr.clone();
+
+        self.tracker
+            .update_status(request_id, RequestStatus::InProgress);
+
+        thread::spawn(move || {
+            println!(
+                "[Client] [Req #{}] Sending get additional views requests in background...",
+                request_id
+            );
+
+            match Client::send_request_sync(&middleware_addr, &request) {
+                Ok(response) => {
+                    println!("[Client] [Req #{}] ✓ Completed", request_id);
+
+                    if let Some(output_path) = &response.output_path {
+                        if let Ok(requests) =
+                            serde_json::from_str::<Vec<AdditionalViewsRequest>>(output_path)
+                        {
+                            let mut additional = additional_requests.lock().unwrap();
+                            *additional = requests.clone();
+                            println!(
+                                "[Client] [Req #{}] ✓ Stored {} additional views requests locally",
+                                request_id,
+                                requests.len()
+                            );
+                        }
+                    }
+
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Completed(response));
+                }
+                Err(e) => {
+                    eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Failed(e.to_string()));
+                }
+            }
+        });
+
+        println!(
+            "[Client] Queued get additional views requests #{} for '{}'",
+            request_id, self.metadata.username
+        );
+        Ok(request_id)
     }
 
     pub fn add_views(
@@ -644,6 +764,7 @@ impl Client {
             middleware_addr: middleware_addr.to_string(),
             tracker: RequestTracker::new(),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
+            additional_views_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -663,6 +784,8 @@ impl Client {
             ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
             ClientRequest::ModifyViews { request_id, .. } => *request_id,
             ClientRequest::AddViews { request_id, .. } => *request_id,
+            ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
+            ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -877,6 +1000,12 @@ impl Client {
         );
         println!(
             "  add_views <owner> <image_name> <views>  - Request additional views for an approved image"
+        );
+        println!(
+            "  get_additional_views_requests   - View additional views requests for your images"
+        );
+        println!(
+            "  accept_add_views <number> <result>  - Accept (result=1) or reject (result=0) additional views request"
         );
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
@@ -1122,6 +1251,44 @@ impl Client {
                         Err(_) => {
                             eprintln!("Error: additional views must be a valid positive number")
                         }
+                    }
+                }
+                "get_additional_views_requests" => match self.get_additional_views_requests() {
+                    Ok(id) => println!("Request #{id} queued (fetching additional views requests)"),
+                    Err(e) => eprintln!("Error: {e}"),
+                },
+                "accept_add_views" if tokens.len() == 3 => {
+                    let request_number = match tokens[1].parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("Error: request number must be a valid integer");
+                            continue;
+                        }
+                    };
+
+                    let result = match tokens[2].parse::<i32>() {
+                        Ok(r) => r,
+                        Err(_) => {
+                            eprintln!("Error: result must be 0 (reject) or 1 (accept)");
+                            continue;
+                        }
+                    };
+
+                    if result != 0 && result != 1 {
+                        eprintln!("Error: result must be 0 (reject) or 1 (accept)");
+                        continue;
+                    }
+
+                    match self.accept_additional_views(request_number, result) {
+                        Ok(id) => {
+                            let action = if result == 0 {
+                                "rejection"
+                            } else {
+                                "acceptance"
+                            };
+                            println!("Request #{id} queued (additional views {})", action);
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
                     }
                 }
                 "exit" => {

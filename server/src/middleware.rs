@@ -432,6 +432,14 @@ impl ServerMiddleware {
             .route("/get_accepted_views", post(get_accepted_views_handler))
             .route("/modify_views", post(modify_views_handler))
             .route("/add_views", post(add_views_handler))
+            .route(
+                "/get_additional_views_requests",
+                post(get_additional_views_requests_handler),
+            )
+            .route(
+                "/accept_additional_views",
+                post(accept_additional_views_handler),
+            )
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1631,6 +1639,117 @@ async fn add_views_handler(
             "status": "error",
             "message": format!("Failed to request additional views: {}", e),
         }))),
+    }
+}
+
+async fn get_additional_views_requests_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Fetching additional views requests for: {}",
+        request_id, username
+    );
+
+    match directory_service::get_additional_views_requests(username).await {
+        Ok(requests) => {
+            let request_list = if requests.is_empty() {
+                "No additional views requests".to_string()
+            } else {
+                let mut lines = vec!["Additional Views Requests:".to_string()];
+                for (i, req) in requests.iter().enumerate() {
+                    lines.push(format!(
+                        "  [{}] {} wants +{} views for '{}' (current: {})",
+                        i + 1,
+                        req.viewer,
+                        req.prop_views - req.accep_views,
+                        req.image_name,
+                        req.accep_views
+                    ));
+                }
+                lines.join("\n")
+            };
+
+            let requests_json: Vec<_> = requests
+                .iter()
+                .map(|req| {
+                    serde_json::json!({
+                        "viewer": req.viewer,
+                        "image_name": req.image_name,
+                        "prop_views": req.prop_views,
+                        "accep_views": req.accep_views
+                    })
+                })
+                .collect();
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "message": request_list,
+                "requests": requests_json,
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to fetch additional views requests: {}", e),
+        }))),
+    }
+}
+
+async fn accept_additional_views_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let result = payload["result"].as_i64().unwrap_or(-1) as i32;
+
+    let action = if result == 0 {
+        "Rejecting"
+    } else {
+        "Accepting"
+    };
+
+    println!(
+        "[Server Middleware] [Req #{}] {} additional views: {} -> {}'s '{}'",
+        request_id, action, viewer, owner, image_name
+    );
+
+    match directory_service::accept_or_reject_additional_views(owner, viewer, image_name, result)
+        .await
+    {
+        Ok(_) => {
+            let message = if result == 0 {
+                format!("Additional views request rejected for {}", viewer)
+            } else {
+                format!("Additional views request accepted for {}", viewer)
+            };
+
+            println!("[Server Middleware] [Req #{}] ✓ {}", request_id, message);
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "message": message,
+            })))
+        }
+        Err(e) => {
+            eprintln!(
+                "[Server Middleware] [Req #{}] Error processing additional views request: {}",
+                request_id, e
+            );
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "error",
+                "message": format!("Failed to process additional views request: {}", e),
+            })))
+        }
     }
 }
 

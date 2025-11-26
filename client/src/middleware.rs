@@ -107,6 +107,17 @@ pub enum ClientRequest {
         image_name: String,
         additional_views: u64,
     },
+    GetAdditionalViewsRequests {
+        request_id: u64,
+        username: String,
+    },
+    AcceptAdditionalViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        result: i32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -115,6 +126,14 @@ pub struct MiddlewareResponse {
     pub status: String,
     pub message: Option<String>,
     pub output_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdditionalViewsRequest {
+    pub viewer: String,
+    pub image_name: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
 }
 
 // Add this near the top with other structures
@@ -753,6 +772,144 @@ impl ClientMiddleware {
         }
     }
 
+    fn send_get_additional_views_requests_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        username: &str,
+    ) -> Result<Vec<AdditionalViewsRequest>, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/get_additional_views_requests", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "username": username,
+        });
+
+        println!(
+            "[ClientMiddleware] [Req #{}] Fetching additional views requests for: {}",
+            request_id, username
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<serde_json::Value>() {
+                Ok(json_resp) => {
+                    let status = json_resp["status"].as_str().unwrap_or("error");
+
+                    if status == "success" {
+                        let message = json_resp["message"].as_str().unwrap_or("No requests");
+
+                        println!("\n========================================");
+                        println!("{}", message);
+                        println!("========================================\n");
+
+                        let mut requests = Vec::new();
+                        if let Some(requests_array) = json_resp["requests"].as_array() {
+                            for req in requests_array {
+                                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
+                                let image_name =
+                                    req["image_name"].as_str().unwrap_or("").to_string();
+                                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
+                                let accep_views = req["accep_views"].as_u64().unwrap_or(0);
+
+                                requests.push(AdditionalViewsRequest {
+                                    viewer,
+                                    image_name,
+                                    prop_views,
+                                    accep_views,
+                                });
+                            }
+                        }
+
+                        Ok(requests)
+                    } else {
+                        let message = json_resp["message"].as_str().unwrap_or("Unknown error");
+                        Err(message.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Failed to parse response: {}", e)),
+            },
+            Err(e) => Err(format!("Failed to contact server: {}", e)),
+        }
+    }
+
+    fn send_accept_additional_views_to_server(
+        server_urls: &[String],
+        request_id: u64,
+        owner: &str,
+        viewer: &str,
+        image_name: &str,
+        result: i32,
+    ) -> MiddlewareResponse {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let server_url = &server_urls[0];
+        let url = format!("{}/accept_additional_views", server_url);
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "result": result,
+        });
+
+        let action = if result == 0 {
+            "Rejecting"
+        } else {
+            "Accepting"
+        };
+
+        println!(
+            "[ClientMiddleware] [Req #{}] {} additional views request: {} -> {}'s '{}'",
+            request_id, action, viewer, owner, image_name
+        );
+
+        match client.post(&url).json(&payload).send() {
+            Ok(response) => match response.json::<ServerResponse>() {
+                Ok(server_resp) => {
+                    if server_resp.status == "success" {
+                        println!(
+                            "[ClientMiddleware] [Req #{}] ✓ {}",
+                            request_id, server_resp.message
+                        );
+                        MiddlewareResponse::success(request_id, &server_resp.message, None)
+                    } else {
+                        eprintln!(
+                            "[ClientMiddleware] [Req #{}] Error: {}",
+                            request_id, server_resp.message
+                        );
+                        MiddlewareResponse::error(request_id, &server_resp.message)
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] Failed to parse response: {}",
+                        request_id, e
+                    );
+                    MiddlewareResponse::error(
+                        request_id,
+                        &format!("Failed to parse response: {}", e),
+                    )
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[ClientMiddleware] [Req #{}] Failed to contact server: {}",
+                    request_id, e
+                );
+                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+            }
+        }
+    }
+
     fn send_view_pending_requests_to_server(
         server_urls: &[String],
         request_id: u64,
@@ -1161,6 +1318,8 @@ impl ClientMiddleware {
                     ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
                     ClientRequest::ModifyViews { request_id, .. } => *request_id,
                     ClientRequest::AddViews { request_id, .. } => *request_id,
+                    ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
+                    ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -1467,6 +1626,40 @@ impl ClientMiddleware {
                 &viewer,
                 &image_name,
                 additional_views,
+            ),
+            ClientRequest::GetAdditionalViewsRequests {
+                request_id,
+                username,
+            } => {
+                match Self::send_get_additional_views_requests_to_server(
+                    server_urls,
+                    request_id,
+                    &username,
+                ) {
+                    Ok(requests) => {
+                        let requests_json = serde_json::to_string(&requests).unwrap_or_default();
+                        MiddlewareResponse::success(
+                            request_id,
+                            "Additional views requests fetched successfully",
+                            Some(requests_json),
+                        )
+                    }
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }
+            ClientRequest::AcceptAdditionalViews {
+                request_id,
+                owner,
+                viewer,
+                image_name,
+                result,
+            } => Self::send_accept_additional_views_to_server(
+                server_urls,
+                request_id,
+                &owner,
+                &viewer,
+                &image_name,
+                result,
             ),
         }
     }
