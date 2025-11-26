@@ -344,3 +344,91 @@ pub async fn get_accepted_views(
         Err(format!("Failed to get accepted views: {}", response.status()).into())
     }
 }
+
+// ------------------------------------------------------------------------------------
+
+pub async fn modify_accepted_views(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+    change_views: i64,
+) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "modify_accepted_views",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+        "change_views": change_views,
+    });
+
+    println!(
+        "[Directory Service] Modifying views: {} -> {}'s '{}' (change: {:+})",
+        viewer, owner, image_name, change_views
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        let status = body["status"].as_str().unwrap_or("error");
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string();
+
+        if status == "success" {
+            let new_views = body["new_accep_views"].as_u64();
+            Ok((true, new_views, message))
+        } else {
+            Ok((false, None, message))
+        }
+    } else {
+        Err(format!("Failed to modify views: {}", response.status()).into())
+    }
+}
+
+// ------------------------------------------------------------------------------------
+
+pub async fn request_additional_views(
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+    additional_views: u64,
+) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
+    let client = Client::new();
+
+    let payload = json!({
+        "operation": "request_additional_views",
+        "owner": owner,
+        "viewer": viewer,
+        "image_name": image_name,
+        "additional_views": additional_views,
+    });
+
+    println!(
+        "[Directory Service] Requesting additional views: {} wants +{} views of {}'s '{}'",
+        viewer, additional_views, owner, image_name
+    );
+
+    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
+
+    if response.status().is_success() {
+        let body: Value = response.json().await?;
+        let status = body["status"].as_str().unwrap_or("error");
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string();
+
+        if status == "success" {
+            let new_prop_views = body["new_prop_views"].as_u64();
+            Ok((true, new_prop_views, message))
+        } else {
+            Ok((false, None, message))
+        }
+    } else {
+        Err(format!("Failed to request additional views: {}", response.status()).into())
+    }
+}

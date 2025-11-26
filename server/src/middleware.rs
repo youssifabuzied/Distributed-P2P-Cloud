@@ -430,6 +430,8 @@ impl ServerMiddleware {
             )
             .route("/approve_access", post(approve_access_handler))
             .route("/get_accepted_views", post(get_accepted_views_handler))
+            .route("/modify_views", post(modify_views_handler))
+            .route("/add_views", post(add_views_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1546,6 +1548,88 @@ async fn get_accepted_views_handler(
             "request_id": request_id,
             "status": "error",
             "message": format!("Failed to get accepted views: {}", e),
+        }))),
+    }
+}
+
+async fn modify_views_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let change_views = payload["change_views"].as_i64().unwrap_or(0);
+
+    println!(
+        "[Server Middleware] [Req #{}] Modifying views: {} -> {}'s '{}' (change: {:+})",
+        request_id, viewer, owner, image_name, change_views
+    );
+
+    match directory_service::modify_accepted_views(owner, viewer, image_name, change_views).await {
+        Ok((success, new_views, message)) => {
+            if success {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "success",
+                    "new_views": new_views,
+                    "message": message,
+                })))
+            } else {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "error",
+                    "message": message,
+                })))
+            }
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to modify views: {}", e),
+        }))),
+    }
+}
+
+async fn add_views_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let owner = payload["owner"].as_str().unwrap_or("");
+    let viewer = payload["viewer"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+    let additional_views = payload["additional_views"].as_u64().unwrap_or(0);
+
+    println!(
+        "[Server Middleware] [Req #{}] Requesting additional views: {} wants +{} views of {}'s '{}'",
+        request_id, viewer, additional_views, owner, image_name
+    );
+
+    match directory_service::request_additional_views(owner, viewer, image_name, additional_views)
+        .await
+    {
+        Ok((success, new_prop_views, message)) => {
+            if success {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "success",
+                    "new_prop_views": new_prop_views,
+                    "message": message,
+                })))
+            } else {
+                Ok(Json(serde_json::json!({
+                    "request_id": request_id,
+                    "status": "error",
+                    "message": message,
+                })))
+            }
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to request additional views: {}", e),
         }))),
     }
 }

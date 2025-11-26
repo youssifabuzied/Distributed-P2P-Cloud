@@ -359,6 +359,115 @@ def get_accepted_views(owner, viewer, image_name):
         conn.close()
         return False, None, f"Database error: {e}"
     
+def modify_accepted_views(owner, viewer, image_name, change_views):
+    """
+    Modify the number of accepted views for an existing access record
+    
+    Args:
+        owner: Username of the image owner
+        viewer: Username of the viewer
+        image_name: Name of the image
+        change_views: Change amount (positive to add, negative to reduce)
+    
+    Returns:
+        tuple: (success: bool, new_accep_views: int or None, message: str)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Get current accepted views (only for approved records)
+        cursor.execute("""
+            SELECT accep_views, status
+            FROM ImageAccess 
+            WHERE owner = ? AND viewer = ? AND image_name = ? AND status = 1
+        """, (owner, viewer, image_name))
+        
+        result = cursor.fetchone()
+        
+        if result is None:
+            conn.close()
+            return False, None, f"No approved access record found for {viewer} to view {owner}'s '{image_name}'"
+        
+        current_views, status = result
+        
+        # Calculate new views (ensure non-negative)
+        new_views = max(0, current_views + change_views)
+        
+        # Update the record
+        cursor.execute("""
+            UPDATE ImageAccess 
+            SET accep_views = ?
+            WHERE owner = ? AND viewer = ? AND image_name = ?
+        """, (new_views, owner, viewer, image_name))
+        
+        conn.commit()
+        print(f"Modified views: {current_views} -> {new_views} (change: {change_views:+d})")
+        
+        conn.close()
+        return True, new_views, f"Views modified: {current_views} -> {new_views}"
+        
+    except Exception as e:
+        print(f"Error modifying accepted views: {e}")
+        conn.close()
+        return False, None, f"Database error: {e}"
+    
+def request_additional_views(owner, viewer, image_name, additional_views):
+    """
+    Request additional views for an already approved access record
+    Sets status to 3 (approved but viewer wants more)
+    Updates prop_views to accep_views + additional_views
+    
+    Args:
+        owner: Username of the image owner
+        viewer: Username of the viewer
+        image_name: Name of the image
+        additional_views: Number of additional views requested
+    
+    Returns:
+        tuple: (success: bool, new_prop_views: int or None, message: str)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Get current approved record (status = 1)
+        cursor.execute("""
+            SELECT accep_views, status
+            FROM ImageAccess 
+            WHERE owner = ? AND viewer = ? AND image_name = ? AND status = 1
+        """, (owner, viewer, image_name))
+        
+        result = cursor.fetchone()
+        
+        if result is None:
+            conn.close()
+            return False, None, f"No approved access record found for {viewer} to view {owner}'s '{image_name}'"
+        
+        current_accep_views, status = result
+        
+        # Calculate new proposed views
+        new_prop_views = current_accep_views + additional_views
+        
+        
+        # Update status to 3 and set prop_views
+        cursor.execute("""
+            UPDATE ImageAccess 
+            SET status = 3, prop_views = ?
+            WHERE owner = ? AND viewer = ? AND image_name = ?
+        """, (new_prop_views, owner, viewer, image_name))
+        
+        conn.commit()
+        print(f"Additional views requested: {viewer} -> {owner}'s '{image_name}' (current: {current_accep_views}, requesting: +{additional_views}, total proposed: {new_prop_views})")
+        
+        conn.close()
+        return True, new_prop_views, f"Additional views request created: {additional_views} more views requested (total proposed: {new_prop_views})"
+        
+    except Exception as e:
+        print(f"Error requesting additional views: {e}")
+        conn.close()
+        return False, None, f"Database error: {e}"
+    
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -531,6 +640,46 @@ def handle_request():
                     'message': message
                 }), 400
 
+        elif operation == 'modify_accepted_views':
+            owner = data.get('owner')
+            viewer = data.get('viewer')
+            image_name = data.get('image_name')
+            change_views = data.get('change_views')
+            
+            success, new_views, message = modify_accepted_views(owner, viewer, image_name, change_views)
+            
+            if success:
+                return jsonify({
+                    'status': 'success',
+                    'new_accep_views': new_views,
+                    'message': message
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': message
+                }), 400
+            
+        elif operation == 'request_additional_views':
+            owner = data.get('owner')
+            viewer = data.get('viewer')
+            image_name = data.get('image_name')
+            additional_views = data.get('additional_views')
+            
+            success, new_prop_views, message = request_additional_views(owner, viewer, image_name, additional_views)
+            
+            if success:
+                return jsonify({
+                    'status': 'success',
+                    'new_prop_views': new_prop_views,
+                    'message': message
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': message
+                }), 400
+            
         else:
             return jsonify({'status': 'error', 'message': 'Unknown operation'}), 400
 

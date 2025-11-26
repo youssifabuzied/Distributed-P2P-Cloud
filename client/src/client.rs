@@ -79,6 +79,20 @@ pub enum ClientRequest {
         viewer: String,
         image_name: String,
     },
+    ModifyViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        change_views: i64,
+    },
+    AddViews {
+        request_id: u64,
+        owner: String,
+        viewer: String,
+        image_name: String,
+        additional_views: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -189,6 +203,57 @@ impl Client {
         println!(
             "[Client] Queued get accepted views request #{} for {}'s '{}'",
             id, owner, image_name
+        );
+        Ok(id)
+    }
+
+    pub fn add_views(
+        &self,
+        owner: &str,
+        image_name: &str,
+        additional_views: u64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::AddViews {
+            request_id,
+            owner: owner.to_string(),
+            viewer: self.metadata.username.clone(),
+            image_name: image_name.to_string(),
+            additional_views,
+        };
+
+        let id = self.send_request_async(request);
+        println!(
+            "[Client] Queued add views request #{} for +{} views of {}'s '{}'",
+            id, additional_views, owner, image_name
+        );
+        Ok(id)
+    }
+
+    pub fn modify_views(
+        &self,
+        viewer: &str,
+        image_name: &str,
+        change_views: i64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::ModifyViews {
+            request_id,
+            owner: self.metadata.username.clone(),
+            viewer: viewer.to_string(),
+            image_name: image_name.to_string(),
+            change_views,
+        };
+
+        let id = self.send_request_async(request);
+        let action = if change_views >= 0 {
+            "increase"
+        } else {
+            "decrease"
+        };
+        println!(
+            "[Client] Queued modify views request #{} to {} views for {}'s '{}' by {:+}",
+            id, action, viewer, image_name, change_views
         );
         Ok(id)
     }
@@ -596,6 +661,8 @@ impl Client {
             ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
             ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
             ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
+            ClientRequest::ModifyViews { request_id, .. } => *request_id,
+            ClientRequest::AddViews { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -805,6 +872,12 @@ impl Client {
         );
         println!("  get_views <owner> <image_name>  - Get accepted views for an image");
         println!("  view_image <owner> <image_name>  - View a shared image from shared_images");
+        println!(
+            "  modify_views <viewer> <image_name> <change>  - Modify accepted views (+/- number)"
+        );
+        println!(
+            "  add_views <owner> <image_name> <views>  - Request additional views for an approved image"
+        );
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
@@ -1019,6 +1092,36 @@ impl Client {
                     match self.view_image(owner, image_name) {
                         Ok(_) => println!("Image viewing complete"),
                         Err(e) => eprintln!("Error viewing image: {}", e),
+                    }
+                }
+                "modify_views" if tokens.len() == 4 => {
+                    let viewer = tokens[1];
+                    let image_name = tokens[2];
+                    match tokens[3].parse::<i64>() {
+                        Ok(change_views) => {
+                            match self.modify_views(viewer, image_name, change_views) {
+                                Ok(id) => println!("Request #{id} queued (modifying views)"),
+                                Err(e) => eprintln!("Error: {e}"),
+                            }
+                        }
+                        Err(_) => eprintln!("Error: change_views must be a valid integer"),
+                    }
+                }
+                "add_views" if tokens.len() == 4 => {
+                    let owner = tokens[1];
+                    let image_name = tokens[2];
+                    match tokens[3].parse::<u64>() {
+                        Ok(additional_views) => {
+                            match self.add_views(owner, image_name, additional_views) {
+                                Ok(id) => {
+                                    println!("Request #{id} queued (requesting additional views)")
+                                }
+                                Err(e) => eprintln!("Error: {e}"),
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("Error: additional views must be a valid positive number")
+                        }
                     }
                 }
                 "exit" => {
