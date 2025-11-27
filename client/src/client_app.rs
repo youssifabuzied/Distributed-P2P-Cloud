@@ -17,8 +17,8 @@ fn main() {
 
     // ✨ NEW: Define multiple server URLs
     let server_urls = vec![
-        "http://10.185.59.251:8000".to_string(), // Server 1
-        "http://10.185.59.183:8000".to_string(), // "http://10.0.2.15:8000".to_string(), // Server 2 (if running)
+        "http://10.185.59.183:8000".to_string(), // Server 1
+        "http://10.185.59.251:8000".to_string(), // "http://10.0.2.15:8000".to_string(), // Server 2 (if running)
     ];
 
     // Start middleware with multiple servers

@@ -421,7 +421,7 @@ impl Client {
                     "[Client] Waiting for server response (request #{})...",
                     request_id
                 );
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_secs(10));
 
                 // Check if we got a completed response
                 if let Some(RequestStatus::Completed(response)) =
@@ -505,7 +505,7 @@ impl Client {
                     let max_wait = 30; // 30 seconds timeout
 
                     loop {
-                        std::thread::sleep(Duration::from_secs(1));
+                        std::thread::sleep(Duration::from_secs(10));
                         wait_time += 1;
 
                         match self.tracker.get_status(request_id) {
@@ -1210,20 +1210,51 @@ impl Client {
                     let count = self.tracker.pending_count();
                     println!("Pending/In-Progress requests: {count}");
                 }
+
                 "fetch_users" => {
                     let request_id = self.tracker.create_request();
                     let request = ClientRequest::FetchActiveUsers { request_id };
                     let id = self.send_request_async(request);
                     println!("Request #{id} queued (fetching active users)");
 
-                    // ✅ NEW: Wait and print result
-                    std::thread::sleep(Duration::from_secs(2));
-                    if let Some(RequestStatus::Completed(response)) = self.tracker.get_status(id) {
-                        if let Some(message) = &response.message {
-                            Self::print_fetched_users(message);
+                    // Wait for response
+                    println!("[Client] Waiting for response...");
+                    std::thread::sleep(Duration::from_secs(10));
+
+                    match self.tracker.get_status(id) {
+                        Some(RequestStatus::Completed(response)) => {
+                            if response.status == "OK" {
+                                if let Some(message) = &response.message {
+                                    println!("\n========================================");
+                                    println!("Active Users");
+                                    println!("========================================");
+                                    println!("{}", message);
+                                    println!("========================================\n");
+                                } else {
+                                    println!("No users data in response");
+                                }
+                            } else {
+                                eprintln!(
+                                    "Error: {}",
+                                    response
+                                        .message
+                                        .as_ref()
+                                        .unwrap_or(&"Unknown error".to_string())
+                                );
+                            }
+                        }
+                        Some(RequestStatus::Failed(err)) => {
+                            eprintln!("Failed to fetch users: {}", err);
+                        }
+                        Some(RequestStatus::InProgress) | Some(RequestStatus::Pending) => {
+                            println!("Request still in progress - try again in a moment");
+                        }
+                        None => {
+                            println!("Request not found");
                         }
                     }
                 }
+
                 "fetch_images" if tokens.len() == 2 => {
                     let target_username = tokens[1];
                     let request_id = self.tracker.create_request();
@@ -1237,71 +1268,86 @@ impl Client {
                         target_username
                     );
 
-                    // ✅ DEBUG: Check request status
-                    println!("[DEBUG] Waiting 2 seconds for response...");
+                    // Wait for response
+                    println!("[Client] Waiting for response...");
                     std::thread::sleep(Duration::from_secs(10));
 
-                    println!("[DEBUG] Checking request status for #{}", id);
                     match self.tracker.get_status(id) {
                         Some(RequestStatus::Completed(response)) => {
-                            println!("[DEBUG] ✓ Request completed successfully");
-                            println!("[DEBUG] Response status: {}", response.status);
-                            println!("[DEBUG] Response message: {:?}", response.message);
-                            println!(
-                                "[DEBUG] Response output_path present: {}",
-                                response.output_path.is_some()
-                            );
+                            if response.status == "OK" {
+                                if let Some(output_path) = &response.output_path {
+                                    // Parse the JSON response
+                                    match serde_json::from_str::<serde_json::Value>(output_path) {
+                                        Ok(json) => {
+                                            println!("\n========================================");
+                                            println!("Fetched Images for '{}'", target_username);
+                                            println!("========================================");
 
-                            if let Some(output_path) = &response.output_path {
-                                println!("[DEBUG] Output path length: {} bytes", output_path.len());
-                                println!(
-                                    "[DEBUG] First 200 chars: {}",
-                                    &output_path.chars().take(200).collect::<String>()
-                                );
-
-                                // Try to parse JSON to check structure
-                                match serde_json::from_str::<serde_json::Value>(output_path) {
-                                    Ok(json) => {
-                                        println!("[DEBUG] ✓ Valid JSON parsed");
-                                        println!(
-                                            "[DEBUG] JSON keys: {:?}",
-                                            json.as_object().map(|o| o.keys().collect::<Vec<_>>())
-                                        );
-
-                                        if let Some(images_array) = json["images"].as_array() {
-                                            println!(
-                                                "[DEBUG] Images array found with {} items",
-                                                images_array.len()
-                                            );
-                                        } else {
-                                            println!("[DEBUG] ⚠ No 'images' array in JSON");
+                                            if let Some(images_array) = json["images"].as_array() {
+                                                if images_array.is_empty() {
+                                                    println!("No images found for this user");
+                                                } else {
+                                                    println!(
+                                                        "Found {} image(s):",
+                                                        images_array.len()
+                                                    );
+                                                    for (i, img) in images_array.iter().enumerate()
+                                                    {
+                                                        let name = img["image_name"]
+                                                            .as_str()
+                                                            .unwrap_or("unknown");
+                                                        let size =
+                                                            img["size"].as_u64().unwrap_or(0);
+                                                        let path = img["path"]
+                                                            .as_str()
+                                                            .unwrap_or("unknown");
+                                                        println!(
+                                                            "  [{}] {} ({} bytes)",
+                                                            i + 1,
+                                                            name,
+                                                            size
+                                                        );
+                                                        println!("      Saved to: {}", path);
+                                                    }
+                                                }
+                                            } else {
+                                                println!("No images array in response");
+                                            }
+                                            println!("========================================\n");
                                         }
-
-                                        // Now call the print function
-                                        Self::print_fetched_images(output_path);
+                                        Err(e) => {
+                                            eprintln!("Failed to parse images data: {}", e);
+                                            eprintln!("Raw data: {}", output_path);
+                                        }
                                     }
-                                    Err(e) => {
-                                        println!("[DEBUG] ✗ Failed to parse JSON: {}", e);
+                                } else {
+                                    println!("No output_path in response");
+                                    if let Some(msg) = &response.message {
+                                        println!("Message: {}", msg);
                                     }
                                 }
                             } else {
-                                println!("[DEBUG] ⚠ No output_path in response");
+                                eprintln!(
+                                    "Error: {}",
+                                    response
+                                        .message
+                                        .as_ref()
+                                        .unwrap_or(&"Unknown error".to_string())
+                                );
                             }
                         }
-                        Some(RequestStatus::InProgress) => {
-                            println!("[DEBUG] ⚠ Request still in progress after 2 seconds");
-                        }
-                        Some(RequestStatus::Pending) => {
-                            println!("[DEBUG] ⚠ Request still pending after 2 seconds");
-                        }
                         Some(RequestStatus::Failed(err)) => {
-                            println!("[DEBUG] ✗ Request failed: {}", err);
+                            eprintln!("Failed to fetch images: {}", err);
+                        }
+                        Some(RequestStatus::InProgress) | Some(RequestStatus::Pending) => {
+                            println!("Request still in progress - try again in a moment");
                         }
                         None => {
-                            println!("[DEBUG] ✗ Request #{} not found in tracker", id);
+                            println!("Request not found");
                         }
                     }
                 }
+
                 "request_access" if tokens.len() == 4 => {
                     let owner = tokens[1];
                     let image_name = tokens[2];
@@ -1315,15 +1361,31 @@ impl Client {
                         Err(_) => eprintln!("Error: prop_views must be a valid number"),
                     }
                 }
+                // In client/src/client.rs, replace "view_pending_requests" case:
                 "view_pending_requests" => {
                     match self.view_pending_requests() {
                         Ok(id) => {
                             println!("Request #{id} queued (fetching pending requests)");
 
-                            // ✅ NEW: Wait and print result
-                            std::thread::sleep(Duration::from_secs(2));
-                            let pending = self.pending_requests.lock().unwrap();
-                            Self::print_pending_requests(&pending);
+                            // ✅ Wait longer for response
+                            println!("[Client] Waiting for response...");
+                            std::thread::sleep(Duration::from_secs(10)); // Increased from 2
+
+                            // Check if request completed
+                            match self.tracker.get_status(id) {
+                                Some(RequestStatus::Completed(_)) => {
+                                    let pending = self.pending_requests.lock().unwrap();
+                                    Self::print_pending_requests(&pending);
+                                }
+                                Some(RequestStatus::Failed(err)) => {
+                                    eprintln!("Failed to fetch pending requests: {}", err);
+                                }
+                                _ => {
+                                    println!(
+                                        "Request still in progress - try 'check_stored' command later"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => eprintln!("Error: {e}"),
                     }
@@ -1423,15 +1485,31 @@ impl Client {
                         }
                     }
                 }
+                // In client/src/client.rs, replace "get_additional_views_requests" case:
                 "get_additional_views_requests" => {
                     match self.get_additional_views_requests() {
                         Ok(id) => {
                             println!("Request #{id} queued (fetching additional views requests)");
 
-                            // ✅ NEW: Wait and print result
-                            std::thread::sleep(Duration::from_secs(2));
-                            let additional = self.additional_views_requests.lock().unwrap();
-                            Self::print_additional_views_requests(&additional);
+                            // ✅ Wait longer for response
+                            println!("[Client] Waiting for response...");
+                            std::thread::sleep(Duration::from_secs(10)); // Increased from 2
+
+                            // Check if request completed
+                            match self.tracker.get_status(id) {
+                                Some(RequestStatus::Completed(_)) => {
+                                    let additional = self.additional_views_requests.lock().unwrap();
+                                    Self::print_additional_views_requests(&additional);
+                                }
+                                Some(RequestStatus::Failed(err)) => {
+                                    eprintln!("Failed to fetch additional views requests: {}", err);
+                                }
+                                _ => {
+                                    println!(
+                                        "Request still in progress - please wait and try again"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => eprintln!("Error: {e}"),
                     }

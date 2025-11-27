@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 
 // Multiple database URLs for replication
 const DIRECTORY_URLS: &[&str] = &[
@@ -28,23 +29,22 @@ pub struct AdditionalViewsRequest {
 
 // ------------------------------ Option B helpers ------------------------------
 
-use tokio::task::JoinHandle;
-
 async fn write_to_all_databases(
     operation: &str,
     payload: &Value,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Wrap the client in Arc to share between tasks
     let client = Arc::new(Client::new());
-    let mut handles: Vec<JoinHandle<Result<(), String>>> = Vec::new();
+    let (tx, rx) = oneshot::channel();
+    let tx = Arc::new(Mutex::new(Some(tx)));
 
     for &url in DIRECTORY_URLS {
         let client_clone = Arc::clone(&client);
+        let tx_clone = Arc::clone(&tx);
         let payload_clone = payload.clone();
         let url_clone = url.to_string();
         let operation_clone = operation.to_string();
 
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             match client_clone
                 .post(&url_clone)
                 .json(&payload_clone)
@@ -52,39 +52,27 @@ async fn write_to_all_databases(
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
-                    let _ = resp.json::<Value>().await; // Ignore response body
-                    Ok::<(), String>(())
+                    // First success wins
+                    if let Some(sender) = tx_clone.lock().unwrap().take() {
+                        let _ = sender.send(Ok(()));
+                    }
                 }
-                Ok(_) => Err(format!("{} responded with error", url_clone)),
-                Err(e) => Err(format!("{} failed: {}", url_clone, e)),
+                Ok(_) => {
+                    eprintln!("[Directory Service] {} responded with error", url_clone);
+                }
+                Err(e) => {
+                    eprintln!("[Directory Service] {} failed: {}", url_clone, e);
+                }
             }
         });
-
-        handles.push(handle);
     }
 
-    let mut any_error = false;
-    for h in handles {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("[Directory Service] {} failed: {}", operation, e);
-                any_error = true;
-            }
-            Err(e) => {
-                eprintln!("[Directory Service] {} task panicked: {:?}", operation, e);
-                any_error = true;
-            }
-        }
-    }
-
-    if any_error {
-        Err(format!("Some databases failed for operation {}", operation).into())
-    } else {
-        Ok(())
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(format!("All databases failed for operation: {}", operation).into()),
+        Err(_) => Err(format!("Database request timeout for operation: {}", operation).into()),
     }
 }
-
 use tokio::sync::oneshot;
 
 async fn read_from_one_database<T, F>(
@@ -99,12 +87,12 @@ where
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
     let parse_fn = Arc::new(parse_response);
-    let client = Arc::new(Client::new()); // Wrap Client in Arc
+    let client = Arc::new(Client::new());
 
     for &url in DIRECTORY_URLS {
         let tx_clone = Arc::clone(&tx);
         let parse_fn_clone = Arc::clone(&parse_fn);
-        let client_clone = Arc::clone(&client); // Clone Arc<Client>
+        let client_clone = Arc::clone(&client);
         let payload_clone = payload.clone();
         let url_clone = url.to_string();
         let operation_clone = operation.to_string();
@@ -362,8 +350,6 @@ pub async fn get_accepted_views(
     .await
 }
 
-// ------------------------------ The remaining functions ------------------------------
-
 pub async fn modify_accepted_views(
     owner: &str,
     viewer: &str,
@@ -379,8 +365,6 @@ pub async fn modify_accepted_views(
     });
 
     write_to_all_databases("modify_accepted_views", &payload).await?;
-
-    // Return new view count by reading from one database
     get_accepted_views(owner, viewer, image_name).await
 }
 

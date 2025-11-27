@@ -1012,116 +1012,126 @@ impl ClientMiddleware {
         }
     }
 
-    fn send_fetch_images_to_server(
-        server_urls: &[String],
-        request_id: u64,
-        target_username: &str,
-    ) -> MiddlewareResponse {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+    // In client/src/middleware.rs, replace send_fetch_images_to_server function:
 
-        let server_url = &server_urls[0];
-        let url = format!("{}/fetch_images", server_url);
+    // fn send_fetch_images_to_server(
+    //     server_urls: &[String],
+    //     request_id: u64,
+    //     target_username: &str,
+    // ) -> MiddlewareResponse {
+    //     let client = reqwest::blocking::Client::builder()
+    //         .timeout(Duration::from_secs(10))
+    //         .build()
+    //         .unwrap();
 
-        let payload = serde_json::json!({
-            "request_id": request_id,
-            "target_username": target_username,
-        });
+    //     let server_url = &server_urls[0];
+    //     let url = format!("{}/fetch_images", server_url);
 
-        match client.post(&url).json(&payload).send() {
-            Ok(response) => {
-                match response.json::<serde_json::Value>() {
-                    Ok(json_resp) => {
-                        let status = json_resp["status"].as_str().unwrap_or("error");
+    //     let payload = serde_json::json!({
+    //         "request_id": request_id,
+    //         "target_username": target_username,
+    //     });
 
-                        if status == "success" {
-                            // Parse images array
-                            if let Some(images_array) = json_resp["images"].as_array() {
-                                // ✅ REMOVED ALL PRINTING - just save files silently
-                                let storage_dir = "client_storage";
-                                if let Err(e) = std::fs::create_dir_all(storage_dir) {
-                                    eprintln!("Failed to create storage directory: {}", e);
-                                }
-                                let mut saved_paths = Vec::new(); // Collect output paths
+    //     match client.post(&url).json(&payload).send() {
+    //         Ok(response) => {
+    //             match response.json::<serde_json::Value>() {
+    //                 Ok(json_resp) => {
+    //                     let status = json_resp["status"].as_str().unwrap_or("error");
 
-                                for img in images_array {
-                                    let image_name =
-                                        img["image_name"].as_str().unwrap_or("unknown");
-                                    let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
+    //                     if status == "success" {
+    //                         // Parse images array
+    //                         if let Some(images_array) = json_resp["images"].as_array() {
+    //                             let storage_dir = "client_storage";
+    //                             if let Err(e) = std::fs::create_dir_all(storage_dir) {
+    //                                 eprintln!("Failed to create storage directory: {}", e);
+    //                             }
 
-                                    match general_purpose::STANDARD.decode(image_bytes_b64) {
-                                        Ok(bytes) => {
-                                            let output_path =
-                                                format!("{}/{}", storage_dir, image_name);
-                                            if std::fs::write(&output_path, &bytes).is_ok() {
-                                                saved_paths.push(output_path); // Save path only if write succeeded
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
-                                }
+    //                             let mut saved_images = Vec::new();
 
-                                // Return the list of saved paths as JSON
-                                MiddlewareResponse::success(
-                                    request_id,
-                                    "Images fetched and saved",
-                                    Some(serde_json::to_string(&saved_paths).unwrap_or_default()),
-                                )
-                            } else {
-                                MiddlewareResponse::error(request_id, "No images array in response")
-                            }
-                        } else {
-                            let message = json_resp["message"].as_str().unwrap_or("Unknown error");
-                            MiddlewareResponse::error(request_id, message)
-                        }
-                    }
-                    Err(e) => MiddlewareResponse::error(
-                        request_id,
-                        &format!("Failed to parse response: {}", e),
-                    ),
-                }
-            }
-            Err(e) => {
-                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-            }
-        }
-    }
+    //                             for img in images_array {
+    //                                 let image_name =
+    //                                     img["image_name"].as_str().unwrap_or("unknown");
+    //                                 let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
 
-    fn send_fetch_users_to_server(server_urls: &[String], request_id: u64) -> MiddlewareResponse {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+    //                                 match general_purpose::STANDARD.decode(image_bytes_b64) {
+    //                                     Ok(bytes) => {
+    //                                         let output_path =
+    //                                             format!("{}/{}", storage_dir, image_name);
+    //                                         if std::fs::write(&output_path, &bytes).is_ok() {
+    //                                             saved_images.push(serde_json::json!({
+    //                                                 "image_name": image_name,
+    //                                                 "size": bytes.len(),
+    //                                                 "path": output_path
+    //                                             }));
+    //                                         }
+    //                                     }
+    //                                     Err(_) => {}
+    //                                 }
+    //                             }
 
-        let server_url = &server_urls[0];
-        let url = format!("{}/fetch_users", server_url);
+    //                             // ✅ Return JSON with image details in output_path
+    //                             let images_json = serde_json::json!({
+    //                                 "images": saved_images
+    //                             });
 
-        let payload = serde_json::json!({
-            "request_id": request_id,
-        });
+    //                             MiddlewareResponse::success(
+    //                                 request_id,
+    //                                 "Images fetched and saved",
+    //                                 Some(serde_json::to_string(&images_json).unwrap_or_default()),
+    //                             )
+    //                         } else {
+    //                             MiddlewareResponse::error(request_id, "No images array in response")
+    //                         }
+    //                     } else {
+    //                         let message = json_resp["message"].as_str().unwrap_or("Unknown error");
+    //                         MiddlewareResponse::error(request_id, message)
+    //                     }
+    //                 }
+    //                 Err(e) => MiddlewareResponse::error(
+    //                     request_id,
+    //                     &format!("Failed to parse response: {}", e),
+    //                 ),
+    //             }
+    //         }
+    //         Err(e) => {
+    //             MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+    //         }
+    //     }
+    // }
 
-        match client.post(&url).json(&payload).send() {
-            Ok(response) => match response.json::<ServerResponse>() {
-                Ok(server_resp) => {
-                    if server_resp.status == "success" {
-                        // ✅ REMOVED PRINTING - return data as JSON string
-                        MiddlewareResponse::success(request_id, &server_resp.message, None)
-                    } else {
-                        MiddlewareResponse::error(request_id, &server_resp.message)
-                    }
-                }
-                Err(e) => MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to parse response: {}", e),
-                ),
-            },
-            Err(e) => {
-                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-            }
-        }
-    }
+    // fn send_fetch_users_to_server(server_urls: &[String], request_id: u64) -> MiddlewareResponse {
+    //     let client = reqwest::blocking::Client::builder()
+    //         .timeout(Duration::from_secs(10))
+    //         .build()
+    //         .unwrap();
+
+    //     let server_url = &server_urls[0];
+    //     let url = format!("{}/fetch_users", server_url);
+
+    //     let payload = serde_json::json!({
+    //         "request_id": request_id,
+    //     });
+
+    //     match client.post(&url).json(&payload).send() {
+    //         Ok(response) => match response.json::<ServerResponse>() {
+    //             Ok(server_resp) => {
+    //                 if server_resp.status == "success" {
+    //                     // ✅ REMOVED PRINTING - return data as JSON string
+    //                     MiddlewareResponse::success(request_id, &server_resp.message, None)
+    //                 } else {
+    //                     MiddlewareResponse::error(request_id, &server_resp.message)
+    //                 }
+    //             }
+    //             Err(e) => MiddlewareResponse::error(
+    //                 request_id,
+    //                 &format!("Failed to parse response: {}", e),
+    //             ),
+    //         },
+    //         Err(e) => {
+    //             MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
+    //         }
+    //     }
+    // }
 
     fn send_heartbeat_to_server(
         server_urls: &[String],
@@ -1541,11 +1551,7 @@ impl ClientMiddleware {
 
                     match Self::make_request_with_timeout(&url, payload) {
                         Ok(resp) if resp.status == "success" => {
-                            println!("\n========================================");
-                            println!("Active Users:");
-                            println!("========================================");
-                            println!("{}", resp.message);
-                            println!("========================================\n");
+                            // ✅ Return the message directly - DON'T print here
                             MiddlewareResponse::success(request_id, &resp.message, None)
                         }
                         Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
@@ -1568,28 +1574,45 @@ impl ClientMiddleware {
                         Ok(json_resp) => {
                             let status = json_resp["status"].as_str().unwrap_or("error");
                             if status == "success" {
-                                // Process images as before
+                                // ✅ Save images to disk
                                 if let Some(images_array) = json_resp["images"].as_array() {
                                     let storage_dir = "client_storage";
                                     let _ = std::fs::create_dir_all(storage_dir);
+
+                                    let mut saved_images = Vec::new();
 
                                     for img in images_array {
                                         let image_name =
                                             img["image_name"].as_str().unwrap_or("unknown");
                                         let image_bytes_b64 =
                                             img["image_bytes"].as_str().unwrap_or("");
+
                                         if let Ok(bytes) =
                                             general_purpose::STANDARD.decode(image_bytes_b64)
                                         {
                                             let output_path =
                                                 format!("{}/{}", storage_dir, image_name);
-                                            let _ = std::fs::write(&output_path, &bytes);
+                                            if std::fs::write(&output_path, &bytes).is_ok() {
+                                                saved_images.push(serde_json::json!({
+                                                    "image_name": image_name,
+                                                    "size": bytes.len(),
+                                                    "path": output_path
+                                                }));
+                                            }
                                         }
                                     }
+
+                                    // ✅ Return JSON string in output_path for client to parse
+                                    let result_json = serde_json::json!({
+                                        "images": saved_images
+                                    });
+
                                     MiddlewareResponse::success(
                                         request_id,
-                                        "Images fetched and saved",
-                                        None,
+                                        "Images fetched successfully",
+                                        Some(
+                                            serde_json::to_string(&result_json).unwrap_or_default(),
+                                        ),
                                     )
                                 } else {
                                     MiddlewareResponse::error(request_id, "No images in response")
@@ -1701,6 +1724,10 @@ impl ClientMiddleware {
 
                 // Post-approval workflow if successful
                 if response.status == "OK" && accep_views > 0 {
+                    println!(
+                        "[ClientMiddleware] [Req #{}] Initiating post-approval workflow...",
+                        request_id
+                    );
                     let server_urls_vec = server_urls.to_vec();
                     return ClientMiddleware::handle_post_approval(
                         &server_urls_vec,
@@ -2440,7 +2467,7 @@ impl ClientMiddleware {
         payload: serde_json::Value,
     ) -> Result<ServerResponse, String> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("Failed to create client: {}", e))?;
 
