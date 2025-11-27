@@ -1492,175 +1492,422 @@ impl ClientMiddleware {
     }
 
     fn forward_to_servers(server_urls: &[String], request: ClientRequest) -> MiddlewareResponse {
+        let request_id = match &request {
+            ClientRequest::RegisterWithDirectory { request_id, .. } => *request_id,
+            ClientRequest::AddImage { request_id, .. } => *request_id,
+            ClientRequest::Heartbeat { request_id, .. } => *request_id,
+            ClientRequest::FetchActiveUsers { request_id } => *request_id,
+            ClientRequest::FetchUserImages { request_id, .. } => *request_id,
+            ClientRequest::RequestImageAccess { request_id, .. } => *request_id,
+            ClientRequest::ViewPendingRequests { request_id, .. } => *request_id,
+            ClientRequest::ApproveOrRejectAccess { request_id, .. } => *request_id,
+            ClientRequest::GetAcceptedViews { request_id, .. } => *request_id,
+            ClientRequest::ModifyViews { request_id, .. } => *request_id,
+            ClientRequest::AddViews { request_id, .. } => *request_id,
+            ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
+            ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
+            _ => 0,
+        };
+
         match request {
-            //VIEWS NEED TO CHANGE
             ClientRequest::EncryptImage {
                 request_id,
                 image_path,
                 views,
             } => {
-                // Forward encryption to ALL servers and wait for first response
-                //VIEWS NEED TO CHANGE
                 Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path, views)
             }
+
             ClientRequest::DecryptImage {
                 request_id,
                 image_path,
                 username,
-            } => {
-                // Handle decryption locally (no server needed)
-                Self::decrypt_image_locally(request_id, &image_path, &username)
+            } => Self::decrypt_image_locally(request_id, &image_path, &username),
+
+            ClientRequest::RegisterWithDirectory { username, ip, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                        "ip": ip,
+                    });
+                    let url = format!("{}/register", server_url);
+
+                    match Self::make_request_with_timeout(&url, payload) {
+                        Ok(resp) if resp.status == "success" => {
+                            MiddlewareResponse::success(request_id, &resp.message, None)
+                        }
+                        Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
             }
-            ClientRequest::RegisterWithDirectory {
-                request_id,
-                username,
-                ip,
-            } => Self::send_register_to_server(server_urls, request_id, &username, &ip),
+
             ClientRequest::AddImage {
-                request_id,
                 username,
                 image_name,
                 image_bytes,
+                ..
             } => {
-                Self::send_add_image_to_server(
-                    server_urls,
-                    request_id,
-                    &username,
-                    &image_name,
-                    &image_bytes,
-                ) // ← Add this
+                let image_bytes_b64 = general_purpose::STANDARD.encode(&image_bytes);
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                        "image_name": image_name,
+                        "image_bytes": image_bytes_b64,
+                    });
+                    let url = format!("{}/add_image", server_url);
+
+                    match Self::make_request_with_timeout(&url, payload) {
+                        Ok(resp) if resp.status == "success" => {
+                            MiddlewareResponse::success(request_id, &resp.message, None)
+                        }
+                        Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
             }
-            ClientRequest::Heartbeat {
-                request_id,
-                username,
-            } => Self::send_heartbeat_to_server(server_urls, request_id, &username),
-            ClientRequest::FetchActiveUsers { request_id } => {
-                Self::send_fetch_users_to_server(server_urls, request_id)
+
+            ClientRequest::Heartbeat { username, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                    });
+                    let url = format!("{}/heartbeat", server_url);
+
+                    match Self::make_request_with_timeout(&url, payload) {
+                        Ok(resp) if resp.status == "success" => {
+                            MiddlewareResponse::success(request_id, &resp.message, None)
+                        }
+                        Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
             }
+
+            ClientRequest::FetchActiveUsers { .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({ "request_id": request_id });
+                    let url = format!("{}/fetch_users", server_url);
+
+                    match Self::make_request_with_timeout(&url, payload) {
+                        Ok(resp) if resp.status == "success" => {
+                            println!("\n========================================");
+                            println!("Active Users:");
+                            println!("========================================");
+                            println!("{}", resp.message);
+                            println!("========================================\n");
+                            MiddlewareResponse::success(request_id, &resp.message, None)
+                        }
+                        Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
+            }
+
             ClientRequest::FetchUserImages {
-                request_id,
-                target_username,
-            } => Self::send_fetch_images_to_server(server_urls, request_id, &target_username),
+                target_username, ..
+            } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "target_username": target_username,
+                    });
+                    let url = format!("{}/fetch_images", server_url);
+
+                    match Self::make_json_request_with_timeout(&url, payload) {
+                        Ok(json_resp) => {
+                            let status = json_resp["status"].as_str().unwrap_or("error");
+                            if status == "success" {
+                                // Process images as before
+                                if let Some(images_array) = json_resp["images"].as_array() {
+                                    let storage_dir = "client_storage";
+                                    let _ = std::fs::create_dir_all(storage_dir);
+
+                                    for img in images_array {
+                                        let image_name =
+                                            img["image_name"].as_str().unwrap_or("unknown");
+                                        let image_bytes_b64 =
+                                            img["image_bytes"].as_str().unwrap_or("");
+                                        if let Ok(bytes) =
+                                            general_purpose::STANDARD.decode(image_bytes_b64)
+                                        {
+                                            let output_path =
+                                                format!("{}/{}", storage_dir, image_name);
+                                            let _ = std::fs::write(&output_path, &bytes);
+                                        }
+                                    }
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        "Images fetched and saved",
+                                        None,
+                                    )
+                                } else {
+                                    MiddlewareResponse::error(request_id, "No images in response")
+                                }
+                            } else {
+                                let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                                MiddlewareResponse::error(request_id, msg)
+                            }
+                        }
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
+            }
+
             ClientRequest::RequestImageAccess {
-                request_id,
                 owner,
                 viewer,
                 image_name,
                 prop_views,
-            } => Self::send_request_access_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-                prop_views,
-            ),
-            ClientRequest::ViewPendingRequests {
-                request_id,
-                username,
-            } => {
-                match Self::send_view_pending_requests_to_server(server_urls, request_id, &username)
-                {
-                    Ok(requests) => {
-                        // ✅ Serialize and store in output_path
-                        let requests_json = serde_json::to_string(&requests).unwrap_or_default();
-                        MiddlewareResponse::success(
-                            request_id,
-                            "Pending requests fetched successfully",
-                            Some(requests_json),
-                        )
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "prop_views": prop_views,
+                });
+                let url = format!("{}/request_access", server_url);
+
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
                     }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
                     Err(e) => MiddlewareResponse::error(request_id, &e),
                 }
+            }),
+
+            ClientRequest::ViewPendingRequests { username, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                    });
+                    let url = format!("{}/view_pending_requests", server_url);
+
+                    match Self::make_json_request_with_timeout(&url, payload) {
+                        Ok(json_resp) => {
+                            let status = json_resp["status"].as_str().unwrap_or("error");
+                            if status == "success" {
+                                if let Some(requests_array) = json_resp["requests"].as_array() {
+                                    let requests: Vec<PendingRequest> = requests_array
+                                        .iter()
+                                        .filter_map(|req| {
+                                            Some(PendingRequest {
+                                                viewer: req["viewer"].as_str()?.to_string(),
+                                                image_name: req["image_name"].as_str()?.to_string(),
+                                                prop_views: req["prop_views"].as_u64()?,
+                                            })
+                                        })
+                                        .collect();
+                                    let requests_json =
+                                        serde_json::to_string(&requests).unwrap_or_default();
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        "Pending requests fetched",
+                                        Some(requests_json),
+                                    )
+                                } else {
+                                    MiddlewareResponse::error(request_id, "No requests in response")
+                                }
+                            } else {
+                                let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                                MiddlewareResponse::error(request_id, msg)
+                            }
+                        }
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
             }
+
             ClientRequest::ApproveOrRejectAccess {
-                request_id,
                 owner,
                 viewer,
                 image_name,
                 accep_views,
-            } => Self::send_approve_access_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-                accep_views,
-            ),
-            ClientRequest::GetAcceptedViews {
-                request_id,
-                owner,
-                viewer,
-                image_name,
-            } => Self::send_get_accepted_views_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-            ),
-            ClientRequest::ModifyViews {
-                request_id,
-                owner,
-                viewer,
-                image_name,
-                change_views,
-            } => Self::send_modify_views_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-                change_views,
-            ),
-            ClientRequest::AddViews {
-                request_id,
-                owner,
-                viewer,
-                image_name,
-                additional_views,
-            } => Self::send_add_views_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-                additional_views,
-            ),
-            ClientRequest::GetAdditionalViewsRequests {
-                request_id,
-                username,
+                ..
             } => {
-                match Self::send_get_additional_views_requests_to_server(
-                    server_urls,
-                    request_id,
-                    &username,
-                ) {
-                    Ok(requests) => {
-                        let requests_json = serde_json::to_string(&requests).unwrap_or_default();
-                        MiddlewareResponse::success(
-                            request_id,
-                            "Additional views requests fetched successfully",
-                            Some(requests_json),
-                        )
+                let response =
+                    Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                        let payload = serde_json::json!({
+                            "request_id": request_id,
+                            "owner": owner,
+                            "viewer": viewer,
+                            "image_name": image_name,
+                            "accep_views": accep_views,
+                        });
+                        let url = format!("{}/approve_access", server_url);
+
+                        match Self::make_request_with_timeout(&url, payload) {
+                            Ok(resp) if resp.status == "success" => {
+                                MiddlewareResponse::success(request_id, &resp.message, None)
+                            }
+                            Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                            Err(e) => MiddlewareResponse::error(request_id, &e),
+                        }
+                    });
+
+                // Post-approval workflow if successful
+                if response.status == "OK" && accep_views > 0 {
+                    let server_urls_vec = server_urls.to_vec();
+                    return ClientMiddleware::handle_post_approval(
+                        &server_urls_vec,
+                        request_id,
+                        &owner,
+                        &viewer,
+                        &image_name,
+                        accep_views as u64,
+                    );
+                }
+                response
+            }
+
+            ClientRequest::GetAcceptedViews {
+                owner,
+                viewer,
+                image_name,
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                });
+                let url = format!("{}/get_accepted_views", server_url);
+
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
                     }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
                     Err(e) => MiddlewareResponse::error(request_id, &e),
                 }
+            }),
+
+            ClientRequest::ModifyViews {
+                owner,
+                viewer,
+                image_name,
+                change_views,
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "change_views": change_views,
+                });
+                let url = format!("{}/modify_views", server_url);
+
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
+                    }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }),
+
+            ClientRequest::AddViews {
+                owner,
+                viewer,
+                image_name,
+                additional_views,
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "additional_views": additional_views,
+                });
+                let url = format!("{}/add_views", server_url);
+
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
+                    }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }),
+
+            ClientRequest::GetAdditionalViewsRequests { username, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                    });
+                    let url = format!("{}/get_additional_views_requests", server_url);
+
+                    match Self::make_json_request_with_timeout(&url, payload) {
+                        Ok(json_resp) => {
+                            let status = json_resp["status"].as_str().unwrap_or("error");
+                            if status == "success" {
+                                if let Some(requests_array) = json_resp["requests"].as_array() {
+                                    let requests: Vec<AdditionalViewsRequest> = requests_array
+                                        .iter()
+                                        .filter_map(|req| {
+                                            Some(AdditionalViewsRequest {
+                                                viewer: req["viewer"].as_str()?.to_string(),
+                                                image_name: req["image_name"].as_str()?.to_string(),
+                                                prop_views: req["prop_views"].as_u64()?,
+                                                accep_views: req["accep_views"].as_u64()?,
+                                            })
+                                        })
+                                        .collect();
+                                    let requests_json =
+                                        serde_json::to_string(&requests).unwrap_or_default();
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        "Additional views requests fetched",
+                                        Some(requests_json),
+                                    )
+                                } else {
+                                    MiddlewareResponse::error(request_id, "No requests in response")
+                                }
+                            } else {
+                                let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                                MiddlewareResponse::error(request_id, msg)
+                            }
+                        }
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
             }
+
             ClientRequest::AcceptAdditionalViews {
-                request_id,
                 owner,
                 viewer,
                 image_name,
                 result,
-            } => Self::send_accept_additional_views_to_server(
-                server_urls,
-                request_id,
-                &owner,
-                &viewer,
-                &image_name,
-                result,
-            ),
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "result": result,
+                });
+                let url = format!("{}/accept_additional_views", server_url);
+
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
+                    }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }),
         }
     }
     /// Send encryption request to ALL servers simultaneously
@@ -2189,6 +2436,97 @@ impl ClientMiddleware {
             &format!("Image successfully decrypted"),
             Some(output_path.to_string_lossy().to_string()),
         )
+    }
+    fn try_servers_sequentially<F>(
+        server_urls: &[String],
+        request_id: u64,
+        operation: F,
+    ) -> MiddlewareResponse
+    where
+        F: Fn(&str) -> MiddlewareResponse,
+    {
+        for (index, server_url) in server_urls.iter().enumerate() {
+            println!(
+                "[ClientMiddleware] [Req #{}] Attempting server {} of {} ({})",
+                request_id,
+                index + 1,
+                server_urls.len(),
+                server_url
+            );
+
+            let response = operation(server_url);
+
+            if response.status == "OK" || response.status == "success" {
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Success on server {}",
+                    request_id,
+                    index + 1
+                );
+                return response;
+            }
+
+            eprintln!(
+                "[ClientMiddleware] [Req #{}] ✗ Server {} failed: {}",
+                request_id,
+                index + 1,
+                response
+                    .message
+                    .as_ref()
+                    .unwrap_or(&"Unknown error".to_string())
+            );
+
+            // If not the last server, continue to next
+            if index < server_urls.len() - 1 {
+                println!(
+                    "[ClientMiddleware] [Req #{}] Trying next server...",
+                    request_id
+                );
+            }
+        }
+
+        MiddlewareResponse::error(request_id, "All servers failed")
+    }
+
+    /// Helper to make HTTP request with 5-second timeout
+    fn make_request_with_timeout(
+        url: &str,
+        payload: serde_json::Value,
+    ) -> Result<ServerResponse, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("Failed to create client: {}", e))?;
+
+        let response = client
+            .post(url)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        response
+            .json::<ServerResponse>()
+            .map_err(|e| format!("Failed to parse response: {}", e))
+    }
+
+    /// Helper for JSON value responses (for fetch operations)
+    fn make_json_request_with_timeout(
+        url: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("Failed to create client: {}", e))?;
+
+        let response = client
+            .post(url)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        response
+            .json::<serde_json::Value>()
+            .map_err(|e| format!("Failed to parse response: {}", e))
     }
 
     // Helper function to update view count (non-critical)

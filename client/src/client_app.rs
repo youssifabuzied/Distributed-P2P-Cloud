@@ -10,15 +10,15 @@ use std::time::Duration;
 fn main() {
     // Configuration
     let username = "client1";
-    let client_ip = "127.0.0.1";
+    let client_ip = "10.185.59.183";
     let client_port = 8080u16;
     let middleware_ip = "127.0.0.1";
     let middleware_port = 9000u16;
 
     // ✨ NEW: Define multiple server URLs
     let server_urls = vec![
-        "http://127.0.0.1:8000".to_string(), // Server 1
-                                             // "http://10.0.2.15:8000".to_string(), // Server 2 (if running)
+        "http://10.185.59.251:8000".to_string(), // Server 1
+        "http://10.185.59.183:8000".to_string(), // "http://10.0.2.15:8000".to_string(), // Server 2 (if running)
     ];
 
     // Start middleware with multiple servers
