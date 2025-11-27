@@ -801,12 +801,7 @@ impl ClientMiddleware {
                     let status = json_resp["status"].as_str().unwrap_or("error");
 
                     if status == "success" {
-                        let message = json_resp["message"].as_str().unwrap_or("No requests");
-
-                        println!("\n========================================");
-                        println!("{}", message);
-                        println!("========================================\n");
-
+                        // ✅ REMOVED PRINTING - just return data
                         let mut requests = Vec::new();
                         if let Some(requests_array) = json_resp["requests"].as_array() {
                             for req in requests_array {
@@ -915,7 +910,6 @@ impl ClientMiddleware {
         request_id: u64,
         username: &str,
     ) -> Result<Vec<PendingRequest>, String> {
-        // ← Changed return type
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -940,13 +934,7 @@ impl ClientMiddleware {
                     let status = json_resp["status"].as_str().unwrap_or("error");
 
                     if status == "success" {
-                        let message = json_resp["message"].as_str().unwrap_or("No requests");
-
-                        println!("\n========================================");
-                        println!("{}", message);
-                        println!("========================================\n");
-
-                        // ✅ NEW: Parse and return the requests
+                        // ✅ Return raw JSON data - NO PRINTING HERE
                         let mut requests = Vec::new();
                         if let Some(requests_array) = json_resp["requests"].as_array() {
                             for req in requests_array {
@@ -963,7 +951,7 @@ impl ClientMiddleware {
                             }
                         }
 
-                        Ok(requests) // ✅ Return the data
+                        Ok(requests) // ✅ Return data only
                     } else {
                         let message = json_resp["message"].as_str().unwrap_or("Unknown error");
                         Err(message.to_string())
@@ -1034,7 +1022,6 @@ impl ClientMiddleware {
             .build()
             .unwrap();
 
-        // Try first available server
         let server_url = &server_urls[0];
         let url = format!("{}/fetch_images", server_url);
 
@@ -1045,91 +1032,58 @@ impl ClientMiddleware {
 
         match client.post(&url).json(&payload).send() {
             Ok(response) => {
-                println!("Got response from server!");
-
                 match response.json::<serde_json::Value>() {
                     Ok(json_resp) => {
-                        println!("Successfully parsed JSON response");
-                        println!("Response: {:?}", json_resp);
-
                         let status = json_resp["status"].as_str().unwrap_or("error");
-                        println!("Status: {}", status);
 
                         if status == "success" {
                             // Parse images array
                             if let Some(images_array) = json_resp["images"].as_array() {
-                                println!("Found {} images", images_array.len());
-                                println!("\n========================================");
-                                println!("Images for user '{}':", target_username);
-                                println!("========================================");
-
-                                // Create client_storage directory if it doesn't exist
+                                // ✅ REMOVED ALL PRINTING - just save files silently
                                 let storage_dir = "client_storage";
                                 if let Err(e) = std::fs::create_dir_all(storage_dir) {
                                     eprintln!("Failed to create storage directory: {}", e);
                                 }
+                                let mut saved_paths = Vec::new(); // Collect output paths
 
                                 for img in images_array {
                                     let image_name =
                                         img["image_name"].as_str().unwrap_or("unknown");
                                     let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
 
-                                    println!("Processing image: {}", image_name);
-
-                                    // Decode base64 to get actual bytes
                                     match general_purpose::STANDARD.decode(image_bytes_b64) {
                                         Ok(bytes) => {
-                                            println!("  {} ({} bytes)", image_name, bytes.len());
-
-                                            // Save to client_storage as PNG
                                             let output_path =
                                                 format!("{}/{}", storage_dir, image_name);
-                                            match std::fs::write(&output_path, &bytes) {
-                                                Ok(_) => {
-                                                    println!("  ✓ Saved to: {}", output_path);
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "  ✗ Failed to save {}: {}",
-                                                        image_name, e
-                                                    );
-                                                }
+                                            if std::fs::write(&output_path, &bytes).is_ok() {
+                                                saved_paths.push(output_path); // Save path only if write succeeded
                                             }
                                         }
-                                        Err(e) => {
-                                            println!("  {} (decode error: {})", image_name, e);
-                                        }
+                                        Err(_) => {}
                                     }
                                 }
 
-                                println!("========================================\n");
-
+                                // Return the list of saved paths as JSON
                                 MiddlewareResponse::success(
                                     request_id,
                                     "Images fetched and saved",
-                                    None,
+                                    Some(serde_json::to_string(&saved_paths).unwrap_or_default()),
                                 )
                             } else {
-                                println!("No images array found in response");
                                 MiddlewareResponse::error(request_id, "No images array in response")
                             }
                         } else {
                             let message = json_resp["message"].as_str().unwrap_or("Unknown error");
-                            println!("Error: {}", message);
                             MiddlewareResponse::error(request_id, message)
                         }
                     }
-                    Err(e) => {
-                        println!("Failed to parse JSON: {}", e);
-                        MiddlewareResponse::error(
-                            request_id,
-                            &format!("Failed to parse response: {}", e),
-                        )
-                    }
+                    Err(e) => MiddlewareResponse::error(
+                        request_id,
+                        &format!("Failed to parse response: {}", e),
+                    ),
                 }
             }
             Err(e) => {
-                println!("Failed to send request: {}", e);
                 MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
             }
         }
@@ -1141,7 +1095,6 @@ impl ClientMiddleware {
             .build()
             .unwrap();
 
-        // Try first available server
         let server_url = &server_urls[0];
         let url = format!("{}/fetch_users", server_url);
 
@@ -1153,13 +1106,7 @@ impl ClientMiddleware {
             Ok(response) => match response.json::<ServerResponse>() {
                 Ok(server_resp) => {
                     if server_resp.status == "success" {
-                        // Parse users from message (will be JSON string)
-                        println!("\n========================================");
-                        println!("Active Users:");
-                        println!("========================================");
-                        println!("{}", server_resp.message);
-                        println!("========================================\n");
-
+                        // ✅ REMOVED PRINTING - return data as JSON string
                         MiddlewareResponse::success(request_id, &server_resp.message, None)
                     } else {
                         MiddlewareResponse::error(request_id, &server_resp.message)

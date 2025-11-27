@@ -803,21 +803,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Server configuration (unchanged defaults, only example)
     let config = ServerConfig {
-        server_id: 2,               // ← Unique server ID
+        server_id: 1,               // ← Unique server ID
         priority: 20,               // ← Election priority (higher wins)
         client_port: 8000,          // ← HTTP port for client middleware
         peer_port: 8001,            // ← HTTP port for peer election
         internal_server_port: 7000, // ← TCP port for encryption server
-        peers: vec![
-            // PeerInfo {
-            //     server_id: 1,
-            //     address: "10.251.174.138:8001".to_string(),
-            // },
-            // PeerInfo {
-            //     server_id: 3,
-            //     address: "10.251.174.183:8001".to_string(),
-            // },
-        ],
+        peers: vec![PeerInfo {
+            server_id: 2,
+            address: "10.185.59.251".to_string(),
+        }],
         election_timeout_ms: 3500,
         failure_port: 8002,
         failure_check_interval_secs: 10,

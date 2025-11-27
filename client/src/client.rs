@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose};
 use image::imageops::FilterType;
 use image::io::Reader as ImageReader;
 use serde::{Deserialize, Serialize};
@@ -847,6 +848,93 @@ impl Client {
         let response: MiddlewareResponse = serde_json::from_str(response_line.trim())?;
         Ok(response)
     }
+    fn print_pending_requests(requests: &[PendingRequest]) {
+        println!("\n========================================");
+        println!("Pending Access Requests");
+        println!("========================================");
+
+        if requests.is_empty() {
+            println!("No pending access requests");
+        } else {
+            for (i, req) in requests.iter().enumerate() {
+                println!(
+                    "[{}] {} wants {} views of '{}'",
+                    i + 1,
+                    req.viewer,
+                    req.prop_views,
+                    req.image_name
+                );
+            }
+        }
+
+        println!("========================================\n");
+    }
+
+    // ✅ NEW: Helper function to print additional views requests JSON
+    fn print_additional_views_requests(requests: &[AdditionalViewsRequest]) {
+        println!("\n========================================");
+        println!("Additional Views Requests");
+        println!("========================================");
+
+        if requests.is_empty() {
+            println!("No additional views requests");
+        } else {
+            for (i, req) in requests.iter().enumerate() {
+                println!(
+                    "[{}] {} wants +{} views for '{}' (current: {})",
+                    i + 1,
+                    req.viewer,
+                    req.prop_views - req.accep_views,
+                    req.image_name,
+                    req.accep_views
+                );
+            }
+        }
+
+        println!("========================================\n");
+    }
+
+    // ✅ NEW: Helper function to print fetched users JSON
+    pub fn print_fetched_users(message: &str) {
+        println!("\n========================================");
+        println!("Active Users");
+        println!("========================================");
+        println!("{}", message);
+        println!("========================================\n");
+    }
+
+    // ✅ NEW: Helper function to print fetched images JSON
+    fn print_fetched_images(json_str: &str) {
+        match serde_json::from_str::<serde_json::Value>(json_str) {
+            Ok(json_resp) => {
+                println!("\n========================================");
+                println!("Fetched Images");
+                println!("========================================");
+
+                if let Some(images_array) = json_resp["images"].as_array() {
+                    println!("Found {} images", images_array.len());
+                    for img in images_array {
+                        let image_name = img["image_name"].as_str().unwrap_or("unknown");
+                        let image_bytes_b64 = img["image_bytes"].as_str().unwrap_or("");
+
+                        match general_purpose::STANDARD.decode(image_bytes_b64) {
+                            Ok(bytes) => {
+                                println!("  {} ({} bytes)", image_name, bytes.len());
+                            }
+                            Err(_) => {
+                                println!("  {} (decode error)", image_name);
+                            }
+                        }
+                    }
+                }
+
+                println!("========================================\n");
+            }
+            Err(e) => {
+                eprintln!("Failed to parse fetched images JSON: {}", e);
+            }
+        }
+    }
     //Helper Function To Print User-View Pairs
     // fn format_views(views: &HashMap<String, u64>) -> String {
     // views
@@ -1127,6 +1215,14 @@ impl Client {
                     let request = ClientRequest::FetchActiveUsers { request_id };
                     let id = self.send_request_async(request);
                     println!("Request #{id} queued (fetching active users)");
+
+                    // ✅ NEW: Wait and print result
+                    std::thread::sleep(Duration::from_secs(2));
+                    if let Some(RequestStatus::Completed(response)) = self.tracker.get_status(id) {
+                        if let Some(message) = &response.message {
+                            Self::print_fetched_users(message);
+                        }
+                    }
                 }
                 "fetch_images" if tokens.len() == 2 => {
                     let target_username = tokens[1];
@@ -1140,6 +1236,71 @@ impl Client {
                         "Request #{id} queued (fetching images for '{}')",
                         target_username
                     );
+
+                    // ✅ DEBUG: Check request status
+                    println!("[DEBUG] Waiting 2 seconds for response...");
+                    std::thread::sleep(Duration::from_secs(10));
+
+                    println!("[DEBUG] Checking request status for #{}", id);
+                    match self.tracker.get_status(id) {
+                        Some(RequestStatus::Completed(response)) => {
+                            println!("[DEBUG] ✓ Request completed successfully");
+                            println!("[DEBUG] Response status: {}", response.status);
+                            println!("[DEBUG] Response message: {:?}", response.message);
+                            println!(
+                                "[DEBUG] Response output_path present: {}",
+                                response.output_path.is_some()
+                            );
+
+                            if let Some(output_path) = &response.output_path {
+                                println!("[DEBUG] Output path length: {} bytes", output_path.len());
+                                println!(
+                                    "[DEBUG] First 200 chars: {}",
+                                    &output_path.chars().take(200).collect::<String>()
+                                );
+
+                                // Try to parse JSON to check structure
+                                match serde_json::from_str::<serde_json::Value>(output_path) {
+                                    Ok(json) => {
+                                        println!("[DEBUG] ✓ Valid JSON parsed");
+                                        println!(
+                                            "[DEBUG] JSON keys: {:?}",
+                                            json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                                        );
+
+                                        if let Some(images_array) = json["images"].as_array() {
+                                            println!(
+                                                "[DEBUG] Images array found with {} items",
+                                                images_array.len()
+                                            );
+                                        } else {
+                                            println!("[DEBUG] ⚠ No 'images' array in JSON");
+                                        }
+
+                                        // Now call the print function
+                                        Self::print_fetched_images(output_path);
+                                    }
+                                    Err(e) => {
+                                        println!("[DEBUG] ✗ Failed to parse JSON: {}", e);
+                                    }
+                                }
+                            } else {
+                                println!("[DEBUG] ⚠ No output_path in response");
+                            }
+                        }
+                        Some(RequestStatus::InProgress) => {
+                            println!("[DEBUG] ⚠ Request still in progress after 2 seconds");
+                        }
+                        Some(RequestStatus::Pending) => {
+                            println!("[DEBUG] ⚠ Request still pending after 2 seconds");
+                        }
+                        Some(RequestStatus::Failed(err)) => {
+                            println!("[DEBUG] ✗ Request failed: {}", err);
+                        }
+                        None => {
+                            println!("[DEBUG] ✗ Request #{} not found in tracker", id);
+                        }
+                    }
                 }
                 "request_access" if tokens.len() == 4 => {
                     let owner = tokens[1];
@@ -1154,10 +1315,19 @@ impl Client {
                         Err(_) => eprintln!("Error: prop_views must be a valid number"),
                     }
                 }
-                "view_pending_requests" => match self.view_pending_requests() {
-                    Ok(id) => println!("Request #{id} queued (fetching pending requests)"),
-                    Err(e) => eprintln!("Error: {e}"),
-                },
+                "view_pending_requests" => {
+                    match self.view_pending_requests() {
+                        Ok(id) => {
+                            println!("Request #{id} queued (fetching pending requests)");
+
+                            // ✅ NEW: Wait and print result
+                            std::thread::sleep(Duration::from_secs(2));
+                            let pending = self.pending_requests.lock().unwrap();
+                            Self::print_pending_requests(&pending);
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
                 "approve_access_request" if tokens.len() == 3 => {
                     let request_number = match tokens[1].parse::<usize>() {
                         Ok(n) => n,
@@ -1253,10 +1423,19 @@ impl Client {
                         }
                     }
                 }
-                "get_additional_views_requests" => match self.get_additional_views_requests() {
-                    Ok(id) => println!("Request #{id} queued (fetching additional views requests)"),
-                    Err(e) => eprintln!("Error: {e}"),
-                },
+                "get_additional_views_requests" => {
+                    match self.get_additional_views_requests() {
+                        Ok(id) => {
+                            println!("Request #{id} queued (fetching additional views requests)");
+
+                            // ✅ NEW: Wait and print result
+                            std::thread::sleep(Duration::from_secs(2));
+                            let additional = self.additional_views_requests.lock().unwrap();
+                            Self::print_additional_views_requests(&additional);
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
                 "accept_add_views" if tokens.len() == 3 => {
                     let request_number = match tokens[1].parse::<usize>() {
                         Ok(n) => n,
