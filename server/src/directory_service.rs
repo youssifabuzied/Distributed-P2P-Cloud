@@ -1,11 +1,15 @@
 use base64::{Engine as _, engine::general_purpose};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::error::Error;
+use std::sync::{Arc, Mutex};
 
-const DIRECTORY_URL: &str = "http://127.0.0.1:5000/api";
+// Multiple database URLs for replication
+const DIRECTORY_URLS: &[&str] = &[
+    "http://10.185.59.251:5000/api",
+    "http://10.185.59.183:5000/api",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingAccessRequest {
@@ -21,11 +25,127 @@ pub struct AdditionalViewsRequest {
     pub prop_views: u64,
     pub accep_views: u64,
 }
-// ------------------------------------------------------------------------------------
 
-pub async fn register_client(username: &str, ip: &str) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
+// ------------------------------ Option B helpers ------------------------------
 
+use tokio::task::JoinHandle;
+
+async fn write_to_all_databases(
+    operation: &str,
+    payload: &Value,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Wrap the client in Arc to share between tasks
+    let client = Arc::new(Client::new());
+    let mut handles: Vec<JoinHandle<Result<(), String>>> = Vec::new();
+
+    for &url in DIRECTORY_URLS {
+        let client_clone = Arc::clone(&client);
+        let payload_clone = payload.clone();
+        let url_clone = url.to_string();
+        let operation_clone = operation.to_string();
+
+        let handle = tokio::spawn(async move {
+            match client_clone
+                .post(&url_clone)
+                .json(&payload_clone)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let _ = resp.json::<Value>().await; // Ignore response body
+                    Ok::<(), String>(())
+                }
+                Ok(_) => Err(format!("{} responded with error", url_clone)),
+                Err(e) => Err(format!("{} failed: {}", url_clone, e)),
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    let mut any_error = false;
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("[Directory Service] {} failed: {}", operation, e);
+                any_error = true;
+            }
+            Err(e) => {
+                eprintln!("[Directory Service] {} task panicked: {:?}", operation, e);
+                any_error = true;
+            }
+        }
+    }
+
+    if any_error {
+        Err(format!("Some databases failed for operation {}", operation).into())
+    } else {
+        Ok(())
+    }
+}
+
+use tokio::sync::oneshot;
+
+async fn read_from_one_database<T, F>(
+    operation: &str,
+    payload: &Value,
+    parse_response: F,
+) -> Result<T, Box<dyn Error + Send + Sync>>
+where
+    T: Send + 'static,
+    F: Fn(Value) -> Result<T, String> + Send + Sync + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let parse_fn = Arc::new(parse_response);
+    let client = Arc::new(Client::new()); // Wrap Client in Arc
+
+    for &url in DIRECTORY_URLS {
+        let tx_clone = Arc::clone(&tx);
+        let parse_fn_clone = Arc::clone(&parse_fn);
+        let client_clone = Arc::clone(&client); // Clone Arc<Client>
+        let payload_clone = payload.clone();
+        let url_clone = url.to_string();
+        let operation_clone = operation.to_string();
+
+        tokio::spawn(async move {
+            match client_clone
+                .post(&url_clone)
+                .json(&payload_clone)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    if let Ok(body) = response.json::<Value>().await {
+                        if let Ok(result) = parse_fn_clone(body) {
+                            if let Some(sender) = tx_clone.lock().unwrap().take() {
+                                let _ = sender.send(Ok(result));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Directory Service] Read {} failed from {}: {}",
+                        operation_clone, url_clone, e
+                    );
+                }
+                _ => {}
+            }
+        });
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(format!("All databases failed for operation: {}", operation).into()),
+        Err(_) => Err(format!("Database request timeout for operation: {}", operation).into()),
+    }
+}
+
+// ------------------------------ Public API ------------------------------
+
+pub async fn register_client(username: &str, ip: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "add_client",
         "user_name": username,
@@ -33,34 +153,21 @@ pub async fn register_client(username: &str, ip: &str) -> Result<(), Box<dyn Err
     });
 
     println!(
-        "[Directory Service] Registering client: {} {}",
-        username, ip
+        "[Directory Service] Registering client: {} {} (writing to {} databases)",
+        username,
+        ip,
+        DIRECTORY_URLS.len()
     );
 
-    // Send request asynchronously
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        println!("[Directory Service] ✓ Registration successful: {:?}", body);
-        Ok(())
-    } else {
-        Err(format!("Registration failed with status: {}", response.status()).into())
-    }
+    write_to_all_databases("add_client", &payload).await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn add_image(
     username: &str,
     image_name: &str,
     image_bytes: &[u8],
-) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-
-    // Encode image data as base64 for JSON transport
-    let image_bytes_b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
-
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let image_bytes_b64 = general_purpose::STANDARD.encode(image_bytes);
     let payload = json!({
         "operation": "add_image",
         "user_name": username,
@@ -69,138 +176,85 @@ pub async fn add_image(
     });
 
     println!(
-        "[Directory Service] Adding image: {} for user {} ({} bytes)",
+        "[Directory Service] Adding image: {} for user {} ({} bytes) to {} databases",
         image_name,
         username,
-        image_bytes.len()
+        image_bytes.len(),
+        DIRECTORY_URLS.len()
     );
 
-    // Send request asynchronously
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        println!("[Directory Service] ✓ Image added successfully: {:?}", body);
-        Ok(())
-    } else {
-        Err(format!("Add image failed with status: {}", response.status()).into())
-    }
+    write_to_all_databases("add_image", &payload).await
 }
 
-// ------------------------------------------------------------------------------------
-
-pub async fn update_client_timestamp(username: &str) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-
+pub async fn update_client_timestamp(username: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "update_timestamp",
         "user_name": username,
     });
 
-    // Send request asynchronously
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("Timestamp update failed with status: {}", response.status()).into())
-    }
+    write_to_all_databases("update_timestamp", &payload).await
 }
 
-// ------------------------------------------------------------------------------------
-
-pub async fn fetch_active_users() -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let client = Client::new();
-
-    let payload = json!({
-        "operation": "fetch_active_users",
-    });
-
-    // Send request asynchronously
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-
-        // Parse users from response
+pub async fn fetch_active_users() -> Result<Vec<(String, String)>, Box<dyn Error + Send + Sync>> {
+    let payload = json!({ "operation": "fetch_active_users" });
+    read_from_one_database("fetch_active_users", &payload, |body| {
         if let Some(users_array) = body["users"].as_array() {
             let users: Vec<(String, String)> = users_array
                 .iter()
                 .filter_map(|user| {
-                    let username = user["user_name"].as_str()?.to_string();
-                    let ip = user["ip_addr"].as_str()?.to_string();
-                    Some((username, ip))
+                    Some((
+                        user["user_name"].as_str()?.to_string(),
+                        user["ip_addr"].as_str()?.to_string(),
+                    ))
                 })
                 .collect();
             Ok(users)
         } else {
             Ok(Vec::new())
         }
-    } else {
-        Err(format!("Fetch users failed with status: {}", response.status()).into())
-    }
+    })
+    .await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn fetch_user_images(
     username: &str,
-) -> Result<(bool, Vec<(String, String)>), Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<(bool, Vec<(String, String)>), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "fetch_user_images",
         "user_name": username,
     });
 
-    println!("[Directory Service] Sending request for user: {}", username);
-
-    // Send request asynchronously
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
     println!(
-        "[Directory Service] Got response status: {}",
-        response.status()
+        "[Directory Service] Sending request for user: {} to one database",
+        username
     );
 
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-
+    read_from_one_database("fetch_user_images", &payload, |body| {
         let is_online = body["is_online"].as_bool().unwrap_or(false);
-
-        println!("[Directory Service] is_online: {}", is_online);
-
-        // Parse images from response: Vec<(image_name, image_bytes_base64)>
         if let Some(images_array) = body["images"].as_array() {
             let images: Vec<(String, String)> = images_array
                 .iter()
                 .filter_map(|img| {
-                    let name = img["image_name"].as_str()?.to_string();
-                    let bytes_b64 = img["image_bytes"].as_str()?.to_string();
-                    Some((name, bytes_b64))
+                    Some((
+                        img["image_name"].as_str()?.to_string(),
+                        img["image_bytes"].as_str()?.to_string(),
+                    ))
                 })
                 .collect();
-
             Ok((is_online, images))
         } else {
-            println!("[Directory Service] No images array found");
             Ok((is_online, Vec::new()))
         }
-    } else {
-        Err(format!("Fetch images failed with status: {}", response.status()).into())
-    }
+    })
+    .await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn request_image_access(
     owner: &str,
     viewer: &str,
     image_name: &str,
     prop_views: u64,
-) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "request_image_access",
         "owner": owner,
@@ -210,75 +264,50 @@ pub async fn request_image_access(
     });
 
     println!(
-        "[Directory Service] Requesting access: {} wants {} views of {}'s '{}'",
-        viewer, prop_views, owner, image_name
+        "[Directory Service] Requesting access: {} wants {} views of {}'s '{}' to {} databases",
+        viewer,
+        prop_views,
+        owner,
+        image_name,
+        DIRECTORY_URLS.len()
     );
 
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        println!("[Directory Service] ✓ Access request created: {:?}", body);
-        Ok(())
-    } else {
-        Err(format!("Access request failed with status: {}", response.status()).into())
-    }
+    write_to_all_databases("request_image_access", &payload).await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn get_pending_access_requests(
     username: &str,
-) -> Result<Vec<PendingAccessRequest>, Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<Vec<PendingAccessRequest>, Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "get_pending_requests",
         "user_name": username,
     });
 
-    println!(
-        "[Directory Service] Fetching pending access requests for: {}",
-        username
-    );
-
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-
+    read_from_one_database("get_pending_requests", &payload, |body| {
         let mut requests = Vec::new();
-
-        if let Some(requests_array) = body["requests"].as_array() {
-            for req in requests_array {
-                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
-                let image_name = req["image_name"].as_str().unwrap_or("").to_string();
-                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
-
+        if let Some(reqs) = body["requests"].as_array() {
+            for r in reqs {
                 requests.push(PendingAccessRequest {
-                    viewer,
-                    image_name,
-                    prop_views,
+                    viewer: r["viewer"].as_str().ok_or("Missing viewer")?.to_string(),
+                    image_name: r["image_name"]
+                        .as_str()
+                        .ok_or("Missing image_name")?
+                        .to_string(),
+                    prop_views: r["prop_views"].as_u64().ok_or("Missing prop_views")?,
                 });
             }
         }
-
         Ok(requests)
-    } else {
-        Err(format!("Failed to fetch pending requests: {}", response.status()).into())
-    }
+    })
+    .await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn approve_or_reject_access_request(
     owner: &str,
     viewer: &str,
     image_name: &str,
-    accep_views: i64, // Can be -1 for reject
-) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-
+    accep_views: i64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "approve_or_reject_access",
         "owner": owner,
@@ -287,37 +316,28 @@ pub async fn approve_or_reject_access_request(
         "accep_views": accep_views,
     });
 
-    let action = if accep_views == -1 {
-        "Rejecting"
-    } else {
-        "Approving"
-    };
-
     println!(
-        "[Directory Service] {} access: {} -> {}'s '{}' ({} views)",
-        action, viewer, owner, image_name, accep_views
+        "[Directory Service] {} access: {} -> {}'s '{}' ({} views) to {} databases",
+        if accep_views == -1 {
+            "Rejecting"
+        } else {
+            "Approving"
+        },
+        viewer,
+        owner,
+        image_name,
+        accep_views,
+        DIRECTORY_URLS.len()
     );
 
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        println!("[Directory Service] ✓ Access request updated: {:?}", body);
-        Ok(())
-    } else {
-        Err(format!("Failed to update access request: {}", response.status()).into())
-    }
+    write_to_all_databases("approve_or_reject_access", &payload).await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn get_accepted_views(
     owner: &str,
     viewer: &str,
     image_name: &str,
-) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<(bool, Option<u64>, String), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "get_accepted_views",
         "owner": owner,
@@ -325,43 +345,31 @@ pub async fn get_accepted_views(
         "image_name": image_name,
     });
 
-    println!(
-        "[Directory Service] Getting accepted views: {} -> {}'s '{}'",
-        viewer, owner, image_name
-    );
-
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
+    read_from_one_database("get_accepted_views", &payload, |body| {
         let status = body["status"].as_str().unwrap_or("error");
         let message = body["message"]
             .as_str()
             .unwrap_or("Unknown error")
             .to_string();
+        let accep_views = body["accep_views"].as_u64();
 
         if status == "success" {
-            let accep_views = body["accep_views"].as_u64();
             Ok((true, accep_views, message))
         } else {
-            let accep_views = body["accep_views"].as_u64();
             Ok((false, accep_views, message))
         }
-    } else {
-        Err(format!("Failed to get accepted views: {}", response.status()).into())
-    }
+    })
+    .await
 }
 
-// ------------------------------------------------------------------------------------
+// ------------------------------ The remaining functions ------------------------------
 
 pub async fn modify_accepted_views(
     owner: &str,
     viewer: &str,
     image_name: &str,
     change_views: i64,
-) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<(bool, Option<u64>, String), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "modify_accepted_views",
         "owner": owner,
@@ -370,42 +378,18 @@ pub async fn modify_accepted_views(
         "change_views": change_views,
     });
 
-    println!(
-        "[Directory Service] Modifying views: {} -> {}'s '{}' (change: {:+})",
-        viewer, owner, image_name, change_views
-    );
+    write_to_all_databases("modify_accepted_views", &payload).await?;
 
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        let status = body["status"].as_str().unwrap_or("error");
-        let message = body["message"]
-            .as_str()
-            .unwrap_or("Unknown error")
-            .to_string();
-
-        if status == "success" {
-            let new_views = body["new_accep_views"].as_u64();
-            Ok((true, new_views, message))
-        } else {
-            Ok((false, None, message))
-        }
-    } else {
-        Err(format!("Failed to modify views: {}", response.status()).into())
-    }
+    // Return new view count by reading from one database
+    get_accepted_views(owner, viewer, image_name).await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn request_additional_views(
     owner: &str,
     viewer: &str,
     image_name: &str,
     additional_views: u64,
-) -> Result<(bool, Option<u64>, String), Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<(bool, Option<u64>, String), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "request_additional_views",
         "owner": owner,
@@ -414,92 +398,44 @@ pub async fn request_additional_views(
         "additional_views": additional_views,
     });
 
-    println!(
-        "[Directory Service] Requesting additional views: {} wants +{} views of {}'s '{}'",
-        viewer, additional_views, owner, image_name
-    );
-
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        let status = body["status"].as_str().unwrap_or("error");
-        let message = body["message"]
-            .as_str()
-            .unwrap_or("Unknown error")
-            .to_string();
-
-        if status == "success" {
-            let new_prop_views = body["new_prop_views"].as_u64();
-            Ok((true, new_prop_views, message))
-        } else {
-            Ok((false, None, message))
-        }
-    } else {
-        Err(format!("Failed to request additional views: {}", response.status()).into())
-    }
+    write_to_all_databases("request_additional_views", &payload).await?;
+    get_accepted_views(owner, viewer, image_name).await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn get_additional_views_requests(
     username: &str,
-) -> Result<Vec<AdditionalViewsRequest>, Box<dyn Error>> {
-    let client = Client::new();
-
+) -> Result<Vec<AdditionalViewsRequest>, Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "get_additional_views_requests",
         "user_name": username,
     });
 
-    println!(
-        "[Directory Service] Fetching additional views requests for: {}",
-        username
-    );
-
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-
+    read_from_one_database("get_additional_views_requests", &payload, |body| {
         let mut requests = Vec::new();
-
-        if let Some(requests_array) = body["requests"].as_array() {
-            for req in requests_array {
-                let viewer = req["viewer"].as_str().unwrap_or("").to_string();
-                let image_name = req["image_name"].as_str().unwrap_or("").to_string();
-                let prop_views = req["prop_views"].as_u64().unwrap_or(0);
-                let accep_views = req["accep_views"].as_u64().unwrap_or(0);
-
+        if let Some(arr) = body["requests"].as_array() {
+            for r in arr {
                 requests.push(AdditionalViewsRequest {
-                    viewer,
-                    image_name,
-                    prop_views,
-                    accep_views,
+                    viewer: r["viewer"].as_str().ok_or("Missing viewer")?.to_string(),
+                    image_name: r["image_name"]
+                        .as_str()
+                        .ok_or("Missing image_name")?
+                        .to_string(),
+                    prop_views: r["prop_views"].as_u64().ok_or("Missing prop_views")?,
+                    accep_views: r["accep_views"].as_u64().ok_or("Missing accep_views")?,
                 });
             }
         }
-
         Ok(requests)
-    } else {
-        Err(format!(
-            "Failed to fetch additional views requests: {}",
-            response.status()
-        )
-        .into())
-    }
+    })
+    .await
 }
-
-// ------------------------------------------------------------------------------------
 
 pub async fn accept_or_reject_additional_views(
     owner: &str,
     viewer: &str,
     image_name: &str,
-    result: i32, // 0 = reject, 1 = accept
-) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
-
+    result: i32,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let payload = json!({
         "operation": "accept_or_reject_additional_views",
         "owner": owner,
@@ -508,31 +444,18 @@ pub async fn accept_or_reject_additional_views(
         "result": result,
     });
 
-    let action = if result == 0 {
-        "Rejecting"
-    } else {
-        "Accepting"
-    };
-
     println!(
-        "[Directory Service] {} additional views: {} -> {}'s '{}'",
-        action, viewer, owner, image_name
+        "[Directory Service] {} additional views: {} -> {}'s '{}' to {} databases",
+        if result == 0 {
+            "Rejecting"
+        } else {
+            "Accepting"
+        },
+        viewer,
+        owner,
+        image_name,
+        DIRECTORY_URLS.len()
     );
 
-    let response = client.post(DIRECTORY_URL).json(&payload).send().await?;
-
-    if response.status().is_success() {
-        let body: Value = response.json().await?;
-        println!(
-            "[Directory Service] ✓ Additional views request updated: {:?}",
-            body
-        );
-        Ok(())
-    } else {
-        Err(format!(
-            "Failed to update additional views request: {}",
-            response.status()
-        )
-        .into())
-    }
+    write_to_all_databases("accept_or_reject_additional_views", &payload).await
 }
