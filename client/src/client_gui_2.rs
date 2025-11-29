@@ -9,6 +9,7 @@ use middleware::ClientMiddleware;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -36,7 +37,7 @@ pub struct AccessRight {
 // Application State
 // =======================================
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -44,14 +45,14 @@ enum ConnectionStatus {
     Error(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ActiveTab {
     MyImages,
     Discover,
     Requests,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AppState {
     // Connection info
     username: String,
@@ -62,6 +63,10 @@ struct AppState {
     // Status
     connection_status: ConnectionStatus,
     heartbeat_active: bool,
+
+    // Add these fields to AppState
+    add_image_path: String,
+    add_image_error: Option<String>,
 
     // UI state
     registration_error: Option<String>,
@@ -76,6 +81,8 @@ struct AppState {
     // UI flags
     show_add_image_dialog: bool,
     show_view_sharing_dialog: bool,
+
+    image_textures: HashMap<String, egui::TextureHandle>,
 }
 
 impl Default for AppState {
@@ -87,6 +94,8 @@ impl Default for AppState {
             middleware_addr: "127.0.0.1:9000".to_string(),
             connection_status: ConnectionStatus::Disconnected,
             heartbeat_active: false,
+            add_image_path: String::new(),
+            add_image_error: None,
             registration_error: None,
             status_message: "Not connected".to_string(),
             active_tab: ActiveTab::MyImages,
@@ -95,6 +104,7 @@ impl Default for AppState {
             image_access_rights: HashMap::new(),
             show_add_image_dialog: false,
             show_view_sharing_dialog: false,
+            image_textures: HashMap::new(),
         }
     }
 }
@@ -108,6 +118,14 @@ struct CloudP2PApp {
     middleware_started: bool,
 }
 
+impl Clone for CloudP2PApp {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            middleware_started: self.middleware_started,
+        }
+    }
+}
 impl CloudP2PApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Configure fonts and style
@@ -116,6 +134,34 @@ impl CloudP2PApp {
         Self {
             state: Arc::new(Mutex::new(AppState::default())),
             middleware_started: false,
+        }
+    }
+
+    fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
+        let mut state = self.state.lock().unwrap();
+
+        // Don't reload if already loaded
+        if state.image_textures.contains_key(image_name) {
+            return;
+        }
+
+        // Try to load the image
+        if let Ok(image) = image::io::Reader::open(image_path) {
+            if let Ok(dynamic_image) = image.decode() {
+                let size = [
+                    dynamic_image.width() as usize,
+                    dynamic_image.height() as usize,
+                ];
+                let image_buffer = dynamic_image.to_rgba8();
+                let pixels = image_buffer.as_flat_samples();
+
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+
+                let texture =
+                    ctx.load_texture(image_name, color_image, egui::TextureOptions::LINEAR);
+
+                state.image_textures.insert(image_name.to_string(), texture);
+            }
         }
     }
 
@@ -543,18 +589,41 @@ impl CloudP2PApp {
         let mut content_rect = rect;
         content_rect = content_rect.shrink(10.0);
 
-        // Image placeholder
+        // Image area
         let image_rect =
             egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 100.0));
-        ui.painter()
-            .rect_filled(image_rect, 3.0, egui::Color32::from_gray(60));
-        ui.painter().text(
-            image_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "🖼️",
-            egui::FontId::proportional(40.0),
-            egui::Color32::from_gray(150),
-        );
+
+        // Try to load texture if not already loaded
+        let state = self.state.lock().unwrap();
+        if let Some(texture) = state.image_textures.get(&image.name) {
+            // Draw the actual image texture
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter()
+                .image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+        } else {
+            // Draw placeholder while loading
+            ui.painter()
+                .rect_filled(image_rect, 3.0, egui::Color32::from_gray(60));
+            ui.painter().text(
+                image_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🖼️",
+                egui::FontId::proportional(40.0),
+                egui::Color32::from_gray(150),
+            );
+
+            // Trigger loading in background
+            drop(state);
+            let ctx = ui.ctx().clone();
+            let image_name = image.name.clone();
+            let image_path = image.path.clone();
+            let self_clone = Arc::new(self.clone());
+
+            std::thread::spawn(move || {
+                self_clone.load_image_texture(&ctx, &image_name, &image_path);
+                ctx.request_repaint();
+            });
+        }
 
         // Image info
         let text_y = image_rect.max.y + 5.0;
@@ -670,13 +739,233 @@ impl CloudP2PApp {
     // =======================================
 
     fn show_add_image_dialog(&self) {
-        // TODO: Implement file picker and upload
-        self.state.lock().unwrap().status_message =
-            "Add image dialog not yet implemented".to_string();
         self.state.lock().unwrap().show_add_image_dialog = true;
+    }
+
+    fn render_add_image_dialog(&self, ctx: &egui::Context) {
+        let mut state = self.state.lock().unwrap();
+
+        if !state.show_add_image_dialog {
+            return;
+        }
+
+        let mut open = true;
+
+        egui::Window::new("Add Image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.heading("Upload New Image");
+                ui.add_space(10.0);
+
+                // Error message
+                if let Some(error) = &state.add_image_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                    ui.add_space(10.0);
+                }
+
+                // Image path input
+                ui.horizontal(|ui| {
+                    ui.label("Image Path:");
+                    ui.text_edit_singleline(&mut state.add_image_path);
+                });
+
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("Enter the full path to your image file")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        state.show_add_image_dialog = false;
+                        state.add_image_path.clear();
+                        state.add_image_error = None;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_submit = !state.add_image_path.is_empty();
+
+                        if ui
+                            .add_enabled(can_submit, egui::Button::new("Upload"))
+                            .clicked()
+                        {
+                            // Check if file exists BEFORE clearing the path
+                            if !std::path::Path::new(&state.add_image_path).exists() {
+                                state.add_image_error = Some("File not found".to_string());
+                            } else {
+                                // Clear error and close dialog
+                                state.add_image_error = None;
+                                state.show_add_image_dialog = false;
+                                // Don't clear the path yet - we need it for upload!
+                                state.status_message = "Uploading image...".to_string();
+                            }
+                        }
+                    });
+                });
+            });
+
+        // Check if upload should be triggered (after the window is closed)
+        let should_upload = state.status_message == "Uploading image...";
+        let path = state.add_image_path.clone(); // Clone BEFORE clearing
+        let username = state.username.clone();
+        let middleware_addr = state.middleware_addr.clone();
+
+        // Handle close button
+        if !open {
+            state.show_add_image_dialog = false;
+            state.add_image_path.clear();
+            state.add_image_error = None;
+        }
+
+        // Clear the path now if we're uploading
+        if should_upload {
+            state.add_image_path.clear();
+        }
+
+        // Drop the lock before spawning thread
+        drop(state);
+
+        // Perform upload in background thread if triggered
+        if should_upload {
+            let state_clone = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                upload_image(path, username, middleware_addr, state_clone);
+            });
+        }
     }
 }
 
+fn upload_image(
+    image_path: String,
+    username: String,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    println!("[GUI] Uploading image: {}", image_path);
+
+    // Extract image name from path
+    let image_name = std::path::Path::new(&image_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Read and resize image to 100x100
+    match resize_image_to_100x100(&image_path) {
+        Ok(resized_bytes) => {
+            // Create request
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "AddImage": {
+                    "request_id": request_id,
+                    "username": username,
+                    "image_name": image_name,
+                    "image_bytes": resized_bytes,
+                }
+            });
+
+            // Connect to middleware
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    // Send request
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    if let Err(e) = writer.write_all(request_json.as_bytes()) {
+                        let mut state = state.lock().unwrap();
+                        state.status_message = format!("Upload failed: {}", e);
+                        return;
+                    }
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    // Read response
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        let mut state = state.lock().unwrap();
+                        state.status_message = format!("Upload failed: {}", e);
+                        return;
+                    }
+
+                    // Parse response
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            let message = response["message"].as_str().unwrap_or("Unknown");
+
+                            let mut state = state.lock().unwrap();
+                            if status == "OK" {
+                                state.status_message = format!("✓ Image uploaded: {}", image_name);
+
+                                // Add to my_images list with the ORIGINAL path (not resized)
+                                state.my_images.push(ImageInfo {
+                                    name: image_name.clone(),
+                                    size: resized_bytes.len(),
+                                    path: image_path, // Store original path for display
+                                    shared_count: 0,
+                                });
+                            } else {
+                                state.status_message = format!("Upload failed: {}", message);
+                            }
+                        }
+                        Err(e) => {
+                            let mut state = state.lock().unwrap();
+                            state.status_message =
+                                format!("Upload failed: Invalid response ({})", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut state: std::sync::MutexGuard<'_, AppState> = state.lock().unwrap();
+                    state.status_message = format!("Cannot connect to middleware: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let mut state = state.lock().unwrap();
+            state.status_message = format!("Error resizing image: {}", e);
+        }
+    }
+}
+
+fn resize_image_to_100x100(image_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use image::imageops::FilterType;
+    use image::io::Reader as ImageReader;
+
+    // Open the image
+    let img = ImageReader::open(image_path)?.decode()?;
+
+    // Resize to 100x100 using Lanczos3 filter (high quality)
+    let resized = img.resize_exact(100, 100, FilterType::Lanczos3);
+
+    // Encode as PNG
+    let mut png_bytes = Vec::new();
+    resized.write_to(
+        &mut std::io::Cursor::new(&mut png_bytes),
+        image::ImageFormat::Png,
+    )?;
+
+    Ok(png_bytes)
+}
 // =======================================
 // eframe App impl
 // =======================================
@@ -748,6 +1037,7 @@ impl eframe::App for CloudP2PApp {
                 }
             }
         });
+        self.render_add_image_dialog(ctx);
     }
 }
 
