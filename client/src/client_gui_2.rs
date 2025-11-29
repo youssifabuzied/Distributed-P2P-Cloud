@@ -89,6 +89,11 @@ struct AppState {
     user_images: HashMap<String, Vec<ImageInfo>>, // username -> images
     discover_loading: bool,
     discover_error: Option<String>,
+    show_request_access_dialog: bool,     // NEW
+    request_access_owner: String,         // NEW
+    request_access_image: String,         // NEW
+    request_access_views: String,         // NEW
+    request_access_error: Option<String>, // NEW
 }
 
 impl Default for AppState {
@@ -116,6 +121,11 @@ impl Default for AppState {
             user_images: HashMap::new(),
             discover_loading: false,
             discover_error: None,
+            show_request_access_dialog: false,   // NEW
+            request_access_owner: String::new(), // NEW
+            request_access_image: String::new(), // NEW
+            request_access_views: String::new(), // NEW
+            request_access_error: None,          // NEW
         }
     }
 }
@@ -145,6 +155,134 @@ impl CloudP2PApp {
         Self {
             state: Arc::new(Mutex::new(AppState::default())),
             middleware_started: false,
+        }
+    }
+
+    fn render_request_access_dialog(&self, ctx: &egui::Context) {
+        let mut state = self.state.lock().unwrap();
+
+        if !state.show_request_access_dialog {
+            return;
+        }
+
+        let mut open = true;
+
+        egui::Window::new("Request Image Access")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.heading("Request Access");
+                ui.add_space(10.0);
+
+                if let Some(error) = &state.request_access_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                    ui.add_space(10.0);
+                }
+
+                egui::Frame::none()
+                    .fill(ui.visuals().faint_bg_color)
+                    .inner_margin(10.0)
+                    .rounding(5.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Image Details").strong());
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Owner:");
+                            ui.label(&state.request_access_owner);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Image:");
+                            ui.label(&state.request_access_image);
+                        });
+                    });
+
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Number of views:");
+                    ui.text_edit_singleline(&mut state.request_access_views);
+                });
+
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("How many times do you want to view this image?")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        state.show_request_access_dialog = false;
+                        state.request_access_views.clear();
+                        state.request_access_error = None;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_submit = !state.request_access_views.is_empty();
+
+                        if ui
+                            .add_enabled(can_submit, egui::Button::new("Request Access"))
+                            .clicked()
+                        {
+                            match state.request_access_views.parse::<u64>() {
+                                Ok(views) if views > 0 => {
+                                    state.request_access_error = None;
+                                    state.show_request_access_dialog = false;
+                                    state.status_message = "Requesting access...".to_string();
+                                }
+                                Ok(_) => {
+                                    state.request_access_error =
+                                        Some("Views must be greater than 0".to_string());
+                                }
+                                Err(_) => {
+                                    state.request_access_error =
+                                        Some("Please enter a valid number".to_string());
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+        let should_send = state.status_message == "Requesting access...";
+        let owner = state.request_access_owner.clone();
+        let image_name = state.request_access_image.clone();
+        let views_str = state.request_access_views.clone();
+        let viewer = state.username.clone();
+        let middleware_addr = state.middleware_addr.clone();
+
+        if !open {
+            state.show_request_access_dialog = false;
+            state.request_access_views.clear();
+            state.request_access_error = None;
+        }
+
+        if should_send {
+            state.request_access_views.clear();
+        }
+
+        drop(state);
+
+        if should_send {
+            let state_clone = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                send_access_request(
+                    owner,
+                    viewer,
+                    image_name,
+                    views_str,
+                    middleware_addr,
+                    state_clone,
+                );
+            });
         }
     }
 
@@ -332,42 +470,72 @@ impl CloudP2PApp {
 
                     match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
                         Ok(response) => {
-                            let status = response["status"].as_str().unwrap_or("ERROR");
-                            println!("[GUI] Status: {}", status);
+                            println!("[GUI] Full response: {:?}", response);
 
-                            if status == "OK" {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            println!("[GUI] Status: '{}'", status);
+
+                            if status == "OK" || status == "success" {
                                 if let Some(message) = response["message"].as_str() {
-                                    println!("[GUI] Message: {}", message);
+                                    println!("[GUI] Raw message length: {} bytes", message.len());
+                                    println!("[GUI] Raw message: '{}'", message);
+                                    println!(
+                                        "[GUI] Message lines count: {}",
+                                        message.lines().count()
+                                    );
 
                                     // Parse users from message format: "username - ip"
                                     let mut users = Vec::new();
-                                    for line in message.lines() {
+                                    for (idx, line) in message.lines().enumerate() {
+                                        println!("[GUI] Line {}: '{}'", idx, line);
                                         let line = line.trim();
+                                        println!("[GUI] Line {} after trim: '{}'", idx, line);
+
                                         if line.is_empty() {
+                                            println!("[GUI] Line {} is empty, skipping", idx);
                                             continue;
                                         }
 
-                                        let parts: Vec<&str> = line.split(" - ").collect();
-                                        println!(
-                                            "[GUI] Parsing line: '{}' -> parts: {:?}",
-                                            line, parts
-                                        );
+                                        // Split by " - " (space-dash-space)
+                                        if let Some(dash_pos) = line.find(" - ") {
+                                            let username = line[..dash_pos].trim();
+                                            let ip = line[dash_pos + 3..].trim();
 
-                                        if parts.len() == 2 {
-                                            users.push((
-                                                parts[0].trim().to_string(),
-                                                parts[1].trim().to_string(),
-                                            ));
+                                            println!(
+                                                "[GUI] Line {}: Found dash at pos {}, username='{}', ip='{}'",
+                                                idx, dash_pos, username, ip
+                                            );
+
+                                            if !username.is_empty() && !ip.is_empty() {
+                                                println!(
+                                                    "[GUI] ✓ Adding user: '{}' at '{}'",
+                                                    username, ip
+                                                );
+                                                users.push((username.to_string(), ip.to_string()));
+                                            } else {
+                                                println!("[GUI] ✗ Skipping - empty username or ip");
+                                            }
+                                        } else {
+                                            println!(
+                                                "[GUI] Line {}: No ' - ' separator found",
+                                                idx
+                                            );
                                         }
                                     }
 
-                                    println!("[GUI] Parsed {} users: {:?}", users.len(), users);
+                                    println!("[GUI] Final parsed count: {} users", users.len());
+                                    println!("[GUI] Final users list: {:?}", users);
 
                                     let mut s = state.lock().unwrap();
                                     s.discovered_users = users;
                                     s.discover_loading = false;
                                     s.status_message =
                                         format!("✓ Found {} users", s.discovered_users.len());
+
+                                    println!(
+                                        "[GUI] State updated with {} users",
+                                        s.discovered_users.len()
+                                    );
                                 }
                             } else {
                                 let error_msg = response["message"]
@@ -399,7 +567,12 @@ impl CloudP2PApp {
         });
     }
 
-    fn render_discovered_image_card(&self, ui: &mut egui::Ui, image: &ImageInfo, owner: &str) {
+    fn render_discovered_image_card(
+        &self,
+        ui: &mut egui::Ui,
+        image: &ImageInfo,
+        owner: &str,
+    ) -> bool {
         let card_size = egui::vec2(120.0, 150.0);
         let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
 
@@ -420,13 +593,18 @@ impl CloudP2PApp {
         let image_rect =
             egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 80.0));
 
-        // Try to load texture
+        let should_load = {
+            let state = self.state.lock().unwrap();
+            !state.image_textures.contains_key(&image.name)
+        };
+
         let state = self.state.lock().unwrap();
         if let Some(texture) = state.image_textures.get(&image.name) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter()
                 .image(texture.id(), image_rect, uv, egui::Color32::WHITE);
         } else {
+            // Show placeholder
             ui.painter()
                 .rect_filled(image_rect, 3.0, egui::Color32::from_gray(60));
             ui.painter().text(
@@ -436,9 +614,11 @@ impl CloudP2PApp {
                 egui::FontId::proportional(30.0),
                 egui::Color32::from_gray(150),
             );
+        }
+        drop(state);
 
-            // Trigger loading
-            drop(state);
+        // Only spawn loading thread once per image
+        if should_load {
             let ctx = ui.ctx().clone();
             let image_name = image.name.clone();
             let image_path = image.path.clone();
@@ -449,7 +629,6 @@ impl CloudP2PApp {
                 ctx.request_repaint();
             });
         }
-
         // Image info text
         let text_y = image_rect.max.y + 5.0;
         let name_pos = egui::pos2(content_rect.min.x, text_y);
@@ -481,6 +660,7 @@ impl CloudP2PApp {
                 owner, image.name
             );
         }
+        response.clicked()
     }
 
     fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
@@ -1169,6 +1349,8 @@ impl CloudP2PApp {
                                         as usize;
                                 let columns_count = columns_count.max(1);
 
+                                let mut clicked_image: Option<(String, String)> = None;
+
                                 egui::Grid::new("discover_images_grid")
                                     .spacing([spacing, spacing])
                                     .show(ui, |ui| {
@@ -1177,13 +1359,29 @@ impl CloudP2PApp {
                                                 ui.end_row();
                                             }
 
-                                            self.render_discovered_image_card(
+                                            // Check if clicked
+                                            if self.render_discovered_image_card(
                                                 ui,
                                                 image,
                                                 selected_user,
-                                            );
+                                            ) {
+                                                clicked_image = Some((
+                                                    selected_user.clone(),
+                                                    image.name.clone(),
+                                                ));
+                                            }
                                         }
                                     });
+
+                                // Handle click after grid is done rendering
+                                if let Some((owner, image_name)) = clicked_image {
+                                    let mut s = self.state.lock().unwrap();
+                                    s.show_request_access_dialog = true;
+                                    s.request_access_owner = owner;
+                                    s.request_access_image = image_name;
+                                    s.request_access_views = "5".to_string();
+                                    s.request_access_error = None;
+                                }
                             }
                         } else {
                             ui.label("Loading images...");
@@ -1507,6 +1705,7 @@ impl eframe::App for CloudP2PApp {
             }
         });
         self.render_add_image_dialog(ctx);
+        self.render_request_access_dialog(ctx); // NEW LINE
     }
 }
 
@@ -1582,6 +1781,95 @@ fn start_heartbeat(username: String, middleware_addr: String) {
             }
         }
     });
+}
+
+fn send_access_request(
+    owner: String,
+    viewer: String,
+    image_name: String,
+    views_str: String,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    println!(
+        "[GUI] Requesting access: {} wants to view {}'s '{}' ({} views)",
+        viewer, owner, image_name, views_str
+    );
+
+    let prop_views = match views_str.parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Invalid number of views: {}", e);
+            return;
+        }
+    };
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = serde_json::json!({
+        "RequestImageAccess": {
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "prop_views": prop_views,
+        }
+    });
+
+    match TcpStream::connect(&middleware_addr) {
+        Ok(stream) => {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&request).unwrap();
+            if let Err(e) = writer.write_all(request_json.as_bytes()) {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Failed to send request: {}", e);
+                return;
+            }
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            let mut response_line = String::new();
+            if let Err(e) = reader.read_line(&mut response_line) {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Failed to read response: {}", e);
+                return;
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                Ok(response) => {
+                    let status = response["status"].as_str().unwrap_or("ERROR");
+                    let message = response["message"].as_str().unwrap_or("Unknown");
+
+                    let mut s = state.lock().unwrap();
+                    if status == "OK" {
+                        s.status_message = format!(
+                            "✓ Access request sent: {} views of {}'s '{}'",
+                            prop_views, owner, image_name
+                        );
+                    } else {
+                        s.status_message = format!("Request failed: {}", message);
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Invalid response: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Cannot connect to middleware: {}", e);
+        }
+    }
 }
 
 // =======================================
