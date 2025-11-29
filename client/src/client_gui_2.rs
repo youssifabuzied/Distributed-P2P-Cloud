@@ -83,6 +83,12 @@ struct AppState {
     show_view_sharing_dialog: bool,
 
     image_textures: HashMap<String, egui::TextureHandle>,
+
+    discovered_users: Vec<(String, String)>, // (username, ip)
+    selected_user: Option<String>,
+    user_images: HashMap<String, Vec<ImageInfo>>, // username -> images
+    discover_loading: bool,
+    discover_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -105,6 +111,11 @@ impl Default for AppState {
             show_add_image_dialog: false,
             show_view_sharing_dialog: false,
             image_textures: HashMap::new(),
+            discovered_users: Vec::new(),
+            selected_user: None,
+            user_images: HashMap::new(),
+            discover_loading: false,
+            discover_error: None,
         }
     }
 }
@@ -134,6 +145,341 @@ impl CloudP2PApp {
         Self {
             state: Arc::new(Mutex::new(AppState::default())),
             middleware_started: false,
+        }
+    }
+
+    fn fetch_user_images(&self, username: &str) {
+        let state = Arc::clone(&self.state);
+        let username = username.to_string();
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+
+        // Set selected user
+        {
+            let mut s = state.lock().unwrap();
+            s.selected_user = Some(username.clone());
+            s.status_message = format!("Fetching images for {}...", username);
+            // Clear previous images
+            s.user_images.remove(&username);
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "FetchUserImages": {
+                    "request_id": request_id,
+                    "target_username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    // Wait for response
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = format!("Failed to read response: {}", e);
+                        return;
+                    }
+
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            if status == "OK" {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    // Parse JSON with image details
+                                    if let Ok(json) =
+                                        serde_json::from_str::<serde_json::Value>(output_path)
+                                    {
+                                        if let Some(images_array) = json["images"].as_array() {
+                                            let mut images = Vec::new();
+                                            for img in images_array {
+                                                let name = img["image_name"]
+                                                    .as_str()
+                                                    .unwrap_or("unknown")
+                                                    .to_string();
+                                                let size =
+                                                    img["size"].as_u64().unwrap_or(0) as usize;
+                                                let path =
+                                                    img["path"].as_str().unwrap_or("").to_string();
+
+                                                images.push(ImageInfo {
+                                                    name,
+                                                    size,
+                                                    path,
+                                                    shared_count: 0,
+                                                });
+                                            }
+
+                                            let mut s = state.lock().unwrap();
+                                            s.user_images.insert(username.clone(), images.clone());
+                                            s.status_message = format!(
+                                                "✓ Loaded {} images from {}",
+                                                images.len(),
+                                                username
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let mut s = state.lock().unwrap();
+                                s.status_message = format!(
+                                    "Error: {}",
+                                    response["message"].as_str().unwrap_or("Unknown")
+                                );
+                                s.user_images.insert(username.clone(), Vec::new());
+                            }
+                        }
+                        Err(e) => {
+                            let mut s = state.lock().unwrap();
+                            s.status_message = format!("Failed to parse response: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Cannot connect to middleware: {}", e);
+                }
+            }
+        });
+    }
+
+    fn fetch_active_users(&self) {
+        let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+
+        println!("[GUI] Fetching active users from: {}", middleware_addr);
+
+        // Set loading state
+        {
+            let mut s = state.lock().unwrap();
+            s.discover_loading = true;
+            s.discover_error = None;
+            s.status_message = "Fetching active users...".to_string();
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "FetchActiveUsers": {
+                    "request_id": request_id,
+                }
+            });
+
+            println!("[GUI] Connecting to middleware...");
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    println!("[GUI] Connected! Sending request...");
+
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    println!("[GUI] Request: {}", request_json);
+
+                    if let Err(e) = writer.write_all(request_json.as_bytes()) {
+                        println!("[GUI] Failed to send request: {}", e);
+                        let mut s = state.lock().unwrap();
+                        s.discover_loading = false;
+                        s.discover_error = Some(format!("Failed to send request: {}", e));
+                        return;
+                    }
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    println!("[GUI] Waiting for response...");
+
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        println!("[GUI] Failed to read response: {}", e);
+                        let mut s = state.lock().unwrap();
+                        s.discover_loading = false;
+                        s.discover_error = Some(format!("Failed to read response: {}", e));
+                        return;
+                    }
+
+                    println!("[GUI] Response: {}", response_line);
+
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            println!("[GUI] Status: {}", status);
+
+                            if status == "OK" {
+                                if let Some(message) = response["message"].as_str() {
+                                    println!("[GUI] Message: {}", message);
+
+                                    // Parse users from message format: "username - ip"
+                                    let mut users = Vec::new();
+                                    for line in message.lines() {
+                                        let line = line.trim();
+                                        if line.is_empty() {
+                                            continue;
+                                        }
+
+                                        let parts: Vec<&str> = line.split(" - ").collect();
+                                        println!(
+                                            "[GUI] Parsing line: '{}' -> parts: {:?}",
+                                            line, parts
+                                        );
+
+                                        if parts.len() == 2 {
+                                            users.push((
+                                                parts[0].trim().to_string(),
+                                                parts[1].trim().to_string(),
+                                            ));
+                                        }
+                                    }
+
+                                    println!("[GUI] Parsed {} users: {:?}", users.len(), users);
+
+                                    let mut s = state.lock().unwrap();
+                                    s.discovered_users = users;
+                                    s.discover_loading = false;
+                                    s.status_message =
+                                        format!("✓ Found {} users", s.discovered_users.len());
+                                }
+                            } else {
+                                let error_msg = response["message"]
+                                    .as_str()
+                                    .unwrap_or("Unknown error")
+                                    .to_string();
+                                println!("[GUI] Error from server: {}", error_msg);
+
+                                let mut s = state.lock().unwrap();
+                                s.discover_loading = false;
+                                s.discover_error = Some(error_msg);
+                            }
+                        }
+                        Err(e) => {
+                            println!("[GUI] Failed to parse JSON: {}", e);
+                            let mut s = state.lock().unwrap();
+                            s.discover_loading = false;
+                            s.discover_error = Some(format!("Invalid response: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[GUI] Connection failed: {}", e);
+                    let mut s = state.lock().unwrap();
+                    s.discover_loading = false;
+                    s.discover_error = Some(format!("Cannot connect to middleware: {}", e));
+                }
+            }
+        });
+    }
+
+    fn render_discovered_image_card(&self, ui: &mut egui::Ui, image: &ImageInfo, owner: &str) {
+        let card_size = egui::vec2(120.0, 150.0);
+        let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+
+        // Draw card background
+        let fill_color = if response.hovered() {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().widgets.inactive.bg_fill
+        };
+
+        ui.painter().rect_filled(rect, 5.0, fill_color);
+
+        // Content layout
+        let mut content_rect = rect;
+        content_rect = content_rect.shrink(8.0);
+
+        // Image area (placeholder for now)
+        let image_rect =
+            egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 80.0));
+
+        // Try to load texture
+        let state = self.state.lock().unwrap();
+        if let Some(texture) = state.image_textures.get(&image.name) {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter()
+                .image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+        } else {
+            ui.painter()
+                .rect_filled(image_rect, 3.0, egui::Color32::from_gray(60));
+            ui.painter().text(
+                image_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🖼️",
+                egui::FontId::proportional(30.0),
+                egui::Color32::from_gray(150),
+            );
+
+            // Trigger loading
+            drop(state);
+            let ctx = ui.ctx().clone();
+            let image_name = image.name.clone();
+            let image_path = image.path.clone();
+            let self_clone = Arc::new(self.clone());
+
+            std::thread::spawn(move || {
+                self_clone.load_image_texture(&ctx, &image_name, &image_path);
+                ctx.request_repaint();
+            });
+        }
+
+        // Image info text
+        let text_y = image_rect.max.y + 5.0;
+        let name_pos = egui::pos2(content_rect.min.x, text_y);
+        ui.painter().text(
+            name_pos,
+            egui::Align2::LEFT_TOP,
+            &image.name,
+            egui::FontId::proportional(11.0),
+            ui.visuals().text_color(),
+        );
+
+        let size_text = format_size(image.size);
+        let size_pos = egui::pos2(content_rect.min.x, text_y + 15.0);
+        ui.painter().text(
+            size_pos,
+            egui::Align2::LEFT_TOP,
+            &size_text,
+            egui::FontId::proportional(9.0),
+            ui.visuals().weak_text_color(),
+        );
+
+        // Handle click - request access
+        if response.clicked() {
+            println!("[GUI] Clicked on {}'s image: {}", owner, image.name);
+            // TODO: Open dialog to request access with number of views
+            let mut state = self.state.lock().unwrap();
+            state.status_message = format!(
+                "Request access feature coming soon for {}'s {}",
+                owner, image.name
+            );
         }
     }
 
@@ -471,7 +817,7 @@ impl CloudP2PApp {
             ui.selectable_value(&mut guard.active_tab, ActiveTab::Discover, "🔍 Discover");
             ui.selectable_value(&mut guard.active_tab, ActiveTab::Requests, "📬 Requests");
         });
-        drop(guard); // release lock before rendering content
+        drop(guard); // ✅ Release lock before rendering content
 
         ui.separator();
         ui.add_space(10.0);
@@ -479,8 +825,8 @@ impl CloudP2PApp {
         // Tab content
         match state_clone.active_tab {
             ActiveTab::MyImages => {
-                let state = self.state.lock().unwrap().clone();
-                self.render_my_images_tab(ui, &state);
+                // ✅ Don't pass state, let the function get its own lock
+                self.render_my_images_tab(ui, &state_clone);
             }
             ActiveTab::Discover => self.render_discover_tab(ui),
             ActiveTab::Requests => self.render_requests_tab(ui),
@@ -492,7 +838,7 @@ impl CloudP2PApp {
             ui.heading("My Uploaded Images");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("➕ Add Image").clicked() {
-                    self.show_add_image_dialog();
+                    self.state.lock().unwrap().show_add_image_dialog = true;
                 }
             });
         });
@@ -509,10 +855,13 @@ impl CloudP2PApp {
                 ui.add_space(20.0);
 
                 if ui.button("➕ Add Image").clicked() {
-                    self.show_add_image_dialog();
+                    self.state.lock().unwrap().show_add_image_dialog = true;
                 }
             });
         } else {
+            // ✅ Track which image was clicked
+            let mut clicked_idx: Option<usize> = None;
+
             // Image grid
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let available_width = ui.available_width();
@@ -530,12 +879,17 @@ impl CloudP2PApp {
                                 ui.end_row();
                             }
 
-                            self.render_image_card(
+                            // ✅ Check if this card was clicked
+                            let was_clicked = self.render_image_card(
                                 ui,
                                 image,
                                 idx,
                                 state.selected_image == Some(idx),
                             );
+
+                            if was_clicked {
+                                clicked_idx = Some(idx);
+                            }
                         }
                     });
 
@@ -547,20 +901,74 @@ impl CloudP2PApp {
                         ui.separator();
                         ui.add_space(10.0);
 
-                        self.render_selected_image_details(ui, selected_image, state);
+                        ui.heading(format!("Selected: {}", selected_image.name));
+                        ui.add_space(10.0);
+
+                        // Access rights section
+                        egui::Frame::none()
+                            .fill(ui.visuals().faint_bg_color)
+                            .inner_margin(15.0)
+                            .rounding(5.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Current Access Rights").strong());
+                                ui.add_space(5.0);
+
+                                if let Some(access_list) =
+                                    state.image_access_rights.get(&selected_image.name)
+                                {
+                                    if access_list.is_empty() {
+                                        ui.label("No users have access yet");
+                                    } else {
+                                        for access in access_list {
+                                            ui.horizontal(|ui| {
+                                                ui.label("•");
+                                                ui.label(&access.viewer);
+                                                ui.label("-");
+                                                let remaining = access
+                                                    .accepted_views
+                                                    .saturating_sub(access.views_used);
+                                                ui.label(format!(
+                                                    "{} / {} views remaining",
+                                                    remaining, access.accepted_views
+                                                ));
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    ui.label("No users have access yet");
+                                }
+
+                                ui.add_space(10.0);
+
+                                ui.horizontal(|ui| {
+                                    if ui.button("👁️ View Sharing").clicked() {
+                                        self.state.lock().unwrap().show_view_sharing_dialog = true;
+                                    }
+
+                                    if ui.button("🗑️ Delete Image").clicked() {
+                                        self.state.lock().unwrap().status_message =
+                                            "Delete not yet implemented".to_string();
+                                    }
+                                });
+                            });
                     }
                 }
             });
+
+            // ✅ Update selected_image AFTER the UI is done rendering
+            if let Some(idx) = clicked_idx {
+                self.state.lock().unwrap().selected_image = Some(idx);
+            }
         }
     }
-
     fn render_image_card(
         &self,
         ui: &mut egui::Ui,
         image: &ImageInfo,
         idx: usize,
         is_selected: bool,
-    ) {
+    ) -> bool {
+        // ← Return bool indicating if clicked
         let card_size = egui::vec2(150.0, 180.0);
 
         let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
@@ -656,73 +1064,138 @@ impl CloudP2PApp {
             ui.visuals().weak_text_color(),
         );
 
-        // Handle click
-        if response.clicked() {
-            self.state.lock().unwrap().selected_image = Some(idx);
-        }
-    }
-
-    fn render_selected_image_details(
-        &self,
-        ui: &mut egui::Ui,
-        image: &ImageInfo,
-        state: &AppState,
-    ) {
-        ui.heading(format!("Selected: {}", image.name));
-        ui.add_space(10.0);
-
-        // Access rights section
-        egui::Frame::none()
-            .fill(ui.visuals().faint_bg_color)
-            .inner_margin(15.0)
-            .rounding(5.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Current Access Rights").strong());
-                ui.add_space(5.0);
-
-                if let Some(access_list) = state.image_access_rights.get(&image.name) {
-                    if access_list.is_empty() {
-                        ui.label("No users have access yet");
-                    } else {
-                        for access in access_list {
-                            ui.horizontal(|ui| {
-                                ui.label("•");
-                                ui.label(&access.viewer);
-                                ui.label("-");
-                                let remaining =
-                                    access.accepted_views.saturating_sub(access.views_used);
-                                ui.label(format!(
-                                    "{} / {} views remaining",
-                                    remaining, access.accepted_views
-                                ));
-                            });
-                        }
-                    }
-                } else {
-                    ui.label("No users have access yet");
-                }
-
-                ui.add_space(10.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("👁️ View Sharing").clicked() {
-                        self.state.lock().unwrap().show_view_sharing_dialog = true;
-                    }
-
-                    if ui.button("🗑️ Delete Image").clicked() {
-                        // TODO: Implement delete
-                        self.state.lock().unwrap().status_message =
-                            "Delete not yet implemented".to_string();
-                    }
-                });
-            });
+        // Return whether it was clicked (don't lock here!)
+        response.clicked()
     }
 
     fn render_discover_tab(&self, ui: &mut egui::Ui) {
         ui.heading("🔍 Discover Images");
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.label("(Coming soon...)");
+        ui.add_space(10.0);
+
+        // Get current state snapshot
+        let state = self.state.lock().unwrap().clone();
+
+        // Fetch users button
+        ui.horizontal(|ui| {
+            let button_enabled = !state.discover_loading;
+            if ui
+                .add_enabled(button_enabled, egui::Button::new("🔄 Refresh Users"))
+                .clicked()
+            {
+                self.fetch_active_users();
+            }
+
+            if state.discover_loading {
+                ui.spinner();
+                ui.label("Loading...");
+            }
+        });
+
+        ui.add_space(10.0);
+
+        // Show error if any
+        if let Some(error) = &state.discover_error {
+            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+            ui.add_space(10.0);
+        }
+
+        // Two-column layout: users on left, images on right
+        ui.columns(2, |columns| {
+            // Left column: User list
+            columns[0].heading("Online Users");
+            columns[0].add_space(5.0);
+
+            // ✅ FIX: Add unique ID to first ScrollArea
+            egui::ScrollArea::vertical()
+                .id_source("discover_users_scroll") // ← ADD THIS
+                .max_height(400.0)
+                .show(&mut columns[0], |ui| {
+                    if state.discovered_users.is_empty() {
+                        ui.label("No users discovered yet.");
+                        ui.label("Click 'Refresh Users' to discover online users.");
+                    } else {
+                        for (username, ip) in &state.discovered_users {
+                            // Skip our own username
+                            if username == &state.username {
+                                continue;
+                            }
+
+                            let is_selected = state.selected_user.as_ref() == Some(username);
+
+                            let button = egui::Button::new(format!("👤 {}", username))
+                                .min_size(egui::vec2(150.0, 30.0));
+
+                            let response = if is_selected {
+                                ui.add(button.fill(ui.visuals().selection.bg_fill))
+                            } else {
+                                ui.add(button)
+                            };
+
+                            if response.clicked() {
+                                // Fetch images for this user
+                                self.fetch_user_images(username);
+                            }
+
+                            ui.small(format!("IP: {}", ip));
+                            ui.add_space(5.0);
+                        }
+                    }
+                });
+
+            // Right column: User's images
+            columns[1].heading(if let Some(user) = &state.selected_user {
+                format!("{}'s Images", user)
+            } else {
+                "Select a user to view images".to_string()
+            });
+            columns[1].add_space(5.0);
+
+            // ✅ FIX: Add unique ID to second ScrollArea
+            egui::ScrollArea::vertical()
+                .id_source("discover_images_scroll") // ← ADD THIS
+                .max_height(400.0)
+                .show(&mut columns[1], |ui| {
+                    if let Some(selected_user) = &state.selected_user {
+                        if let Some(images) = state.user_images.get(selected_user) {
+                            if images.is_empty() {
+                                ui.label(format!("{} has no images yet.", selected_user));
+                            } else {
+                                // Display images in a grid
+                                let available_width = ui.available_width();
+                                let image_width = 120.0;
+                                let spacing = 10.0;
+                                let columns_count =
+                                    ((available_width + spacing) / (image_width + spacing)).floor()
+                                        as usize;
+                                let columns_count = columns_count.max(1);
+
+                                egui::Grid::new("discover_images_grid")
+                                    .spacing([spacing, spacing])
+                                    .show(ui, |ui| {
+                                        for (idx, image) in images.iter().enumerate() {
+                                            if idx > 0 && idx % columns_count == 0 {
+                                                ui.end_row();
+                                            }
+
+                                            self.render_discovered_image_card(
+                                                ui,
+                                                image,
+                                                selected_user,
+                                            );
+                                        }
+                                    });
+                            }
+                        } else {
+                            ui.label("Loading images...");
+                            ui.spinner();
+                        }
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(50.0);
+                            ui.label("👈 Select a user from the list");
+                        });
+                    }
+                });
         });
     }
 
@@ -737,10 +1210,6 @@ impl CloudP2PApp {
     // =======================================
     // Action Methods
     // =======================================
-
-    fn show_add_image_dialog(&self) {
-        self.state.lock().unwrap().show_add_image_dialog = true;
-    }
 
     fn render_add_image_dialog(&self, ctx: &egui::Context) {
         let mut state = self.state.lock().unwrap();
