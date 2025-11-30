@@ -52,6 +52,7 @@ enum ActiveTab {
     MyImages,
     Discover,
     Requests,
+    SharedWithMe,
 }
 
 #[derive(Clone)]
@@ -108,6 +109,18 @@ struct AppState {
     approve_request_index: usize,
     approve_views_input: String,
     approve_error: Option<String>,
+
+    // Shared images tab
+    shared_images: Vec<ImageInfo>,
+    shared_images_loading: bool,
+    shared_images_error: Option<String>,
+
+    // Request additional views dialog
+    show_request_additional_views_dialog: bool,
+    additional_views_owner: String,
+    additional_views_image: String,
+    additional_views_input: String,
+    additional_views_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -149,6 +162,14 @@ impl Default for AppState {
             approve_request_index: 0,
             approve_views_input: String::new(),
             approve_error: None,
+            shared_images: Vec::new(),
+            shared_images_loading: false,
+            shared_images_error: None,
+            show_request_additional_views_dialog: false,
+            additional_views_owner: String::new(),
+            additional_views_image: String::new(),
+            additional_views_input: String::new(),
+            additional_views_error: None,
         }
     }
 }
@@ -522,6 +543,135 @@ impl CloudP2PApp {
         }
     }
 
+    fn render_request_additional_views_dialog(&self, ctx: &egui::Context) {
+        let mut state = self.state.lock().unwrap();
+
+        if !state.show_request_additional_views_dialog {
+            return;
+        }
+
+        let mut open = true;
+
+        egui::Window::new("Request Additional Views")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.heading("Request More Views");
+                ui.add_space(10.0);
+
+                if let Some(error) = &state.additional_views_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                    ui.add_space(10.0);
+                }
+
+                egui::Frame::none()
+                    .fill(ui.visuals().faint_bg_color)
+                    .inner_margin(10.0)
+                    .rounding(5.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Image Details").strong());
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Owner:");
+                            ui.label(&state.additional_views_owner);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Image:");
+                            ui.label(&state.additional_views_image);
+                        });
+                    });
+
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Additional views:");
+                    ui.text_edit_singleline(&mut state.additional_views_input);
+                });
+
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("How many more views do you need?")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        state.show_request_additional_views_dialog = false;
+                        state.additional_views_input.clear();
+                        state.additional_views_error = None;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_submit = !state.additional_views_input.is_empty();
+
+                        if ui
+                            .add_enabled(can_submit, egui::Button::new("Submit Request"))
+                            .clicked()
+                        {
+                            match state.additional_views_input.parse::<u64>() {
+                                Ok(views) if views > 0 => {
+                                    state.additional_views_error = None;
+                                    state.show_request_additional_views_dialog = false;
+                                    state.status_message =
+                                        "Requesting additional views...".to_string();
+                                }
+                                Ok(_) => {
+                                    state.additional_views_error =
+                                        Some("Views must be greater than 0".to_string());
+                                }
+                                Err(_) => {
+                                    state.additional_views_error =
+                                        Some("Please enter a valid number".to_string());
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+        let should_send = state.status_message == "Requesting additional views...";
+        let owner = state.additional_views_owner.clone();
+        let image_name = state.additional_views_image.clone();
+        let views_str = state.additional_views_input.clone();
+        let viewer = state.username.clone();
+        let middleware_addr = state.middleware_addr.clone();
+
+        if !open {
+            state.show_request_additional_views_dialog = false;
+            state.additional_views_input.clear();
+            state.additional_views_error = None;
+        }
+
+        if should_send {
+            state.additional_views_input.clear();
+        }
+
+        drop(state);
+
+        if should_send {
+            let state_clone = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                send_additional_views_request(
+                    owner,
+                    viewer,
+                    image_name,
+                    views_str,
+                    middleware_addr,
+                    state_clone,
+                );
+            });
+        }
+    }
+
     fn fetch_user_images(&self, username: &str) {
         let state = Arc::clone(&self.state);
         let username = username.to_string();
@@ -810,6 +960,106 @@ impl CloudP2PApp {
                     let mut s = state.lock().unwrap();
                     s.requests_loading = false;
                     s.requests_error = Some(format!("Connection error: {}", e));
+                }
+            }
+        });
+    }
+
+    fn fetch_shared_images(&self) {
+        let state = Arc::clone(&self.state);
+
+        {
+            let mut s = state.lock().unwrap();
+            s.shared_images_loading = true;
+            s.shared_images_error = None;
+        }
+
+        std::thread::spawn(move || {
+            let storage_dir = "shared_images";
+
+            // Check if directory exists
+            if !std::path::Path::new(storage_dir).exists() {
+                let mut s = state.lock().unwrap();
+                s.shared_images_loading = false;
+                s.shared_images = Vec::new();
+                return;
+            }
+
+            match std::fs::read_dir(storage_dir) {
+                Ok(entries) => {
+                    let mut images = Vec::new();
+
+                    for entry in entries {
+                        if let Ok(entry) = entry {
+                            let path = entry.path();
+
+                            // Skip metadata files
+                            if path.to_string_lossy().contains("_metadata.json") {
+                                continue;
+                            }
+
+                            // Only process image files
+                            if let Some(ext) = path.extension() {
+                                let ext_str = ext.to_string_lossy().to_lowercase();
+                                if ext_str == "png" || ext_str == "jpg" || ext_str == "jpeg" {
+                                    let image_name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+
+                                    // Read metadata
+                                    let metadata_filename = format!(
+                                        "{}_metadata.json",
+                                        path.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("image")
+                                    );
+                                    let metadata_path =
+                                        format!("{}/{}", storage_dir, metadata_filename);
+
+                                    if let Ok(metadata_json) =
+                                        std::fs::read_to_string(&metadata_path)
+                                    {
+                                        if let Ok(metadata) =
+                                            serde_json::from_str::<serde_json::Value>(
+                                                &metadata_json,
+                                            )
+                                        {
+                                            let owner = metadata["owner"]
+                                                .as_str()
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            let accepted_views =
+                                                metadata["accepted_views"].as_u64().unwrap_or(0);
+                                            let views_count =
+                                                metadata["views_count"].as_u64().unwrap_or(0);
+                                            let remaining =
+                                                accepted_views.saturating_sub(views_count);
+
+                                            if let Ok(file_meta) = std::fs::metadata(&path) {
+                                                images.push(ImageInfo {
+                                                    name: image_name.clone(),
+                                                    size: file_meta.len() as usize,
+                                                    path: path.to_string_lossy().to_string(),
+                                                    shared_count: remaining as usize, // Store remaining views
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut s = state.lock().unwrap();
+                    s.shared_images = images;
+                    s.shared_images_loading = false;
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.shared_images_loading = false;
+                    s.shared_images_error = Some(format!("Failed to read directory: {}", e));
                 }
             }
         });
@@ -1405,13 +1655,18 @@ impl CloudP2PApp {
         let mut guard = self.state.lock().unwrap();
         let state_clone = guard.clone();
 
-        // Tab bar: operate on guard so selectable_value can mutate active_tab
+        // Tab bar
         ui.horizontal(|ui| {
             ui.selectable_value(&mut guard.active_tab, ActiveTab::MyImages, "📁 My Images");
             ui.selectable_value(&mut guard.active_tab, ActiveTab::Discover, "🔍 Discover");
             ui.selectable_value(&mut guard.active_tab, ActiveTab::Requests, "📬 Requests");
+            ui.selectable_value(
+                &mut guard.active_tab,
+                ActiveTab::SharedWithMe,
+                "📥 Shared With Me",
+            ); // ADD THIS
         });
-        drop(guard); // ✅ Release lock before rendering content
+        drop(guard);
 
         ui.separator();
         ui.add_space(10.0);
@@ -1419,11 +1674,11 @@ impl CloudP2PApp {
         // Tab content
         match state_clone.active_tab {
             ActiveTab::MyImages => {
-                // ✅ Don't pass state, let the function get its own lock
                 self.render_my_images_tab(ui, &state_clone);
             }
             ActiveTab::Discover => self.render_discover_tab(ui),
             ActiveTab::Requests => self.render_requests_tab(ui),
+            ActiveTab::SharedWithMe => self.render_shared_with_me_tab(ui), // ADD THIS
         }
     }
 
@@ -1943,6 +2198,434 @@ impl CloudP2PApp {
                 });
         });
     }
+
+    fn render_shared_with_me_tab(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("📥 Images Shared With Me");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🔄 Refresh").clicked() {
+                    self.fetch_shared_images();
+                }
+            });
+        });
+
+        ui.add_space(10.0);
+
+        let state = self.state.lock().unwrap().clone();
+
+        if state.shared_images_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading shared images...");
+            });
+            return;
+        }
+
+        if let Some(error) = &state.shared_images_error {
+            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+            ui.add_space(10.0);
+        }
+
+        if state.shared_images.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.label("📭 No images shared with you yet");
+                ui.add_space(10.0);
+                ui.label("Images shared by others will appear here");
+            });
+        } else {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let available_width = ui.available_width();
+                let card_width = 200.0;
+                let spacing = 15.0;
+                let columns =
+                    ((available_width + spacing) / (card_width + spacing)).floor() as usize;
+                let columns = columns.max(1);
+
+                let mut clicked_image: Option<(String, String)> = None; // (owner, image_name)
+                let mut request_additional: Option<(String, String)> = None; // (owner, image_name)
+
+                egui::Grid::new("shared_images_grid")
+                    .spacing([spacing, spacing])
+                    .show(ui, |ui| {
+                        for (idx, image) in state.shared_images.iter().enumerate() {
+                            if idx > 0 && idx % columns == 0 {
+                                ui.end_row();
+                            }
+
+                            // Get owner from metadata
+                            let owner = get_image_owner(&image.name);
+
+                            let card_clicked = self.render_shared_image_card(ui, image, &owner);
+
+                            if card_clicked {
+                                clicked_image = Some((owner.clone(), image.name.clone()));
+                            }
+
+                            // Check if additional views button was clicked
+                            if let Some((req_owner, req_image)) = &clicked_image {
+                                if req_owner == &owner && req_image == &image.name {
+                                    // Button click will be handled in the card render
+                                }
+                            }
+                        }
+                    });
+
+                // Handle image click after grid is done
+                if let Some((owner, image_name)) = clicked_image {
+                    drop(state);
+                    self.view_shared_image(&owner, &image_name);
+                }
+            });
+        }
+    }
+
+    fn render_shared_image_card(&self, ui: &mut egui::Ui, image: &ImageInfo, owner: &str) -> bool {
+        let card_size = egui::vec2(200.0, 280.0);
+        let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+
+        // Draw card background
+        let fill_color = if response.hovered() {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().widgets.inactive.bg_fill
+        };
+
+        ui.painter().rect_filled(rect, 5.0, fill_color);
+
+        let mut content_rect = rect;
+        content_rect = content_rect.shrink(10.0);
+
+        // Image area
+        let image_rect =
+            egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 120.0));
+
+        // Try to load and display thumbnail
+        let state = self.state.lock().unwrap();
+        if let Some(texture) = state.image_textures.get(&image.name) {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter()
+                .image(texture.id(), image_rect, uv, egui::Color32::WHITE);
+        } else {
+            ui.painter()
+                .rect_filled(image_rect, 3.0, egui::Color32::from_gray(60));
+            ui.painter().text(
+                image_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🖼️",
+                egui::FontId::proportional(40.0),
+                egui::Color32::from_gray(150),
+            );
+
+            // Load texture in background
+            drop(state);
+            let ctx = ui.ctx().clone();
+            let image_name = image.name.clone();
+            let image_path = image.path.clone();
+            let self_clone = Arc::new(self.clone());
+
+            std::thread::spawn(move || {
+                self_clone.load_image_texture(&ctx, &image_name, &image_path);
+                ctx.request_repaint();
+            });
+        }
+
+        // Image info
+        let text_y = image_rect.max.y + 5.0;
+
+        // Image name
+        let name_pos = egui::pos2(content_rect.min.x, text_y);
+        ui.painter().text(
+            name_pos,
+            egui::Align2::LEFT_TOP,
+            &image.name,
+            egui::FontId::proportional(13.0),
+            ui.visuals().text_color(),
+        );
+
+        // Owner
+        let owner_pos = egui::pos2(content_rect.min.x, text_y + 18.0);
+        ui.painter().text(
+            owner_pos,
+            egui::Align2::LEFT_TOP,
+            format!("From: {}", owner),
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+
+        // Remaining views
+        let views_pos = egui::pos2(content_rect.min.x, text_y + 35.0);
+        let views_color = if image.shared_count > 0 {
+            egui::Color32::from_rgb(100, 200, 100)
+        } else {
+            egui::Color32::from_rgb(200, 100, 100)
+        };
+        ui.painter().text(
+            views_pos,
+            egui::Align2::LEFT_TOP,
+            format!("Views left: {}", image.shared_count),
+            egui::FontId::proportional(11.0),
+            views_color,
+        );
+
+        // Button for requesting additional views
+        let button_rect = egui::Rect::from_min_size(
+            egui::pos2(content_rect.min.x, text_y + 55.0),
+            egui::vec2(content_rect.width(), 30.0),
+        );
+
+        let button_response = ui.allocate_rect(button_rect, egui::Sense::click());
+
+        let button_bg = if button_response.hovered() {
+            egui::Color32::from_rgb(70, 130, 180)
+        } else {
+            egui::Color32::from_rgb(50, 100, 150)
+        };
+
+        ui.painter().rect_filled(button_rect, 3.0, button_bg);
+        ui.painter().text(
+            button_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Request More Views",
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+
+        if button_response.clicked() {
+            let mut s = self.state.lock().unwrap();
+            s.show_request_additional_views_dialog = true;
+            s.additional_views_owner = owner.to_string();
+            s.additional_views_image = image.name.clone();
+            s.additional_views_input = "5".to_string();
+            s.additional_views_error = None;
+            return false; // Don't trigger card click
+        }
+
+        response.clicked()
+    }
+
+    fn view_shared_image(&self, owner: &str, image_name: &str) {
+        let state = Arc::clone(&self.state);
+        let owner = owner.to_string();
+        let image_name = image_name.to_string();
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Opening image '{}'...", image_name);
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+            use std::process::Command;
+
+            let storage_dir = "shared_images";
+            let image_path = format!("{}/{}", storage_dir, image_name);
+
+            // Check if image exists
+            if !std::path::Path::new(&image_path).exists() {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Image '{}' not found", image_name);
+                return;
+            }
+
+            // Read metadata
+            let metadata_filename = format!(
+                "{}_metadata.json",
+                std::path::Path::new(&image_name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image")
+            );
+            let metadata_path = format!("{}/{}", storage_dir, metadata_filename);
+
+            let mut metadata: serde_json::Value = if std::path::Path::new(&metadata_path).exists() {
+                match std::fs::read_to_string(&metadata_path) {
+                    Ok(json) => match serde_json::from_str(&json) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            let mut s = state.lock().unwrap();
+                            s.status_message = "Failed to parse metadata".to_string();
+                            return;
+                        }
+                    },
+                    Err(_) => {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = "Failed to read metadata".to_string();
+                        return;
+                    }
+                }
+            } else {
+                let mut s = state.lock().unwrap();
+                s.status_message = "Metadata not found".to_string();
+                return;
+            };
+
+            let mut accepted_views = metadata["accepted_views"].as_u64().unwrap_or(0);
+            let mut views_count = metadata["views_count"].as_u64().unwrap_or(0);
+
+            println!(
+                "[GUI] Current - Accepted: {}, Used: {}",
+                accepted_views, views_count
+            );
+
+            // Try to sync with server
+            println!("[GUI] Syncing with server...");
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "GetAcceptedViews": {
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": username,
+                    "image_name": image_name,
+                }
+            });
+
+            if let Ok(stream) = TcpStream::connect(&middleware_addr) {
+                let mut reader = BufReader::new(&stream);
+                let mut writer = stream.try_clone().unwrap();
+
+                let request_json = serde_json::to_string(&request).unwrap();
+                let _ = writer.write_all(request_json.as_bytes());
+                let _ = writer.write_all(b"\n");
+                let _ = writer.flush();
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
+
+                let mut response_line = String::new();
+                if reader.read_line(&mut response_line).is_ok() {
+                    if let Ok(response) =
+                        serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                    {
+                        if response["status"].as_str() == Some("OK") {
+                            if let Some(message) = response["message"].as_str() {
+                                if let Some(views_str) = message
+                                    .split_whitespace()
+                                    .find(|s| s.parse::<u64>().is_ok())
+                                {
+                                    if let Ok(server_views) = views_str.parse::<u64>() {
+                                        println!(
+                                            "[GUI] Server sync: {} -> {}",
+                                            accepted_views, server_views
+                                        );
+                                        accepted_views = server_views;
+                                        metadata["accepted_views"] =
+                                            serde_json::json!(server_views);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let remaining_views = accepted_views.saturating_sub(views_count);
+            println!("[GUI] Remaining views: {}", remaining_views);
+
+            let should_decrypt = remaining_views > 0;
+            let image_to_display: String;
+
+            if should_decrypt {
+                println!("[GUI] Decrypting image...");
+
+                // Increment view count
+                views_count += 1;
+                metadata["views_count"] = serde_json::json!(views_count);
+
+                // Save updated metadata
+                if let Ok(updated_json) = serde_json::to_string_pretty(&metadata) {
+                    let _ = std::fs::write(&metadata_path, updated_json);
+                }
+
+                // Send decryption request
+                let decrypt_request = serde_json::json!({
+                    "DecryptImage": {
+                        "request_id": request_id + 1,
+                        "image_path": image_path,
+                        "username": username,
+                    }
+                });
+
+                if let Ok(stream) = TcpStream::connect(&middleware_addr) {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&decrypt_request).unwrap();
+                    let _ = writer.write_all(request_json.as_bytes());
+                    let _ = writer.write_all(b"\n");
+                    let _ = writer.flush();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if reader.read_line(&mut response_line).is_ok() {
+                        if let Ok(response) =
+                            serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                        {
+                            if let Some(output_path) = response["output_path"].as_str() {
+                                image_to_display = output_path.to_string();
+                            } else {
+                                let mut s = state.lock().unwrap();
+                                s.status_message = "Decryption failed".to_string();
+                                return;
+                            }
+                        } else {
+                            let mut s = state.lock().unwrap();
+                            s.status_message = "Invalid decryption response".to_string();
+                            return;
+                        }
+                    } else {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = "Failed to read decryption response".to_string();
+                        return;
+                    }
+                } else {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = "Cannot connect for decryption".to_string();
+                    return;
+                }
+            } else {
+                println!("[GUI] No views remaining - showing encrypted");
+                image_to_display = image_path.clone();
+            }
+
+            // Open image viewer
+            #[cfg(target_os = "linux")]
+            {
+                let _ = Command::new("xdg-open").arg(&image_to_display).spawn();
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let _ = Command::new("open").arg(&image_to_display).spawn();
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let _ = Command::new("cmd")
+                    .args(&["/C", "start", "", &image_to_display])
+                    .spawn();
+            }
+
+            let mut s = state.lock().unwrap();
+            s.status_message = format!(
+                "✓ Viewed '{}' ({}/{} views used)",
+                image_name, views_count, accepted_views
+            );
+        });
+    }
     // =======================================
     // Action Methods
     // =======================================
@@ -2245,6 +2928,7 @@ impl eframe::App for CloudP2PApp {
         self.render_add_image_dialog(ctx);
         self.render_request_access_dialog(ctx);
         self.render_approve_dialog(ctx);
+        self.render_request_additional_views_dialog(ctx);
     }
 }
 
@@ -2492,6 +3176,104 @@ fn send_approval_request(
             s.status_message = format!("Cannot connect: {}", e);
         }
     }
+}
+
+fn send_additional_views_request(
+    owner: String,
+    viewer: String,
+    image_name: String,
+    views_str: String,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let additional_views = match views_str.parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Invalid number: {}", e);
+            return;
+        }
+    };
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = serde_json::json!({
+        "AddViews": {
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "additional_views": additional_views,
+        }
+    });
+
+    match TcpStream::connect(&middleware_addr) {
+        Ok(stream) => {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&request).unwrap();
+            writer.write_all(request_json.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            let mut response_line = String::new();
+            if let Err(e) = reader.read_line(&mut response_line) {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Failed to read response: {}", e);
+                return;
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                Ok(response) => {
+                    let status = response["status"].as_str().unwrap_or("ERROR");
+                    let message = response["message"].as_str().unwrap_or("Unknown");
+
+                    let mut s = state.lock().unwrap();
+                    if status == "OK" {
+                        s.status_message =
+                            format!("✓ Additional views requested: +{} views", additional_views);
+                    } else {
+                        s.status_message = format!("Failed: {}", message);
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Invalid response: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Cannot connect: {}", e);
+        }
+    }
+}
+
+fn get_image_owner(image_name: &str) -> String {
+    let storage_dir = "shared_images";
+    let metadata_filename = format!(
+        "{}_metadata.json",
+        std::path::Path::new(image_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image")
+    );
+    let metadata_path = format!("{}/{}", storage_dir, metadata_filename);
+
+    if let Ok(metadata_json) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
+            return metadata["owner"].as_str().unwrap_or("unknown").to_string();
+        }
+    }
+
+    "unknown".to_string()
 }
 
 // =======================================
