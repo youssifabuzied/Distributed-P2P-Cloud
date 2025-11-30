@@ -2211,7 +2211,7 @@ impl CloudP2PApp {
 
         ui.add_space(10.0);
 
-        let state = self.state.lock().unwrap().clone();
+        let state = self.state.lock().unwrap().clone(); // ✅ Clone entire state
 
         if state.shared_images_loading {
             ui.horizontal(|ui| {
@@ -2242,8 +2242,7 @@ impl CloudP2PApp {
                     ((available_width + spacing) / (card_width + spacing)).floor() as usize;
                 let columns = columns.max(1);
 
-                let mut clicked_image: Option<(String, String)> = None; // (owner, image_name)
-                let mut request_additional: Option<(String, String)> = None; // (owner, image_name)
+                let mut clicked_image: Option<(String, String)> = None;
 
                 egui::Grid::new("shared_images_grid")
                     .spacing([spacing, spacing])
@@ -2253,28 +2252,37 @@ impl CloudP2PApp {
                                 ui.end_row();
                             }
 
-                            // Get owner from metadata
                             let owner = get_image_owner(&image.name);
-
                             let card_clicked = self.render_shared_image_card(ui, image, &owner);
 
                             if card_clicked {
                                 clicked_image = Some((owner.clone(), image.name.clone()));
                             }
-
-                            // Check if additional views button was clicked
-                            if let Some((req_owner, req_image)) = &clicked_image {
-                                if req_owner == &owner && req_image == &image.name {
-                                    // Button click will be handled in the card render
-                                }
-                            }
                         }
                     });
 
-                // Handle image click after grid is done
+                // ✅ Handle click AFTER all UI is done
                 if let Some((owner, image_name)) = clicked_image {
-                    drop(state);
-                    self.view_shared_image(&owner, &image_name);
+                    let state_clone = Arc::clone(&self.state);
+                    let username = state.username.clone();
+                    let middleware_addr = state.middleware_addr.clone();
+
+                    // Update status immediately
+                    {
+                        let mut s = state_clone.lock().unwrap();
+                        s.status_message = format!("Opening image '{}'...", image_name);
+                    }
+
+                    // ✅ Spawn background task - don't block
+                    std::thread::spawn(move || {
+                        view_shared_image_background(
+                            state_clone,
+                            owner,
+                            image_name,
+                            username,
+                            middleware_addr,
+                        );
+                    });
                 }
             });
         }
@@ -2422,7 +2430,7 @@ impl CloudP2PApp {
             s.status_message = format!("Opening image '{}'...", image_name);
         }
 
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
             use std::io::{BufRead, BufReader, Write};
             use std::net::TcpStream;
             use std::process::Command;
@@ -3274,6 +3282,213 @@ fn get_image_owner(image_name: &str) -> String {
     }
 
     "unknown".to_string()
+}
+
+fn view_shared_image_background(
+    state: Arc<Mutex<AppState>>,
+    owner: String,
+    image_name: String,
+    username: String,
+    middleware_addr: String,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::process::Command;
+
+    let storage_dir = "shared_images";
+    let image_path = format!("{}/{}", storage_dir, image_name);
+
+    // Check if image exists
+    if !std::path::Path::new(&image_path).exists() {
+        let mut s = state.lock().unwrap();
+        s.status_message = format!("Image '{}' not found", image_name);
+        return;
+    }
+
+    // Read metadata
+    let metadata_filename = format!(
+        "{}_metadata.json",
+        std::path::Path::new(&image_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image")
+    );
+    let metadata_path = format!("{}/{}", storage_dir, metadata_filename);
+
+    let mut metadata: serde_json::Value = if std::path::Path::new(&metadata_path).exists() {
+        match std::fs::read_to_string(&metadata_path) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(m) => m,
+                Err(_) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = "Failed to parse metadata".to_string();
+                    return;
+                }
+            },
+            Err(_) => {
+                let mut s = state.lock().unwrap();
+                s.status_message = "Failed to read metadata".to_string();
+                return;
+            }
+        }
+    } else {
+        let mut s = state.lock().unwrap();
+        s.status_message = "Metadata not found".to_string();
+        return;
+    };
+
+    let mut accepted_views = metadata["accepted_views"].as_u64().unwrap_or(0);
+    let mut views_count = metadata["views_count"].as_u64().unwrap_or(0);
+
+    println!(
+        "[GUI] Current - Accepted: {}, Used: {}",
+        accepted_views, views_count
+    );
+
+    // Try to sync with server
+    println!("[GUI] Syncing with server...");
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = serde_json::json!({
+        "GetAcceptedViews": {
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": username,
+            "image_name": image_name,
+        }
+    });
+
+    if let Ok(stream) = TcpStream::connect(&middleware_addr) {
+        let mut reader = BufReader::new(&stream);
+        let mut writer = stream.try_clone().unwrap();
+
+        let request_json = serde_json::to_string(&request).unwrap();
+        let _ = writer.write_all(request_json.as_bytes());
+        let _ = writer.write_all(b"\n");
+        let _ = writer.flush();
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let mut response_line = String::new();
+        if reader.read_line(&mut response_line).is_ok() {
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                if response["status"].as_str() == Some("OK") {
+                    if let Some(message) = response["message"].as_str() {
+                        if let Some(views_str) = message
+                            .split_whitespace()
+                            .find(|s| s.parse::<u64>().is_ok())
+                        {
+                            if let Ok(server_views) = views_str.parse::<u64>() {
+                                println!(
+                                    "[GUI] Server sync: {} -> {}",
+                                    accepted_views, server_views
+                                );
+                                accepted_views = server_views;
+                                metadata["accepted_views"] = serde_json::json!(server_views);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let remaining_views = accepted_views.saturating_sub(views_count);
+    println!("[GUI] Remaining views: {}", remaining_views);
+
+    let should_decrypt = remaining_views > 0;
+    let image_to_display: String;
+
+    if should_decrypt {
+        println!("[GUI] Decrypting image...");
+
+        // Increment view count
+        views_count += 1;
+        metadata["views_count"] = serde_json::json!(views_count);
+
+        // Save updated metadata
+        if let Ok(updated_json) = serde_json::to_string_pretty(&metadata) {
+            let _ = std::fs::write(&metadata_path, updated_json);
+        }
+
+        // Send decryption request
+        let decrypt_request = serde_json::json!({
+            "DecryptImage": {
+                "request_id": request_id + 1,
+                "image_path": image_path,
+                "username": username,
+            }
+        });
+
+        if let Ok(stream) = TcpStream::connect(&middleware_addr) {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&decrypt_request).unwrap();
+            let _ = writer.write_all(request_json.as_bytes());
+            let _ = writer.write_all(b"\n");
+            let _ = writer.flush();
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            let mut response_line = String::new();
+            if reader.read_line(&mut response_line).is_ok() {
+                if let Ok(response) =
+                    serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                {
+                    if let Some(output_path) = response["output_path"].as_str() {
+                        image_to_display = output_path.to_string();
+                    } else {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = "Decryption failed".to_string();
+                        return;
+                    }
+                } else {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = "Invalid decryption response".to_string();
+                    return;
+                }
+            } else {
+                let mut s = state.lock().unwrap();
+                s.status_message = "Failed to read decryption response".to_string();
+                return;
+            }
+        } else {
+            let mut s = state.lock().unwrap();
+            s.status_message = "Cannot connect for decryption".to_string();
+            return;
+        }
+    } else {
+        println!("[GUI] No views remaining - showing encrypted");
+        image_to_display = image_path.clone();
+    }
+
+    // Open image viewer
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("xdg-open").arg(&image_to_display).spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(&image_to_display).spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("cmd")
+            .args(&["/C", "start", "", &image_to_display])
+            .spawn();
+    }
+
+    let mut s = state.lock().unwrap();
+    s.status_message = format!(
+        "✓ Viewed '{}' ({}/{} views used)",
+        image_name, views_count, accepted_views
+    );
 }
 
 // =======================================
