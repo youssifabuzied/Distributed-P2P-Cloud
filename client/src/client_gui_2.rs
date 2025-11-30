@@ -3022,85 +3022,88 @@ fn send_access_request(
     middleware_addr: String,
     state: Arc<Mutex<AppState>>,
 ) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
+    // ✅ Spawn background thread immediately
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
 
-    println!(
-        "[GUI] Requesting access: {} wants to view {}'s '{}' ({} views)",
-        viewer, owner, image_name, views_str
-    );
+        println!(
+            "[GUI] Requesting access: {} wants to view {}'s '{}' ({} views)",
+            viewer, owner, image_name, views_str
+        );
 
-    let prop_views = match views_str.parse::<u64>() {
-        Ok(v) => v,
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.status_message = format!("Invalid number of views: {}", e);
-            return;
-        }
-    };
-
-    let request_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let request = serde_json::json!({
-        "RequestImageAccess": {
-            "request_id": request_id,
-            "owner": owner,
-            "viewer": viewer,
-            "image_name": image_name,
-            "prop_views": prop_views,
-        }
-    });
-
-    match TcpStream::connect(&middleware_addr) {
-        Ok(stream) => {
-            let mut reader = BufReader::new(&stream);
-            let mut writer = stream.try_clone().unwrap();
-
-            let request_json = serde_json::to_string(&request).unwrap();
-            if let Err(e) = writer.write_all(request_json.as_bytes()) {
+        let prop_views = match views_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
                 let mut s = state.lock().unwrap();
-                s.status_message = format!("Failed to send request: {}", e);
+                s.status_message = format!("Invalid number of views: {}", e);
                 return;
             }
-            writer.write_all(b"\n").unwrap();
-            writer.flush().unwrap();
+        };
 
-            let mut response_line = String::new();
-            if let Err(e) = reader.read_line(&mut response_line) {
-                let mut s = state.lock().unwrap();
-                s.status_message = format!("Failed to read response: {}", e);
-                return;
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let request = serde_json::json!({
+            "RequestImageAccess": {
+                "request_id": request_id,
+                "owner": owner,
+                "viewer": viewer,
+                "image_name": image_name,
+                "prop_views": prop_views,
             }
+        });
 
-            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
-                Ok(response) => {
-                    let status = response["status"].as_str().unwrap_or("ERROR");
-                    let message = response["message"].as_str().unwrap_or("Unknown");
+        match TcpStream::connect(&middleware_addr) {
+            Ok(stream) => {
+                let mut reader = BufReader::new(&stream);
+                let mut writer = stream.try_clone().unwrap();
 
+                let request_json = serde_json::to_string(&request).unwrap();
+                if let Err(e) = writer.write_all(request_json.as_bytes()) {
                     let mut s = state.lock().unwrap();
-                    if status == "OK" {
-                        s.status_message = format!(
-                            "✓ Access request sent: {} views of {}'s '{}'",
-                            prop_views, owner, image_name
-                        );
-                    } else {
-                        s.status_message = format!("Request failed: {}", message);
+                    s.status_message = format!("Failed to send request: {}", e);
+                    return;
+                }
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+
+                let mut response_line = String::new();
+                if let Err(e) = reader.read_line(&mut response_line) {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Failed to read response: {}", e);
+                    return;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                    Ok(response) => {
+                        let status = response["status"].as_str().unwrap_or("ERROR");
+                        let message = response["message"].as_str().unwrap_or("Unknown");
+
+                        let mut s = state.lock().unwrap();
+                        if status == "OK" {
+                            s.status_message = format!(
+                                "✓ Access request sent: {} views of {}'s '{}'",
+                                prop_views, owner, image_name
+                            );
+                        } else {
+                            s.status_message = format!("Request failed: {}", message);
+                        }
+                    }
+                    Err(e) => {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = format!("Invalid response: {}", e);
                     }
                 }
-                Err(e) => {
-                    let mut s = state.lock().unwrap();
-                    s.status_message = format!("Invalid response: {}", e);
-                }
+            }
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Cannot connect to middleware: {}", e);
             }
         }
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.status_message = format!("Cannot connect to middleware: {}", e);
-        }
-    }
+    });
 }
 
 fn send_approval_request(
@@ -3112,78 +3115,81 @@ fn send_approval_request(
     middleware_addr: String,
     state: Arc<Mutex<AppState>>,
 ) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
+    // ✅ Spawn background thread immediately
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
 
-    let request_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-    let request = if request_type == "access" {
-        let accep_views = views_input.parse::<i64>().unwrap_or(-1);
-        serde_json::json!({
-            "ApproveOrRejectAccess": {
-                "request_id": request_id,
-                "owner": owner,
-                "viewer": viewer,
-                "image_name": image_name,
-                "accep_views": accep_views,
-            }
-        })
-    } else {
-        let result = views_input.parse::<i32>().unwrap_or(0);
-        serde_json::json!({
-            "AcceptAdditionalViews": {
-                "request_id": request_id,
-                "owner": owner,
-                "viewer": viewer,
-                "image_name": image_name,
-                "result": result,
-            }
-        })
-    };
+        let request = if request_type == "access" {
+            let accep_views = views_input.parse::<i64>().unwrap_or(-1);
+            serde_json::json!({
+                "ApproveOrRejectAccess": {
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "accep_views": accep_views,
+                }
+            })
+        } else {
+            let result = views_input.parse::<i32>().unwrap_or(0);
+            serde_json::json!({
+                "AcceptAdditionalViews": {
+                    "request_id": request_id,
+                    "owner": owner,
+                    "viewer": viewer,
+                    "image_name": image_name,
+                    "result": result,
+                }
+            })
+        };
 
-    match TcpStream::connect(&middleware_addr) {
-        Ok(stream) => {
-            let mut reader = BufReader::new(&stream);
-            let mut writer = stream.try_clone().unwrap();
+        match TcpStream::connect(&middleware_addr) {
+            Ok(stream) => {
+                let mut reader = BufReader::new(&stream);
+                let mut writer = stream.try_clone().unwrap();
 
-            let request_json = serde_json::to_string(&request).unwrap();
-            writer.write_all(request_json.as_bytes()).unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer.flush().unwrap();
+                let request_json = serde_json::to_string(&request).unwrap();
+                writer.write_all(request_json.as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
 
-            let mut response_line = String::new();
-            if let Err(e) = reader.read_line(&mut response_line) {
-                let mut s = state.lock().unwrap();
-                s.status_message = format!("Failed to read response: {}", e);
-                return;
-            }
-
-            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
-                Ok(response) => {
-                    let status = response["status"].as_str().unwrap_or("ERROR");
-                    let message = response["message"].as_str().unwrap_or("Unknown");
-
+                let mut response_line = String::new();
+                if let Err(e) = reader.read_line(&mut response_line) {
                     let mut s = state.lock().unwrap();
-                    if status == "OK" {
-                        s.status_message = format!("✓ {}", message);
-                    } else {
-                        s.status_message = format!("Failed: {}", message);
+                    s.status_message = format!("Failed to read response: {}", e);
+                    return;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                    Ok(response) => {
+                        let status = response["status"].as_str().unwrap_or("ERROR");
+                        let message = response["message"].as_str().unwrap_or("Unknown");
+
+                        let mut s = state.lock().unwrap();
+                        if status == "OK" {
+                            s.status_message = format!("✓ {}", message);
+                        } else {
+                            s.status_message = format!("Failed: {}", message);
+                        }
+                    }
+                    Err(e) => {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = format!("Invalid response: {}", e);
                     }
                 }
-                Err(e) => {
-                    let mut s = state.lock().unwrap();
-                    s.status_message = format!("Invalid response: {}", e);
-                }
+            }
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Cannot connect: {}", e);
             }
         }
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.status_message = format!("Cannot connect: {}", e);
-        }
-    }
+    });
 }
 
 fn send_additional_views_request(
@@ -3194,74 +3200,79 @@ fn send_additional_views_request(
     middleware_addr: String,
     state: Arc<Mutex<AppState>>,
 ) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
+    // ✅ Spawn background thread immediately - don't block GUI
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
 
-    let additional_views = match views_str.parse::<u64>() {
-        Ok(v) => v,
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.status_message = format!("Invalid number: {}", e);
-            return;
-        }
-    };
-
-    let request_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let request = serde_json::json!({
-        "AddViews": {
-            "request_id": request_id,
-            "owner": owner,
-            "viewer": viewer,
-            "image_name": image_name,
-            "additional_views": additional_views,
-        }
-    });
-
-    match TcpStream::connect(&middleware_addr) {
-        Ok(stream) => {
-            let mut reader = BufReader::new(&stream);
-            let mut writer = stream.try_clone().unwrap();
-
-            let request_json = serde_json::to_string(&request).unwrap();
-            writer.write_all(request_json.as_bytes()).unwrap();
-            writer.write_all(b"\n").unwrap();
-            writer.flush().unwrap();
-
-            let mut response_line = String::new();
-            if let Err(e) = reader.read_line(&mut response_line) {
+        let additional_views = match views_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
                 let mut s = state.lock().unwrap();
-                s.status_message = format!("Failed to read response: {}", e);
+                s.status_message = format!("Invalid number: {}", e);
                 return;
             }
+        };
 
-            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
-                Ok(response) => {
-                    let status = response["status"].as_str().unwrap_or("ERROR");
-                    let message = response["message"].as_str().unwrap_or("Unknown");
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
+        let request = serde_json::json!({
+            "AddViews": {
+                "request_id": request_id,
+                "owner": owner,
+                "viewer": viewer,
+                "image_name": image_name,
+                "additional_views": additional_views,
+            }
+        });
+
+        match TcpStream::connect(&middleware_addr) {
+            Ok(stream) => {
+                let mut reader = BufReader::new(&stream);
+                let mut writer = stream.try_clone().unwrap();
+
+                let request_json = serde_json::to_string(&request).unwrap();
+                writer.write_all(request_json.as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+
+                let mut response_line = String::new();
+                if let Err(e) = reader.read_line(&mut response_line) {
                     let mut s = state.lock().unwrap();
-                    if status == "OK" {
-                        s.status_message =
-                            format!("✓ Additional views requested: +{} views", additional_views);
-                    } else {
-                        s.status_message = format!("Failed: {}", message);
+                    s.status_message = format!("Failed to read response: {}", e);
+                    return;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                    Ok(response) => {
+                        let status = response["status"].as_str().unwrap_or("ERROR");
+                        let message = response["message"].as_str().unwrap_or("Unknown");
+
+                        let mut s = state.lock().unwrap();
+                        if status == "OK" {
+                            s.status_message = format!(
+                                "✓ Additional views requested: +{} views",
+                                additional_views
+                            );
+                        } else {
+                            s.status_message = format!("Failed: {}", message);
+                        }
+                    }
+                    Err(e) => {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = format!("Invalid response: {}", e);
                     }
                 }
-                Err(e) => {
-                    let mut s = state.lock().unwrap();
-                    s.status_message = format!("Invalid response: {}", e);
-                }
+            }
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Cannot connect: {}", e);
             }
         }
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.status_message = format!("Cannot connect: {}", e);
-        }
-    }
+    });
 }
 
 fn get_image_owner(image_name: &str) -> String {
