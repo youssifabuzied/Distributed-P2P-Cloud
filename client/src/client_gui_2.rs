@@ -6,6 +6,8 @@ mod middleware;
 
 use middleware::ClientMiddleware;
 
+use crate::client::AdditionalViewsRequest;
+use crate::client::PendingRequest;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -89,11 +91,23 @@ struct AppState {
     user_images: HashMap<String, Vec<ImageInfo>>, // username -> images
     discover_loading: bool,
     discover_error: Option<String>,
-    show_request_access_dialog: bool,     // NEW
-    request_access_owner: String,         // NEW
-    request_access_image: String,         // NEW
-    request_access_views: String,         // NEW
-    request_access_error: Option<String>, // NEW
+    show_request_access_dialog: bool,
+    request_access_owner: String,
+    request_access_image: String,
+    request_access_views: String,
+    request_access_error: Option<String>,
+
+    pending_access_requests: Vec<PendingRequest>,
+    additional_views_requests: Vec<AdditionalViewsRequest>,
+    requests_loading: bool,
+    requests_error: Option<String>,
+
+    // For approval dialogs
+    show_approve_dialog: bool,
+    approve_request_type: String, // "access" or "additional"
+    approve_request_index: usize,
+    approve_views_input: String,
+    approve_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -121,11 +135,20 @@ impl Default for AppState {
             user_images: HashMap::new(),
             discover_loading: false,
             discover_error: None,
-            show_request_access_dialog: false,   // NEW
-            request_access_owner: String::new(), // NEW
-            request_access_image: String::new(), // NEW
-            request_access_views: String::new(), // NEW
-            request_access_error: None,          // NEW
+            show_request_access_dialog: false,
+            request_access_owner: String::new(),
+            request_access_image: String::new(),
+            request_access_views: String::new(),
+            request_access_error: None,
+            pending_access_requests: Vec::new(),
+            additional_views_requests: Vec::new(),
+            requests_loading: false,
+            requests_error: None,
+            show_approve_dialog: false,
+            approve_request_type: String::new(),
+            approve_request_index: 0,
+            approve_views_input: String::new(),
+            approve_error: None,
         }
     }
 }
@@ -286,6 +309,219 @@ impl CloudP2PApp {
         }
     }
 
+    fn render_approve_dialog(&self, ctx: &egui::Context) {
+        let mut state = self.state.lock().unwrap();
+
+        if !state.show_approve_dialog {
+            return;
+        }
+
+        let mut open = true;
+
+        let title = if state.approve_request_type == "access" {
+            "Approve/Reject Access Request"
+        } else {
+            "Approve/Reject Additional Views"
+        };
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                if let Some(error) = &state.approve_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                    ui.add_space(10.0);
+                }
+
+                if state.approve_request_type == "access" {
+                    // Access request approval
+                    if let Some(req) = state
+                        .pending_access_requests
+                        .get(state.approve_request_index)
+                    {
+                        egui::Frame::none()
+                            .fill(ui.visuals().faint_bg_color)
+                            .inner_margin(10.0)
+                            .rounding(5.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Request Details").strong());
+                                ui.add_space(5.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Viewer:");
+                                    ui.label(&req.viewer);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Image:");
+                                    ui.label(&req.image_name);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Requested views:");
+                                    ui.label(req.prop_views.to_string());
+                                });
+                            });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Accept with views:");
+                            ui.text_edit_singleline(&mut state.approve_views_input);
+                        });
+
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Enter -1 to reject, or number of views to approve",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                } else {
+                    // Additional views request approval
+                    if let Some(req) = state
+                        .additional_views_requests
+                        .get(state.approve_request_index)
+                    {
+                        egui::Frame::none()
+                            .fill(ui.visuals().faint_bg_color)
+                            .inner_margin(10.0)
+                            .rounding(5.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Request Details").strong());
+                                ui.add_space(5.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Viewer:");
+                                    ui.label(&req.viewer);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Image:");
+                                    ui.label(&req.image_name);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Current views:");
+                                    ui.label(req.accep_views.to_string());
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Wants total:");
+                                    ui.label(req.prop_views.to_string());
+                                });
+                            });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Accept (1) or Reject (0):");
+                            ui.text_edit_singleline(&mut state.approve_views_input);
+                        });
+
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new("Enter 1 to accept, 0 to reject")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        state.show_approve_dialog = false;
+                        state.approve_views_input.clear();
+                        state.approve_error = None;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Submit").clicked() {
+                            // Validate input
+                            if state.approve_request_type == "access" {
+                                match state.approve_views_input.parse::<i64>() {
+                                    Ok(views) if views == -1 || views > 0 => {
+                                        state.approve_error = None;
+                                        state.show_approve_dialog = false;
+                                        state.status_message = "Processing approval...".to_string();
+                                    }
+                                    _ => {
+                                        state.approve_error = Some(
+                                            "Enter -1 to reject or a positive number to approve"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            } else {
+                                match state.approve_views_input.parse::<i32>() {
+                                    Ok(result) if result == 0 || result == 1 => {
+                                        state.approve_error = None;
+                                        state.show_approve_dialog = false;
+                                        state.status_message = "Processing approval...".to_string();
+                                    }
+                                    _ => {
+                                        state.approve_error =
+                                            Some("Enter 0 to reject or 1 to accept".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+        let should_send = state.status_message == "Processing approval...";
+        let request_type = state.approve_request_type.clone();
+        let request_index = state.approve_request_index;
+        let views_input = state.approve_views_input.clone();
+        let username = state.username.clone();
+        let middleware_addr = state.middleware_addr.clone();
+
+        let request_data = if request_type == "access" {
+            state
+                .pending_access_requests
+                .get(request_index)
+                .map(|r| (r.viewer.clone(), r.image_name.clone()))
+        } else {
+            state
+                .additional_views_requests
+                .get(request_index)
+                .map(|r| (r.viewer.clone(), r.image_name.clone()))
+        };
+
+        if !open {
+            state.show_approve_dialog = false;
+            state.approve_views_input.clear();
+            state.approve_error = None;
+        }
+
+        if should_send {
+            state.approve_views_input.clear();
+        }
+
+        drop(state);
+
+        if should_send {
+            if let Some((viewer, image_name)) = request_data {
+                let state_clone = Arc::clone(&self.state);
+                std::thread::spawn(move || {
+                    send_approval_request(
+                        request_type,
+                        username,
+                        viewer,
+                        image_name,
+                        views_input,
+                        middleware_addr,
+                        state_clone,
+                    );
+                });
+            }
+        }
+    }
+
     fn fetch_user_images(&self, username: &str) {
         let state = Arc::clone(&self.state);
         let username = username.to_string();
@@ -396,6 +632,184 @@ impl CloudP2PApp {
                 Err(e) => {
                     let mut s = state.lock().unwrap();
                     s.status_message = format!("Cannot connect to middleware: {}", e);
+                }
+            }
+        });
+    }
+
+    fn fetch_pending_requests(&self) {
+        let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.requests_loading = true;
+            s.requests_error = None;
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "ViewPendingRequests": {
+                    "request_id": request_id,
+                    "username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        let mut s = state.lock().unwrap();
+                        s.requests_loading = false;
+                        s.requests_error = Some(format!("Failed to read response: {}", e));
+                        return;
+                    }
+
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            if status == "OK" {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    if let Ok(requests) =
+                                        serde_json::from_str::<Vec<PendingRequest>>(output_path)
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.pending_access_requests = requests;
+                                        s.requests_loading = false;
+                                    }
+                                }
+                            } else {
+                                let mut s = state.lock().unwrap();
+                                s.requests_loading = false;
+                                s.requests_error = Some("Failed to fetch requests".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            let mut s = state.lock().unwrap();
+                            s.requests_loading = false;
+                            s.requests_error = Some(format!("Parse error: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.requests_loading = false;
+                    s.requests_error = Some(format!("Connection error: {}", e));
+                }
+            }
+        });
+    }
+
+    fn fetch_additional_views_requests(&self) {
+        let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.requests_loading = true;
+            s.requests_error = None;
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "GetAdditionalViewsRequests": {
+                    "request_id": request_id,
+                    "username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        let mut s = state.lock().unwrap();
+                        s.requests_loading = false;
+                        s.requests_error = Some(format!("Failed to read response: {}", e));
+                        return;
+                    }
+
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            if status == "OK" {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    if let Ok(requests) =
+                                        serde_json::from_str::<Vec<AdditionalViewsRequest>>(
+                                            output_path,
+                                        )
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.additional_views_requests = requests;
+                                        s.requests_loading = false;
+                                    }
+                                }
+                            } else {
+                                let mut s = state.lock().unwrap();
+                                s.requests_loading = false;
+                                s.requests_error = Some("Failed to fetch requests".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            let mut s = state.lock().unwrap();
+                            s.requests_loading = false;
+                            s.requests_error = Some(format!("Parse error: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.requests_loading = false;
+                    s.requests_error = Some(format!("Connection error: {}", e));
                 }
             }
         });
@@ -1398,13 +1812,137 @@ impl CloudP2PApp {
     }
 
     fn render_requests_tab(&self, ui: &mut egui::Ui) {
-        ui.heading("📬 Access Requests");
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.label("(Coming soon...)");
+        let state = self.state.lock().unwrap().clone(); // ✅ Already cloned here
+
+        ui.horizontal(|ui| {
+            ui.heading("📬 Access Requests");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🔄 Refresh All").clicked() {
+                    // ✅ Don't drop state here, we need it below
+                    self.fetch_pending_requests();
+                    self.fetch_additional_views_requests();
+                }
+            });
+        });
+
+        ui.add_space(10.0);
+
+        if state.requests_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading requests...");
+            });
+            return;
+        }
+
+        if let Some(error) = &state.requests_error {
+            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+            ui.add_space(10.0);
+        }
+
+        // ✅ Clone state for left column
+        let state_left = state.clone();
+        // ✅ Clone state for right column
+        let state_right = state.clone();
+
+        // Two columns: Access Requests | Additional Views Requests
+        ui.columns(2, |columns| {
+            // Left column: Access Requests
+            columns[0].heading("New Access Requests");
+            columns[0].add_space(5.0);
+
+            egui::ScrollArea::vertical()
+                .id_source("access_requests_scroll")
+                .max_height(400.0)
+                .show(&mut columns[0], |ui| {
+                    if state_left.pending_access_requests.is_empty() {
+                        ui.label("No pending access requests");
+                    } else {
+                        for (i, req) in state_left.pending_access_requests.iter().enumerate() {
+                            egui::Frame::none()
+                                .fill(ui.visuals().faint_bg_color)
+                                .inner_margin(10.0)
+                                .rounding(5.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&req.viewer).strong());
+                                        ui.label("wants");
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} views",
+                                                req.prop_views
+                                            ))
+                                            .color(egui::Color32::from_rgb(100, 150, 255)),
+                                        );
+                                    });
+                                    ui.label(format!("Image: {}", req.image_name));
+
+                                    ui.add_space(5.0);
+
+                                    if ui.button("Review Request").clicked() {
+                                        let mut s = self.state.lock().unwrap();
+                                        s.show_approve_dialog = true;
+                                        s.approve_request_type = "access".to_string();
+                                        s.approve_request_index = i;
+                                        s.approve_views_input = req.prop_views.to_string();
+                                        s.approve_error = None;
+                                    }
+                                });
+
+                            ui.add_space(5.0);
+                        }
+                    }
+                });
+
+            // Right column: Additional Views Requests
+            columns[1].heading("Additional Views Requests");
+            columns[1].add_space(5.0);
+
+            egui::ScrollArea::vertical()
+                .id_source("additional_views_scroll")
+                .max_height(400.0)
+                .show(&mut columns[1], |ui| {
+                    if state_right.additional_views_requests.is_empty() {
+                        ui.label("No additional views requests");
+                    } else {
+                        for (i, req) in state_right.additional_views_requests.iter().enumerate() {
+                            egui::Frame::none()
+                                .fill(ui.visuals().faint_bg_color)
+                                .inner_margin(10.0)
+                                .rounding(5.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&req.viewer).strong());
+                                        ui.label("wants");
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "+{} more views",
+                                                req.prop_views - req.accep_views
+                                            ))
+                                            .color(egui::Color32::from_rgb(255, 150, 100)),
+                                        );
+                                    });
+                                    ui.label(format!("Image: {}", req.image_name));
+                                    ui.label(format!("Current: {} views", req.accep_views));
+
+                                    ui.add_space(5.0);
+
+                                    if ui.button("Review Request").clicked() {
+                                        let mut s = self.state.lock().unwrap();
+                                        s.show_approve_dialog = true;
+                                        s.approve_request_type = "additional".to_string();
+                                        s.approve_request_index = i;
+                                        s.approve_views_input = "1".to_string();
+                                        s.approve_error = None;
+                                    }
+                                });
+
+                            ui.add_space(5.0);
+                        }
+                    }
+                });
         });
     }
-
     // =======================================
     // Action Methods
     // =======================================
@@ -1705,7 +2243,8 @@ impl eframe::App for CloudP2PApp {
             }
         });
         self.render_add_image_dialog(ctx);
-        self.render_request_access_dialog(ctx); // NEW LINE
+        self.render_request_access_dialog(ctx);
+        self.render_approve_dialog(ctx);
     }
 }
 
@@ -1868,6 +2407,89 @@ fn send_access_request(
         Err(e) => {
             let mut s = state.lock().unwrap();
             s.status_message = format!("Cannot connect to middleware: {}", e);
+        }
+    }
+}
+
+fn send_approval_request(
+    request_type: String,
+    owner: String,
+    viewer: String,
+    image_name: String,
+    views_input: String,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = if request_type == "access" {
+        let accep_views = views_input.parse::<i64>().unwrap_or(-1);
+        serde_json::json!({
+            "ApproveOrRejectAccess": {
+                "request_id": request_id,
+                "owner": owner,
+                "viewer": viewer,
+                "image_name": image_name,
+                "accep_views": accep_views,
+            }
+        })
+    } else {
+        let result = views_input.parse::<i32>().unwrap_or(0);
+        serde_json::json!({
+            "AcceptAdditionalViews": {
+                "request_id": request_id,
+                "owner": owner,
+                "viewer": viewer,
+                "image_name": image_name,
+                "result": result,
+            }
+        })
+    };
+
+    match TcpStream::connect(&middleware_addr) {
+        Ok(stream) => {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&request).unwrap();
+            writer.write_all(request_json.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            let mut response_line = String::new();
+            if let Err(e) = reader.read_line(&mut response_line) {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Failed to read response: {}", e);
+                return;
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                Ok(response) => {
+                    let status = response["status"].as_str().unwrap_or("ERROR");
+                    let message = response["message"].as_str().unwrap_or("Unknown");
+
+                    let mut s = state.lock().unwrap();
+                    if status == "OK" {
+                        s.status_message = format!("✓ {}", message);
+                    } else {
+                        s.status_message = format!("Failed: {}", message);
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Invalid response: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Cannot connect: {}", e);
         }
     }
 }
