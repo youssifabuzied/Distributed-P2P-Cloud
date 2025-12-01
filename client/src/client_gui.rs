@@ -2496,7 +2496,6 @@ impl CloudP2PApp {
                 ui.horizontal(|ui| {
                     ui.label("Image Path:");
                     ui.text_edit_singleline(&mut state.add_image_path);
-                    //CAN CAUSE THIS ERROR: /usr/bin/eog: symbol lookup error: /snap/core20/current/lib/x86_64-linux-gnu/libpthread.so.0: undefined symbol: __libc_pthread_init, version GLIBC_PRIVATE
                     if ui.button("📁 Browse").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Image", &["png", "jpg", "jpeg"])
@@ -2520,10 +2519,12 @@ impl CloudP2PApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_submit = !state.add_image_path.is_empty();
-                        if ui.add_enabled(can_submit, egui::Button::new("Upload")).clicked() {
+                        if ui
+                            .add_enabled(can_submit, egui::Button::new("Upload"))
+                            .clicked()
+                        {
                             if !std::path::Path::new(&state.add_image_path).exists() {
-                                state.add_image_error =
-                                    Some("File not found".to_string());
+                                state.add_image_error = Some("File not found".to_string());
                             } else {
                                 state.add_image_error = None;
                                 state.show_add_image_dialog = false;
@@ -2553,7 +2554,6 @@ impl CloudP2PApp {
             });
         }
     }
-
 }
 
 fn upload_image(
