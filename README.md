@@ -21,11 +21,11 @@ cd Distributed-P2P-Cloud
 # Step 3: Open the first terminal and run the server
 cargo run --bin server
 
-# Step 4: Open the second terminal and run the client
-cargo run --bin client_app
+# Step 4: Open the second terminal and run the client gui
+cargo run --bin client_gui
 
-# Step 5: Once the client is running, you can test commands directly.
-# For example, to encrypt a file:
-# Must be PNG
-encrypt resources/input.jpg user1=5
-decrypt client_storage/encrypted_input.png
+# Step 5: Open the third terminal and run the database
+cd database
+rm database.db
+python3 main.py
+

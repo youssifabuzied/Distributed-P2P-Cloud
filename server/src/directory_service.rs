@@ -6,11 +6,24 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
-// Multiple database URLs for replication
-const DIRECTORY_URLS: &[&str] = &[
-    "http://10.185.59.251:5000/api",
-    "http://10.185.59.183:5000/api",
-];
+use once_cell::sync::Lazy;
+use std::fs;
+
+pub static DIRECTORY_URLS: Lazy<Vec<String>> = Lazy::new(|| {
+    // Read server URLs from JSON once at startup
+    let urls: Vec<String> = if let Ok(text) = fs::read_to_string("server/database_urls.json") {
+        serde_json::from_str(&text).unwrap_or_else(|_| {
+            eprintln!("Failed to parse server_urls.json");
+            Vec::new()
+        })
+    } else {
+        eprintln!("Failed to read server_urls.json");
+        Vec::new()
+    };
+
+    // Append `/api` to match the previous DIRECTORY_URLS
+    urls.into_iter().map(|u| format!("{}/api", u)).collect()
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingAccessRequest {
@@ -37,7 +50,7 @@ async fn write_to_all_databases(
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
 
-    for &url in DIRECTORY_URLS {
+    for url in DIRECTORY_URLS.iter() {
         let client_clone = Arc::clone(&client);
         let tx_clone = Arc::clone(&tx);
         let payload_clone = payload.clone();
@@ -89,7 +102,7 @@ where
     let parse_fn = Arc::new(parse_response);
     let client = Arc::new(Client::new());
 
-    for &url in DIRECTORY_URLS {
+    for url in DIRECTORY_URLS.iter() {
         let tx_clone = Arc::clone(&tx);
         let parse_fn_clone = Arc::clone(&parse_fn);
         let client_clone = Arc::clone(&client);
