@@ -2262,23 +2262,6 @@ impl ClientMiddleware {
             request_id, parsed_views
         );
 
-        // Check if user has remaining views
-        match parsed_views.get_mut(username) {
-            Some(count) => {
-                if *count == 0 {
-                    return MiddlewareResponse::error(request_id, "No views remaining");
-                }
-                *count -= 1;
-                println!(
-                    "[ClientMiddleware] [Req #{}] User {} has {} views remaining",
-                    request_id, username, *count
-                );
-            }
-            None => {
-                return MiddlewareResponse::error(request_id, "User not authorized for this image");
-            }
-        }
-
         // Create temporary extraction directory
         let tmp_extract_dir = match tempfile::tempdir_in("/tmp") {
             Ok(dir) => dir,
