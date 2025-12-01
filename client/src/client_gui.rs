@@ -2475,13 +2475,10 @@ impl CloudP2PApp {
 
     fn render_add_image_dialog(&self, ctx: &egui::Context) {
         let mut state = self.state.lock().unwrap();
-
         if !state.show_add_image_dialog {
             return;
         }
-
         let mut open = true;
-
         egui::Window::new("Add Image")
             .open(&mut open)
             .collapsible(false)
@@ -2489,85 +2486,67 @@ impl CloudP2PApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
-
                 ui.heading("Upload New Image");
                 ui.add_space(10.0);
-
-                // Error message
                 if let Some(error) = &state.add_image_error {
                     ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
                     ui.add_space(10.0);
                 }
-
-                // Image path input
+                // File picker UI
                 ui.horizontal(|ui| {
                     ui.label("Image Path:");
                     ui.text_edit_singleline(&mut state.add_image_path);
+                    if ui.button("📁 Browse").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Image", &["png", "jpg", "jpeg"])
+                            .pick_file()
+                        {
+                            state.add_image_path = path.display().to_string();
+                            state.add_image_error = None;
+                            println!("[GUI] Selected image path: {}", state.add_image_path);
+                        }
+                    }
                 });
 
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new("Enter the full path to your image file")
-                        .small()
-                        .weak(),
-                );
                 ui.add_space(10.0);
-
                 ui.separator();
                 ui.add_space(10.0);
-
-                // Buttons
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         state.show_add_image_dialog = false;
                         state.add_image_path.clear();
                         state.add_image_error = None;
                     }
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_submit = !state.add_image_path.is_empty();
-
                         if ui
                             .add_enabled(can_submit, egui::Button::new("Upload"))
                             .clicked()
                         {
-                            // Check if file exists BEFORE clearing the path
                             if !std::path::Path::new(&state.add_image_path).exists() {
                                 state.add_image_error = Some("File not found".to_string());
                             } else {
-                                // Clear error and close dialog
                                 state.add_image_error = None;
                                 state.show_add_image_dialog = false;
-                                // Don't clear the path yet - we need it for upload!
                                 state.status_message = "Uploading image...".to_string();
                             }
                         }
                     });
                 });
             });
-
-        // Check if upload should be triggered (after the window is closed)
         let should_upload = state.status_message == "Uploading image...";
-        let path = state.add_image_path.clone(); // Clone BEFORE clearing
+        let path = state.add_image_path.clone();
         let username = state.username.clone();
         let middleware_addr = state.middleware_addr.clone();
-
-        // Handle close button
         if !open {
             state.show_add_image_dialog = false;
             state.add_image_path.clear();
             state.add_image_error = None;
         }
-
-        // Clear the path now if we're uploading
         if should_upload {
             state.add_image_path.clear();
         }
-
-        // Drop the lock before spawning thread
         drop(state);
-
-        // Perform upload in background thread if triggered
         if should_upload {
             let state_clone = Arc::clone(&self.state);
             std::thread::spawn(move || {

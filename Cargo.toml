@@ -45,7 +45,7 @@ sysinfo = "0.30"
 
 # GUI + utilities
 eframe = { version = "0.22", default-features = true }
-rfd = "0.9"
+rfd = "0.14.1"
 crossbeam-channel = "0.5"
 winapi = { version = "0.3", features = ["winuser"] }
 
