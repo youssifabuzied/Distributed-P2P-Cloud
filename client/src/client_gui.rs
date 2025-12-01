@@ -35,7 +35,14 @@ pub struct AccessRight {
     pub accepted_views: u64,
     pub views_used: u64,
 }
-
+// Helper struct to carry dialog state without holding the mutex
+#[derive(Clone)]
+struct DialogData {
+    owner: String,
+    image: String,
+    input: String,
+    error: Option<String>,
+}
 // =======================================
 // Application State
 // =======================================
@@ -545,13 +552,27 @@ impl CloudP2PApp {
     }
 
     fn render_request_additional_views_dialog(&self, ctx: &egui::Context) {
-        let mut state = self.state.lock().unwrap();
+        // PHASE 1: Extract ONLY the data we need — short lock, no UI yet
+        let dialog_data = {
+            let state = self.state.lock().unwrap();
 
-        if !state.show_request_additional_views_dialog {
-            return;
-        }
+            if !state.show_request_additional_views_dialog {
+                return; // Nothing to show
+            }
 
+            DialogData {
+                owner: state.additional_views_owner.clone(),
+                image: state.additional_views_image.clone(),
+                input: state.additional_views_input.clone(),
+                error: state.additional_views_error.clone(),
+            }
+        };
+        // Lock is dropped here automatically — critical!
+
+        let mut dialog_data = dialog_data; // Now owned and mutable
         let mut open = true;
+        let mut should_submit = false;
+        let mut should_cancel = false;
 
         egui::Window::new("Request Additional Views")
             .open(&mut open)
@@ -560,11 +581,10 @@ impl CloudP2PApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(400.0);
-
                 ui.heading("Request More Views");
                 ui.add_space(10.0);
 
-                if let Some(error) = &state.additional_views_error {
+                if let Some(ref error) = dialog_data.error {
                     ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
                     ui.add_space(10.0);
                 }
@@ -578,11 +598,11 @@ impl CloudP2PApp {
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.label("Owner:");
-                            ui.label(&state.additional_views_owner);
+                            ui.label(&dialog_data.owner);
                         });
                         ui.horizontal(|ui| {
                             ui.label("Image:");
-                            ui.label(&state.additional_views_image);
+                            ui.label(&dialog_data.image);
                         });
                     });
 
@@ -590,7 +610,7 @@ impl CloudP2PApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Additional views:");
-                    ui.text_edit_singleline(&mut state.additional_views_input);
+                    ui.text_edit_singleline(&mut dialog_data.input);
                 });
 
                 ui.add_space(5.0);
@@ -600,76 +620,88 @@ impl CloudP2PApp {
                         .weak(),
                 );
                 ui.add_space(10.0);
-
                 ui.separator();
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
-                        state.show_request_additional_views_dialog = false;
-                        state.additional_views_input.clear();
-                        state.additional_views_error = None;
+                        should_cancel = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_submit = !state.additional_views_input.is_empty();
+                        let can_submit = !dialog_data.input.trim().is_empty()
+                            && dialog_data.input.trim().parse::<u64>().is_ok();
 
                         if ui
                             .add_enabled(can_submit, egui::Button::new("Submit Request"))
                             .clicked()
                         {
-                            match state.additional_views_input.parse::<u64>() {
-                                Ok(views) if views > 0 => {
-                                    state.additional_views_error = None;
-                                    state.show_request_additional_views_dialog = false;
-                                    state.status_message =
-                                        "Requesting additional views...".to_string();
-                                }
-                                Ok(_) => {
-                                    state.additional_views_error =
-                                        Some("Views must be greater than 0".to_string());
-                                }
-                                Err(_) => {
-                                    state.additional_views_error =
-                                        Some("Please enter a valid number".to_string());
-                                }
-                            }
+                            should_submit = true;
                         }
                     });
                 });
             });
 
-        let should_send = state.status_message == "Requesting additional views...";
-        let owner = state.additional_views_owner.clone();
-        let image_name = state.additional_views_image.clone();
-        let views_str = state.additional_views_input.clone();
-        let viewer = state.username.clone();
-        let middleware_addr = state.middleware_addr.clone();
+        // PHASE 2: Write back changes — only if needed, and with short locks
+        {
+            let mut state = self.state.lock().unwrap();
 
-        if !open {
-            state.show_request_additional_views_dialog = false;
-            state.additional_views_input.clear();
-            state.additional_views_error = None;
-        }
+            if !open || should_cancel {
+                state.show_request_additional_views_dialog = false;
+                state.additional_views_input.clear();
+                state.additional_views_error = None;
+                state.additional_views_owner.clear();
+                state.additional_views_image.clear();
+                return;
+            }
 
-        if should_send {
-            state.additional_views_input.clear();
-        }
+            // Update input field in case user typed something
+            state.additional_views_input = dialog_data.input.clone();
 
-        drop(state);
+            if should_submit {
+                match dialog_data.input.trim().parse::<u64>() {
+                    Ok(views) if views > 0 => {
+                        state.additional_views_error = None;
+                        state.show_request_additional_views_dialog = false;
+                        state.status_message = "Requesting additional views...".to_string();
 
-        if should_send {
-            let state_clone = Arc::clone(&self.state);
-            std::thread::spawn(move || {
-                send_additional_views_request(
-                    owner,
-                    viewer,
-                    image_name,
-                    views_str,
-                    middleware_addr,
-                    state_clone,
-                );
-            });
+                        // Extract everything needed for the background thread
+                        let owner = state.additional_views_owner.clone();
+                        let image_name = state.additional_views_image.clone();
+                        let viewer = state.username.clone();
+                        let middleware_addr = state.middleware_addr.clone();
+                        let state_clone = Arc::clone(&self.state);
+
+                        // Clear fields immediately
+                        state.additional_views_input.clear();
+                        state.additional_views_owner.clear();
+                        state.additional_views_image.clear();
+
+                        // Drop lock BEFORE spawning thread
+                        drop(state);
+
+                        // Now safe to spawn
+                        std::thread::spawn(move || {
+                            send_additional_views_request(
+                                owner,
+                                viewer,
+                                image_name,
+                                views.to_string(),
+                                middleware_addr,
+                                state_clone,
+                            );
+                        });
+                    }
+                    Ok(_) => {
+                        state.additional_views_error =
+                            Some("Views must be greater than 0".to_string());
+                    }
+                    Err(_) => {
+                        state.additional_views_error =
+                            Some("Please enter a valid number".to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -2414,15 +2446,26 @@ impl CloudP2PApp {
         );
 
         if button_response.clicked() {
-            let mut s = self.state.lock().unwrap();
-            s.show_request_additional_views_dialog = true;
-            s.additional_views_owner = owner.to_string();
-            s.additional_views_image = image.name.clone();
-            s.additional_views_input = "5".to_string();
-            s.additional_views_error = None;
+            // DO NOT lock here — schedule the change for AFTER rendering
+            let state = Arc::clone(&self.state);
+            let owner = owner.to_string();
+            let image_name = image.name.clone();
+
+            ui.ctx().request_repaint(); // Ensure another frame runs
+
+            // Run this AFTER the current frame, when no lock is held
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut s = state.lock().unwrap();
+                s.show_request_additional_views_dialog = true;
+                s.additional_views_owner = owner;
+                s.additional_views_image = image_name;
+                s.additional_views_input = "5".to_string();
+                s.additional_views_error = None;
+            });
+
             return false; // Don't trigger card click
         }
-
         response.clicked()
     }
 
