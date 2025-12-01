@@ -4,13 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
 
 use once_cell::sync::Lazy;
 use std::fs;
 
 pub static DIRECTORY_URLS: Lazy<Vec<String>> = Lazy::new(|| {
-    // Read server URLs from JSON once at startup
     let urls: Vec<String> = if let Ok(text) = fs::read_to_string("server/server_urls.json") {
         serde_json::from_str(&text).unwrap_or_else(|_| {
             eprintln!("Failed to parse server_urls.json");
@@ -21,7 +19,6 @@ pub static DIRECTORY_URLS: Lazy<Vec<String>> = Lazy::new(|| {
         Vec::new()
     };
 
-    // Append `/api` to match the previous DIRECTORY_URLS
     urls.into_iter()
         .map(|u| format!("{}:5000/api", u))
         .collect()
@@ -57,7 +54,6 @@ async fn write_to_all_databases(
         let tx_clone = Arc::clone(&tx);
         let payload_clone = payload.clone();
         let url_clone = url.to_string();
-        let operation_clone = operation.to_string();
 
         tokio::spawn(async move {
             match client_clone
