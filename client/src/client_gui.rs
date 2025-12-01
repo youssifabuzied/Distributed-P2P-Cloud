@@ -1383,6 +1383,11 @@ impl CloudP2PApp {
                 eprintln!("Failed to read server_urls.json");
             }
 
+            server_urls = server_urls
+                .into_iter()
+                .map(|u| format!("{u}:8000"))
+                .collect();
+
             (ip, port, server_urls)
         };
 

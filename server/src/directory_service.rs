@@ -11,7 +11,7 @@ use std::fs;
 
 pub static DIRECTORY_URLS: Lazy<Vec<String>> = Lazy::new(|| {
     // Read server URLs from JSON once at startup
-    let urls: Vec<String> = if let Ok(text) = fs::read_to_string("server/database_urls.json") {
+    let urls: Vec<String> = if let Ok(text) = fs::read_to_string("server/server_urls.json") {
         serde_json::from_str(&text).unwrap_or_else(|_| {
             eprintln!("Failed to parse server_urls.json");
             Vec::new()
@@ -22,7 +22,9 @@ pub static DIRECTORY_URLS: Lazy<Vec<String>> = Lazy::new(|| {
     };
 
     // Append `/api` to match the previous DIRECTORY_URLS
-    urls.into_iter().map(|u| format!("{}/api", u)).collect()
+    urls.into_iter()
+        .map(|u| format!("{}:5000/api", u))
+        .collect()
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
