@@ -440,6 +440,8 @@ impl ServerMiddleware {
                 "/accept_additional_views",
                 post(accept_additional_views_handler),
             )
+            .route("/get_my_shared_images", post(get_my_shared_images_handler))
+            .route("/remove_image", post(remove_image_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
@@ -1750,6 +1752,72 @@ async fn accept_additional_views_handler(
                 "message": format!("Failed to process additional views request: {}", e),
             })))
         }
+    }
+}
+
+async fn get_my_shared_images_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Fetching shared images for: {}",
+        request_id, username
+    );
+
+    match directory_service::get_my_shared_images(username).await {
+        Ok(images) => {
+            let images_json: Vec<_> = images
+                .iter()
+                .map(|img| {
+                    serde_json::json!({
+                        "image_name": img.image_name,
+                        "viewer": img.viewer,
+                        "accep_views": img.accep_views
+                    })
+                })
+                .collect();
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "shared_images": images_json,
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to fetch shared images: {}", e),
+        }))),
+    }
+}
+
+async fn remove_image_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+    let image_name = payload["image_name"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Removing image: {} for user {}",
+        request_id, image_name, username
+    );
+
+    match directory_service::remove_image(username, image_name).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "success",
+            "message": format!("Image {} removed successfully", image_name),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to remove image: {}", e),
+        }))),
     }
 }
 

@@ -105,6 +105,15 @@ pub enum ClientRequest {
         image_name: String,
         result: i32,
     },
+    GetMySharedImages {
+        request_id: u64,
+        username: String,
+    },
+    RemoveImage {
+        request_id: u64,
+        username: String,
+        image_name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -115,6 +124,12 @@ pub struct MiddlewareResponse {
     pub output_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedImageInfo {
+    pub image_name: String,
+    pub viewer: String,
+    pub accep_views: u64,
+}
 #[derive(Debug, Clone)]
 pub enum RequestStatus {
     Pending,
@@ -208,6 +223,7 @@ pub struct Client {
     pub tracker: RequestTracker,
     pub pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     pub additional_views_requests: Arc<Mutex<Vec<AdditionalViewsRequest>>>,
+    pub my_shared_images: Arc<Mutex<Vec<SharedImageInfo>>>,
 }
 
 impl Client {
@@ -267,7 +283,21 @@ impl Client {
         );
         Ok(id)
     }
+    pub fn remove_image(&self, image_name: &str) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::RemoveImage {
+            request_id,
+            username: self.metadata.username.clone(),
+            image_name: image_name.to_string(),
+        };
 
+        let id = self.send_request_async(request);
+        println!(
+            "[Client] Queued remove image request #{} for '{}'",
+            id, image_name
+        );
+        Ok(id)
+    }
     pub fn get_additional_views_requests(&self) -> Result<u64, Box<dyn Error>> {
         let request_id = self.tracker.create_request();
         let request = ClientRequest::GetAdditionalViewsRequests {
@@ -711,7 +741,65 @@ impl Client {
         );
         Ok(id)
     }
+    pub fn get_my_shared_images(&self) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::GetMySharedImages {
+            request_id,
+            username: self.metadata.username.clone(),
+        };
 
+        let tracker = self.tracker.requests.clone();
+        let my_shared_images = self.my_shared_images.clone();
+        let middleware_addr = self.middleware_addr.clone();
+
+        self.tracker
+            .update_status(request_id, RequestStatus::InProgress);
+
+        thread::spawn(move || {
+            println!(
+                "[Client] [Req #{}] Fetching my shared images in background...",
+                request_id
+            );
+
+            match Client::send_request_sync(&middleware_addr, &request) {
+                Ok(response) => {
+                    println!("[Client] [Req #{}] ✓ Completed", request_id);
+
+                    if let Some(output_path) = &response.output_path {
+                        if let Ok(images) =
+                            serde_json::from_str::<Vec<SharedImageInfo>>(output_path)
+                        {
+                            let mut shared = my_shared_images.lock().unwrap();
+                            *shared = images.clone();
+                            println!(
+                                "[Client] [Req #{}] ✓ Stored {} shared images locally",
+                                request_id,
+                                images.len()
+                            );
+                        }
+                    }
+
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Completed(response));
+                }
+                Err(e) => {
+                    eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Failed(e.to_string()));
+                }
+            }
+        });
+
+        println!(
+            "[Client] Queued get my shared images #{} for '{}'",
+            request_id, self.metadata.username
+        );
+        Ok(request_id)
+    }
     fn resize_image_to_100x100(image_path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         // Open the image
         let img = ImageReader::open(image_path)?.decode()?;
@@ -766,6 +854,7 @@ impl Client {
             tracker: RequestTracker::new(),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             additional_views_requests: Arc::new(Mutex::new(Vec::new())),
+            my_shared_images: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -787,6 +876,8 @@ impl Client {
             ClientRequest::AddViews { request_id, .. } => *request_id,
             ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
             ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
+            ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
+            ClientRequest::RemoveImage { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -847,6 +938,26 @@ impl Client {
         // Parse response
         let response: MiddlewareResponse = serde_json::from_str(response_line.trim())?;
         Ok(response)
+    }
+    fn print_my_shared_images(images: &[SharedImageInfo]) {
+        println!("\n========================================");
+        println!("My Shared Images");
+        println!("========================================");
+
+        if images.is_empty() {
+            println!("No images currently shared with others");
+        } else {
+            println!("{:<20} {:<20} {:<10}", "Image", "Viewer", "Views");
+            println!("{}", "-".repeat(50));
+            for img in images {
+                println!(
+                    "{:<20} {:<20} {:<10}",
+                    img.image_name, img.viewer, img.accep_views
+                );
+            }
+        }
+
+        println!("========================================\n");
     }
     fn print_pending_requests(requests: &[PendingRequest]) {
         println!("\n========================================");
@@ -1098,6 +1209,8 @@ impl Client {
         // println!("  list                     - List all requests");
         // println!("  pending                  - Show pending count");
         println!("  exit                     - Exit the client");
+        println!("  view_my_shared_images            - View which users are viewing your images");
+        println!("  remove_image <image_name>        - Remove an image you own");
         println!("========================================");
 
         loop {
@@ -1154,6 +1267,43 @@ impl Client {
                             );
                         }
                         Err(e) => eprintln!("Error resizing image: {e}"),
+                    }
+                }
+                "remove_image" if tokens.len() == 2 => {
+                    let image_name = tokens[1];
+                    match self.remove_image(image_name) {
+                        Ok(id) => {
+                            println!("Request #{id} queued (removing image '{}')", image_name);
+
+                            println!("[Client] Waiting for response...");
+                            std::thread::sleep(Duration::from_secs(10));
+
+                            match self.tracker.get_status(id) {
+                                Some(RequestStatus::Completed(response)) => {
+                                    if response.status == "OK" {
+                                        println!("✓ Image '{}' removed successfully", image_name);
+                                        if let Some(msg) = &response.message {
+                                            println!("  {}", msg);
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "Error: {}",
+                                            response
+                                                .message
+                                                .as_ref()
+                                                .unwrap_or(&"Unknown error".to_string())
+                                        );
+                                    }
+                                }
+                                Some(RequestStatus::Failed(err)) => {
+                                    eprintln!("Failed to remove image: {}", err);
+                                }
+                                _ => {
+                                    println!("Request still in progress - check status later");
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
                     }
                 }
                 "encrypt" if tokens.len() == 3 => {
@@ -1548,6 +1698,28 @@ impl Client {
                         Err(e) => eprintln!("Error: {e}"),
                     }
                 }
+                "view_my_shared_images" => match self.get_my_shared_images() {
+                    Ok(id) => {
+                        println!("Request #{id} queued (fetching my shared images)");
+
+                        println!("[Client] Waiting for response...");
+                        std::thread::sleep(Duration::from_secs(10));
+
+                        match self.tracker.get_status(id) {
+                            Some(RequestStatus::Completed(_)) => {
+                                let shared = self.my_shared_images.lock().unwrap();
+                                Self::print_my_shared_images(&shared);
+                            }
+                            Some(RequestStatus::Failed(err)) => {
+                                eprintln!("Failed to fetch my shared images: {}", err);
+                            }
+                            _ => {
+                                println!("Request still in progress - please wait and try again");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error: {e}"),
+                },
                 "exit" => {
                     let pending = self.tracker.pending_count();
                     if pending > 0 {

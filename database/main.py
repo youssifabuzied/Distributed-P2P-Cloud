@@ -85,6 +85,7 @@ def add_image(image_name, image_bytes, user_name):
 def remove_image(image_name):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    print("Removing image:", image_name)
     cursor.execute("DELETE FROM Image WHERE image_name = ?", (image_name,))
     conn.commit()
     conn.close()
@@ -411,7 +412,31 @@ def modify_accepted_views(owner, viewer, image_name, change_views):
         print(f"Error modifying accepted views: {e}")
         conn.close()
         return False, None, f"Database error: {e}"
+def get_my_shared_images(username):
+    """
+    Get all images owned by a user that are currently shared with others (status = 1)
     
+    Args:
+        username: Username of the owner
+    
+    Returns:
+        list: List of tuples (image_name, viewer, accep_views)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT image_name, viewer, accep_views
+        FROM ImageAccess 
+        WHERE owner = ? AND status = 1
+        ORDER BY image_name, viewer
+    """, (username,))
+    
+    requests = cursor.fetchall()
+    conn.close()
+    return requests
+
+
 def request_additional_views(owner, viewer, image_name, additional_views):
     """
     Request additional views for an already approved access record
@@ -555,6 +580,25 @@ def accept_or_reject_additional_views(owner, viewer, image_name, result):
         conn.close()
         return False
     
+def remove_image(image_name, user_name):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Set accepted views to 0 for all access records of this image
+    cursor.execute("""
+        UPDATE ImageAccess 
+        SET accep_views = 0 
+        WHERE owner = ? AND image_name = ?
+    """, (user_name, image_name))
+    
+    # Delete the image
+    cursor.execute(
+        "DELETE FROM Image WHERE image_name = ? AND user_name = ?", 
+        (image_name, user_name)
+    )
+    
+    conn.commit()
+    conn.close()
 
 def client_status_worker():
     """Worker that sets status=0 for clients inactive > 10 seconds."""
@@ -616,6 +660,9 @@ def handle_request():
                 data.get('user_name'),
             )
             return jsonify({'status': 'success', 'message': 'Timestamp updated'}), 200
+        elif operation == 'remove_image':
+            remove_image(data.get('image_name'), data.get('user_name'))
+            return jsonify({'status': 'success', 'message': 'Image removed'}), 200
 
         elif operation == 'remove_client':
             remove_client(data.get('user_name'))
@@ -776,7 +823,15 @@ def handle_request():
                     for r in requests
                 ]
             }), 200
-        
+        elif operation == 'get_my_shared_images':
+            requests = get_my_shared_images(data.get('user_name'))
+            return jsonify({
+                'status': 'success',
+                'shared_images': [
+                    {'image_name': r[0], 'viewer': r[1], 'accep_views': r[2]}
+                    for r in requests
+                ]
+            }), 200
         elif operation == 'accept_or_reject_additional_views':
             owner = data.get('owner')
             viewer = data.get('viewer')

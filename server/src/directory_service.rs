@@ -32,6 +32,13 @@ pub struct PendingAccessRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedImageInfo {
+    pub image_name: String,
+    pub viewer: String,
+    pub accep_views: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdditionalViewsRequest {
     pub viewer: String,
     pub image_name: String,
@@ -453,4 +460,51 @@ pub async fn accept_or_reject_additional_views(
     );
 
     write_to_all_databases("accept_or_reject_additional_views", &payload).await
+}
+
+pub async fn get_my_shared_images(
+    username: &str,
+) -> Result<Vec<SharedImageInfo>, Box<dyn Error + Send + Sync>> {
+    let payload = json!({
+        "operation": "get_my_shared_images",
+        "user_name": username,
+    });
+
+    read_from_one_database("get_my_shared_images", &payload, |body| {
+        let mut images = Vec::new();
+        if let Some(arr) = body["shared_images"].as_array() {
+            for r in arr {
+                images.push(SharedImageInfo {
+                    image_name: r["image_name"]
+                        .as_str()
+                        .ok_or("Missing image_name")?
+                        .to_string(),
+                    viewer: r["viewer"].as_str().ok_or("Missing viewer")?.to_string(),
+                    accep_views: r["accep_views"].as_u64().ok_or("Missing accep_views")?,
+                });
+            }
+        }
+        Ok(images)
+    })
+    .await
+}
+
+pub async fn remove_image(
+    username: &str,
+    image_name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let payload = json!({
+        "operation": "remove_image",
+        "user_name": username,
+        "image_name": image_name,
+    });
+
+    println!(
+        "[Directory Service] Removing image: {} for user {} from {} databases",
+        image_name,
+        username,
+        DIRECTORY_URLS.len()
+    );
+
+    write_to_all_databases("remove_image", &payload).await
 }

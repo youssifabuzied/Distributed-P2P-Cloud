@@ -15,6 +15,7 @@ use chacha20poly1305::{
 };
 use hex;
 use png::{Decoder, Encoder};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -117,6 +118,15 @@ pub enum ClientRequest {
         image_name: String,
         result: i32,
     },
+    GetMySharedImages {
+        request_id: u64,
+        username: String,
+    },
+    RemoveImage {
+        request_id: u64,
+        username: String,
+        image_name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -135,6 +145,12 @@ pub struct AdditionalViewsRequest {
     pub accep_views: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedImageInfo {
+    pub image_name: String,
+    pub viewer: String,
+    pub accep_views: u64,
+}
 // Add this near the top with other structures
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ImageMetadata {
@@ -559,6 +575,8 @@ impl ClientMiddleware {
                     ClientRequest::AddViews { request_id, .. } => *request_id,
                     ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
                     ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
+                    ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
+                    ClientRequest::RemoveImage { request_id, .. } => *request_id,
                 };
 
                 // Forward to appropriate handler
@@ -745,6 +763,12 @@ impl ClientMiddleware {
             ClientRequest::AddViews { request_id, .. } => *request_id,
             ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
             ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
+            ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
+            ClientRequest::RemoveImage {
+                request_id,
+                username,
+                image_name,
+            } => *request_id,
             _ => 0,
         };
 
@@ -826,7 +850,26 @@ impl ClientMiddleware {
                     }
                 })
             }
+            ClientRequest::RemoveImage {
+                username,
+                image_name,
+                ..
+            } => Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "username": username,
+                    "image_name": image_name,
+                });
+                let url = format!("{}/remove_image", server_url);
 
+                match Self::make_request_with_timeout(&url, payload) {
+                    Ok(resp) if resp.status == "success" => {
+                        MiddlewareResponse::success(request_id, &resp.message, None)
+                    }
+                    Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                    Err(e) => MiddlewareResponse::error(request_id, &e),
+                }
+            }),
             ClientRequest::FetchActiveUsers { .. } => {
                 Self::try_servers_sequentially(server_urls, request_id, |server_url| {
                     let payload = serde_json::json!({ "request_id": request_id });
@@ -977,7 +1020,51 @@ impl ClientMiddleware {
                     }
                 })
             }
+            ClientRequest::GetMySharedImages { username, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                    });
+                    let url = format!("{}/get_my_shared_images", server_url);
 
+                    match Self::make_json_request_with_timeout(&url, payload) {
+                        Ok(json_resp) => {
+                            let status = json_resp["status"].as_str().unwrap_or("error");
+                            if status == "success" {
+                                if let Some(images_array) = json_resp["shared_images"].as_array() {
+                                    let images: Vec<SharedImageInfo> = images_array
+                                        .iter()
+                                        .filter_map(|img| {
+                                            Some(SharedImageInfo {
+                                                image_name: img["image_name"].as_str()?.to_string(),
+                                                viewer: img["viewer"].as_str()?.to_string(),
+                                                accep_views: img["accep_views"].as_u64()?,
+                                            })
+                                        })
+                                        .collect();
+                                    let images_json =
+                                        serde_json::to_string(&images).unwrap_or_default();
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        "Shared images fetched",
+                                        Some(images_json),
+                                    )
+                                } else {
+                                    MiddlewareResponse::error(
+                                        request_id,
+                                        "No shared images in response",
+                                    )
+                                }
+                            } else {
+                                let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                                MiddlewareResponse::error(request_id, msg)
+                            }
+                        }
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
+            }
             ClientRequest::ApproveOrRejectAccess {
                 owner,
                 viewer,
@@ -1850,6 +1937,7 @@ impl ClientMiddleware {
 
         Ok(())
     }
+
     fn send_register_to_server(
         server_urls: &[String],
         request_id: u64,
