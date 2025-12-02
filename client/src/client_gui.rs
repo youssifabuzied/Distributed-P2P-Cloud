@@ -129,6 +129,10 @@ struct AppState {
     additional_views_image: String,
     additional_views_input: String,
     additional_views_error: Option<String>,
+
+    show_delete_confirmation: bool,
+    delete_target_image: String,
+    delete_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -178,6 +182,9 @@ impl Default for AppState {
             additional_views_image: String::new(),
             additional_views_input: String::new(),
             additional_views_error: None,
+            show_delete_confirmation: false,
+            delete_target_image: String::new(),
+            delete_error: None,
         }
     }
 }
@@ -550,7 +557,86 @@ impl CloudP2PApp {
             }
         }
     }
+    fn render_delete_confirmation_dialog(&self, ctx: &egui::Context) {
+        let mut state = self.state.lock().unwrap();
 
+        if !state.show_delete_confirmation {
+            return;
+        }
+
+        let mut open = true;
+        let mut should_delete = false;
+
+        egui::Window::new("Delete Image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.heading("⚠️ Confirm Deletion");
+                ui.add_space(10.0);
+
+                if let Some(error) = &state.delete_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+                    ui.add_space(10.0);
+                }
+
+                ui.label(format!(
+                    "Are you sure you want to delete '{}'?",
+                    state.delete_target_image
+                ));
+                ui.label(
+                    egui::RichText::new("This action cannot be undone.")
+                        .small()
+                        .weak(),
+                );
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        state.show_delete_confirmation = false;
+                        state.delete_target_image.clear();
+                        state.delete_error = None;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("🗑️ Delete")
+                                    .fill(egui::Color32::from_rgb(200, 50, 50)),
+                            )
+                            .clicked()
+                        {
+                            should_delete = true;
+                        }
+                    });
+                });
+            });
+
+        let image_name = state.delete_target_image.clone();
+        let username = state.username.clone();
+        let middleware_addr = state.middleware_addr.clone();
+
+        if !open {
+            state.show_delete_confirmation = false;
+            state.delete_target_image.clear();
+            state.delete_error = None;
+        }
+
+        drop(state);
+
+        if should_delete {
+            let state_clone = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                send_delete_image_request(image_name, username, middleware_addr, state_clone);
+            });
+        }
+    }
     fn render_request_additional_views_dialog(&self, ctx: &egui::Context) {
         // PHASE 1: Extract ONLY the data we need — short lock, no UI yet
         let dialog_data = {
@@ -1791,6 +1877,7 @@ impl CloudP2PApp {
                 ui.add_space(20.0);
 
                 // Selected image details
+                // Selected image details
                 if let Some(selected_idx) = state.selected_image {
                     if let Some(selected_image) = state.my_images.get(selected_idx) {
                         ui.separator();
@@ -1799,50 +1886,17 @@ impl CloudP2PApp {
                         ui.heading(format!("Selected: {}", selected_image.name));
                         ui.add_space(10.0);
 
-                        // Access rights section
                         egui::Frame::none()
                             .fill(ui.visuals().faint_bg_color)
                             .inner_margin(15.0)
                             .rounding(5.0)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Current Access Rights").strong());
-                                ui.add_space(5.0);
-
-                                if let Some(access_list) =
-                                    state.image_access_rights.get(&selected_image.name)
-                                {
-                                    if access_list.is_empty() {
-                                        ui.label("No users have access yet");
-                                    } else {
-                                        for access in access_list {
-                                            ui.horizontal(|ui| {
-                                                ui.label("•");
-                                                ui.label(&access.viewer);
-                                                ui.label("-");
-                                                let remaining = access
-                                                    .accepted_views
-                                                    .saturating_sub(access.views_used);
-                                                ui.label(format!(
-                                                    "{} / {} views remaining",
-                                                    remaining, access.accepted_views
-                                                ));
-                                            });
-                                        }
-                                    }
-                                } else {
-                                    ui.label("No users have access yet");
-                                }
-
-                                ui.add_space(10.0);
-
                                 ui.horizontal(|ui| {
-                                    if ui.button("👁️ View Sharing").clicked() {
-                                        self.state.lock().unwrap().show_view_sharing_dialog = true;
-                                    }
-
                                     if ui.button("🗑️ Delete Image").clicked() {
-                                        self.state.lock().unwrap().status_message =
-                                            "Delete not yet implemented".to_string();
+                                        let mut s = self.state.lock().unwrap();
+                                        s.show_delete_confirmation = true;
+                                        s.delete_target_image = selected_image.name.clone();
+                                        s.delete_error = None;
                                     }
                                 });
                             });
@@ -2751,6 +2805,7 @@ impl eframe::App for CloudP2PApp {
         self.render_request_access_dialog(ctx);
         self.render_approve_dialog(ctx);
         self.render_request_additional_views_dialog(ctx);
+        self.render_delete_confirmation_dialog(ctx);
     }
 }
 
@@ -2919,7 +2974,82 @@ fn send_access_request(
         }
     });
 }
+fn send_delete_image_request(
+    image_name: String,
+    username: String,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
 
+    println!("[GUI] Deleting image: {}", image_name);
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = serde_json::json!({
+        "RemoveImage": {
+            "request_id": request_id,
+            "username": username,
+            "image_name": image_name,
+        }
+    });
+
+    match TcpStream::connect(&middleware_addr) {
+        Ok(stream) => {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&request).unwrap();
+            writer.write_all(request_json.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            let mut response_line = String::new();
+            if let Err(e) = reader.read_line(&mut response_line) {
+                let mut s = state.lock().unwrap();
+                s.status_message = format!("Failed to read response: {}", e);
+                s.show_delete_confirmation = false;
+                return;
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                Ok(response) => {
+                    let status = response["status"].as_str().unwrap_or("ERROR");
+                    let message = response["message"].as_str().unwrap_or("Unknown");
+
+                    let mut s = state.lock().unwrap();
+                    if status == "OK" {
+                        // Remove image from local list
+                        s.my_images.retain(|img| img.name != image_name);
+                        s.selected_image = None;
+                        s.status_message = format!("✓ Image '{}' deleted successfully", image_name);
+                        s.show_delete_confirmation = false;
+                        s.delete_target_image.clear();
+                    } else {
+                        s.delete_error = Some(message.to_string());
+                        s.status_message = format!("Failed to delete: {}", message);
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.delete_error = Some(format!("Invalid response: {}", e));
+                    s.status_message = format!("Failed to delete: Invalid response");
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.delete_error = Some(format!("Connection error: {}", e));
+            s.status_message = format!("Cannot connect to middleware: {}", e);
+        }
+    }
+}
 fn send_approval_request(
     request_type: String,
     owner: String,
