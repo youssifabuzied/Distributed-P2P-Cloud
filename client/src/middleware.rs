@@ -507,10 +507,16 @@ impl ClientMiddleware {
         Ok(())
     }
 
+    // Replace handle_client_request in client/src/middleware.rs with this debug version:
+
     fn handle_client_request(
         stream: TcpStream,
         server_urls: &[String],
     ) -> Result<(), Box<dyn Error>> {
+        println!("[ClientMiddleware] ========================================");
+        println!("[ClientMiddleware] New TCP connection received");
+        println!("[ClientMiddleware] ========================================");
+
         let mut reader = BufReader::new(&stream);
         let mut writer = stream.try_clone()?;
 
@@ -518,26 +524,40 @@ impl ClientMiddleware {
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
 
+        println!(
+            "[ClientMiddleware] Raw request received: {}",
+            request_line.trim()
+        );
+
         if request_line.trim().is_empty() {
+            println!("[ClientMiddleware] Empty request - returning");
             return Ok(());
         }
 
         // Try to parse as JSON to determine request type
-        let json_value: serde_json::Value = serde_json::from_str(request_line.trim())?;
+        let json_value: serde_json::Value = match serde_json::from_str(request_line.trim()) {
+            Ok(val) => {
+                println!("[ClientMiddleware] Successfully parsed as JSON");
+                val
+            }
+            Err(e) => {
+                println!("[ClientMiddleware] Failed to parse as JSON: {}", e);
+                return Err(Box::new(e));
+            }
+        };
 
-        // Check if this is a delivery request (ReceiveEncryptedImage)
         // Check if this is a delivery request (ReceiveEncryptedImage)
         if let Some(req_type) = json_value["type"].as_str() {
+            println!("[ClientMiddleware] Request type field found: {}", req_type);
             if req_type == "ReceiveEncryptedImage" {
                 println!("[ClientMiddleware] Received encrypted image delivery");
-
+                // ... (keep existing delivery handling)
                 let request_id = json_value["request_id"].as_u64().unwrap_or(0);
-                let owner = json_value["owner"].as_str().unwrap_or("unknown"); // ✅ Extract owner
+                let owner = json_value["owner"].as_str().unwrap_or("unknown");
                 let image_name = json_value["image_name"].as_str().unwrap_or("");
                 let encrypted_data_b64 = json_value["encrypted_data"].as_str().unwrap_or("");
-                let accepted_views = json_value["accepted_views"].as_u64().unwrap_or(0); // ✅ Extract accepted_views
+                let accepted_views = json_value["accepted_views"].as_u64().unwrap_or(0);
 
-                // ✅ Handle the delivery with new parameters
                 let response = Self::handle_receive_encrypted_image(
                     request_id,
                     owner,
@@ -546,7 +566,6 @@ impl ClientMiddleware {
                     accepted_views,
                 );
 
-                // Send acknowledgment back
                 let response_json = serde_json::to_string(&response)?;
                 writer.write_all(response_json.as_bytes())?;
                 writer.write_all(b"\n")?;
@@ -554,11 +573,41 @@ impl ClientMiddleware {
 
                 return Ok(());
             }
+        } else {
+            println!("[ClientMiddleware] No 'type' field found - treating as ClientRequest");
         }
 
         // Otherwise, parse as normal ClientRequest
+        println!("[ClientMiddleware] Parsing as ClientRequest...");
         let response = match serde_json::from_str::<ClientRequest>(request_line.trim()) {
             Ok(request) => {
+                println!("[ClientMiddleware] Successfully parsed ClientRequest");
+
+                // Log the request type
+                let req_name = match &request {
+                    ClientRequest::EncryptImage { .. } => "EncryptImage",
+                    ClientRequest::DecryptImage { .. } => "DecryptImage",
+                    ClientRequest::RegisterWithDirectory { .. } => "RegisterWithDirectory",
+                    ClientRequest::AddImage { .. } => "AddImage",
+                    ClientRequest::Heartbeat { .. } => "Heartbeat",
+                    ClientRequest::FetchActiveUsers { .. } => "FetchActiveUsers",
+                    ClientRequest::FetchUserImages { .. } => "FetchUserImages",
+                    ClientRequest::RequestImageAccess { .. } => "RequestImageAccess",
+                    ClientRequest::ViewPendingRequests { .. } => "ViewPendingRequests",
+                    ClientRequest::ApproveOrRejectAccess { .. } => "ApproveOrRejectAccess",
+                    ClientRequest::GetAcceptedViews { .. } => "GetAcceptedViews",
+                    ClientRequest::ModifyViews { .. } => "ModifyViews",
+                    ClientRequest::AddViews { .. } => "AddViews",
+                    ClientRequest::GetAdditionalViewsRequests { .. } => {
+                        "GetAdditionalViewsRequests"
+                    }
+                    ClientRequest::AcceptAdditionalViews { .. } => "AcceptAdditionalViews",
+                    ClientRequest::GetMySharedImages { .. } => "GetMySharedImages",
+                    ClientRequest::RemoveImage { .. } => "RemoveImage",
+                };
+
+                println!("[ClientMiddleware] Request type: {}", req_name);
+
                 let request_id = match &request {
                     ClientRequest::EncryptImage { request_id, .. } => *request_id,
                     ClientRequest::DecryptImage { request_id, .. } => *request_id,
@@ -579,6 +628,9 @@ impl ClientMiddleware {
                     ClientRequest::RemoveImage { request_id, .. } => *request_id,
                 };
 
+                println!("[ClientMiddleware] Request ID: {}", request_id);
+                println!("[ClientMiddleware] Forwarding to servers...");
+
                 // Forward to appropriate handler
                 Self::forward_to_servers(server_urls, request)
             }
@@ -589,6 +641,7 @@ impl ClientMiddleware {
         };
 
         // Send response back to client
+        println!("[ClientMiddleware] Sending response back to client...");
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes())?;
         writer.write_all(b"\n")?;
@@ -601,7 +654,6 @@ impl ClientMiddleware {
 
         Ok(())
     }
-
     // New handler for receiving encrypted images
     // New handler for receiving encrypted images
     fn handle_receive_encrypted_image(
@@ -764,11 +816,7 @@ impl ClientMiddleware {
             ClientRequest::GetAdditionalViewsRequests { request_id, .. } => *request_id,
             ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
             ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
-            ClientRequest::RemoveImage {
-                request_id,
-                username,
-                image_name,
-            } => *request_id,
+            ClientRequest::RemoveImage { request_id, .. } => *request_id,
             _ => 0,
         };
 
@@ -861,7 +909,10 @@ impl ClientMiddleware {
                     "image_name": image_name,
                 });
                 let url = format!("{}/remove_image", server_url);
-
+                println!(
+                    "[ClientMiddleware] [Req #{}] Sending remove image request to server {}",
+                    request_id, server_url
+                );
                 match Self::make_request_with_timeout(&url, payload) {
                     Ok(resp) if resp.status == "success" => {
                         MiddlewareResponse::success(request_id, &resp.message, None)
