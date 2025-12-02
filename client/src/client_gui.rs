@@ -8,6 +8,7 @@ use middleware::ClientMiddleware;
 
 use crate::client::AdditionalViewsRequest;
 use crate::client::PendingRequest;
+use crate::client::SharedImageInfo;
 use eframe::egui;
 use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,13 @@ struct AppState {
     show_delete_confirmation: bool,
     delete_target_image: String,
     delete_error: Option<String>,
+    // Add these fields to AppState struct (around line 100-150)
+    show_modify_views_dialog: bool,
+    modify_views_target_user: String,
+    modify_views_image_name: String,
+    modify_views_input: String,
+    modify_views_error: Option<String>,
+    selected_image_shared_users: Vec<SharedImageInfo>, // Already exists, ensure it's there
 }
 
 impl Default for AppState {
@@ -170,6 +178,7 @@ impl Default for AppState {
             requests_loading: false,
             requests_error: None,
             show_approve_dialog: false,
+
             approve_request_type: String::new(),
             approve_request_index: 0,
             approve_views_input: String::new(),
@@ -185,6 +194,12 @@ impl Default for AppState {
             show_delete_confirmation: false,
             delete_target_image: String::new(),
             delete_error: None,
+            show_modify_views_dialog: false,
+            modify_views_target_user: String::new(),
+            modify_views_image_name: String::new(),
+            modify_views_input: String::new(),
+            modify_views_error: None,
+            selected_image_shared_users: Vec::new(),
         }
     }
 }
@@ -790,7 +805,77 @@ impl CloudP2PApp {
             }
         }
     }
+    fn fetch_shared_users_for_image(&self, image_name: &str) {
+        let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+        let image_name = image_name.to_string();
 
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "GetMySharedImages": {
+                    "request_id": request_id,
+                    "username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Ok(_) = reader.read_line(&mut response_line) {
+                        if let Ok(response) =
+                            serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                        {
+                            if response["status"].as_str() == Some("OK") {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    if let Ok(all_shared) =
+                                        serde_json::from_str::<Vec<SharedImageInfo>>(output_path)
+                                    {
+                                        // Filter for only this image
+                                        let filtered: Vec<SharedImageInfo> = all_shared
+                                            .into_iter()
+                                            .filter(|info| info.image_name == image_name)
+                                            .collect();
+                                        {
+                                        let mut s = state.lock().unwrap();
+                                        s.selected_image_shared_users = filtered;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch shared users: {}", e);
+                }
+            }
+        });
+    }
     fn fetch_user_images(&self, username: &str) {
         let state = Arc::clone(&self.state);
         let username = username.to_string();
@@ -1402,15 +1487,8 @@ impl CloudP2PApp {
 
         // Only spawn loading thread once per image
         if should_load {
-            let ctx = ui.ctx().clone();
-            let image_name = image.name.clone();
-            let image_path = image.path.clone();
-            let self_clone = Arc::new(self.clone());
-
-            std::thread::spawn(move || {
-                self_clone.load_image_texture(&ctx, &image_name, &image_path);
-                ctx.request_repaint();
-            });
+            self.load_image_texture(ui.ctx(), &image.name, &image.path);
+            ui.ctx().request_repaint();
         }
         // Image info text
         let text_y = image_rect.max.y + 5.0;
@@ -1446,34 +1524,41 @@ impl CloudP2PApp {
         response.clicked()
     }
 
-    fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
-        let mut state = self.state.lock().unwrap();
+        fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
+            // Quick check with minimal lock
+            {
+                let state = self.state.lock().unwrap();
+                if state.image_textures.contains_key(image_name) {
+                    return;
+                }
+            } // Release lock
+    
+            // Decode image OFF the mutex
+            let color_image = match image::io::Reader::open(image_path) {
+                Ok(reader) => match reader.decode() {
+                    Ok(dynamic_image) => {
+                        let size = [
+                            dynamic_image.width() as usize,
+                            dynamic_image.height() as usize,
+                        ];
+                        let image_buffer = dynamic_image.to_rgba8();
+                        let raw = image_buffer.into_raw();
+                        Some(egui::ColorImage::from_rgba_unmultiplied(size, &raw))
+                    }
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
 
-        // Don't reload if already loaded
-        if state.image_textures.contains_key(image_name) {
-            return;
-        }
+        if let Some(ci) = color_image {
+            // Load texture (safe on UI thread)
+            let texture = ctx.load_texture(image_name, ci, egui::TextureOptions::LINEAR);
 
-        // Try to load the image
-        if let Ok(image) = image::io::Reader::open(image_path) {
-            if let Ok(dynamic_image) = image.decode() {
-                let size = [
-                    dynamic_image.width() as usize,
-                    dynamic_image.height() as usize,
-                ];
-                let image_buffer = dynamic_image.to_rgba8();
-                let pixels = image_buffer.as_flat_samples();
-
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-
-                let texture =
-                    ctx.load_texture(image_name, color_image, egui::TextureOptions::LINEAR);
-
-                state.image_textures.insert(image_name.to_string(), texture);
-            }
+            // Insert with brief lock hold
+            let mut state = self.state.lock().unwrap();
+            state.image_textures.insert(image_name.to_string(), texture);
         }
     }
-
     fn start_middleware(&mut self) {
         if self.middleware_started {
             return;
@@ -1878,6 +1963,7 @@ impl CloudP2PApp {
 
                 // Selected image details
                 // Selected image details
+                // Selected image details - REPLACE existing section starting around line 850
                 if let Some(selected_idx) = state.selected_image {
                     if let Some(selected_image) = state.my_images.get(selected_idx) {
                         ui.separator();
@@ -1899,6 +1985,49 @@ impl CloudP2PApp {
                                         s.delete_error = None;
                                     }
                                 });
+
+                                ui.add_space(15.0);
+                                ui.separator();
+                                ui.add_space(15.0);
+
+                                // Shared with section
+                                ui.heading("Shared With:");
+                                ui.add_space(5.0);
+
+                                if state.selected_image_shared_users.is_empty() {
+                                    ui.label("Not shared with anyone yet");
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .id_source("shared_users_scroll")
+                                        .max_height(200.0)
+                                        .show(ui, |ui| {
+                                            for shared_info in &state.selected_image_shared_users {
+                                                egui::Frame::none()
+                                                    .fill(ui.visuals().extreme_bg_color)
+                                                    .inner_margin(8.0)
+                                                    .rounding(3.0)
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new(&shared_info.viewer).strong());
+                                                            ui.label("-");
+                                                            ui.label(format!("{} views", shared_info.accep_views));
+                                                            
+                                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                if ui.button("✏️ Modify Views").clicked() {
+                                                                    let mut s = self.state.lock().unwrap();
+                                                                    s.show_modify_views_dialog = true;
+                                                                    s.modify_views_target_user = shared_info.viewer.clone();
+                                                                    s.modify_views_image_name = selected_image.name.clone();
+                                                                    s.modify_views_input = shared_info.accep_views.to_string();
+                                                                    s.modify_views_error = None;
+                                                                }
+                                                            });
+                                                        });
+                                                    });
+                                                ui.add_space(5.0);
+                                            }
+                                        });
+                                }
                             });
                     }
                 }
@@ -1907,6 +2036,151 @@ impl CloudP2PApp {
             // ✅ Update selected_image AFTER the UI is done rendering
             if let Some(idx) = clicked_idx {
                 self.state.lock().unwrap().selected_image = Some(idx);
+            }
+        }
+    }
+    fn render_modify_views_dialog(&self, ctx: &egui::Context) {
+        let dialog_data = {
+            let state = self.state.lock().unwrap();
+
+            if !state.show_modify_views_dialog {
+                return;
+            }
+
+            (
+                state.modify_views_target_user.clone(),
+                state.modify_views_image_name.clone(),
+                state.modify_views_input.clone(),
+                state.modify_views_error.clone(),
+            )
+        };
+
+        let (target_user, image_name, mut input, error) = dialog_data;
+        let mut open = true;
+        let mut should_submit = false;
+        let mut should_cancel = false;
+
+        egui::Window::new("Modify Views")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.heading("Modify Accepted Views");
+                ui.add_space(10.0);
+
+                if let Some(ref err) = error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                    ui.add_space(10.0);
+                }
+
+                egui::Frame::none()
+                    .fill(ui.visuals().faint_bg_color)
+                    .inner_margin(10.0)
+                    .rounding(5.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Details").strong());
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("User:");
+                            ui.label(&target_user);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Image:");
+                            ui.label(&image_name);
+                        });
+                    });
+
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("New accepted views:");
+                    ui.text_edit_singleline(&mut input);
+                });
+
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("Enter the new total number of accepted views")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        should_cancel = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_submit = !input.trim().is_empty() && input.trim().parse::<i64>().is_ok();
+
+                        if ui
+                            .add_enabled(can_submit, egui::Button::new("Update Views"))
+                            .clicked()
+                        {
+                            should_submit = true;
+                        }
+                    });
+                });
+            });
+
+        {
+            let mut state = self.state.lock().unwrap();
+
+            if !open || should_cancel {
+                state.show_modify_views_dialog = false;
+                state.modify_views_input.clear();
+                state.modify_views_error = None;
+                state.modify_views_target_user.clear();
+                state.modify_views_image_name.clear();
+                return;
+            }
+
+            state.modify_views_input = input.clone();
+
+            if should_submit {
+                match input.trim().parse::<i64>() {
+                    Ok(change_views) => {
+                        state.modify_views_error = None;
+                        state.show_modify_views_dialog = false;
+                        state.status_message = "Updating views...".to_string();
+
+                        let owner = state.username.clone();
+                        let viewer = state.modify_views_target_user.clone();
+                        let image_name_clone = state.modify_views_image_name.clone();
+                        let middleware_addr = state.middleware_addr.clone();
+                        let state_clone = Arc::clone(&self.state);
+                        let selected_image_name = image_name.clone();
+                        let app_clone = Arc::new(self.clone());
+
+                        state.modify_views_input.clear();
+                        state.modify_views_target_user.clear();
+                        state.modify_views_image_name.clear();
+
+                        drop(state);
+
+                        std::thread::spawn(move || {
+                            send_modify_views_request(
+                                owner,
+                                viewer,
+                                image_name_clone.clone(),
+                                change_views,
+                                middleware_addr,
+                                state_clone.clone(),
+                            );
+                            
+                            // Refresh the shared users list after modification
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            app_clone.fetch_shared_users_for_image(&selected_image_name);
+                        });
+                    }
+                    Err(_) => {
+                        state.modify_views_error = Some("Please enter a valid number".to_string());
+                    }
+                }
             }
         }
     }
@@ -1951,6 +2225,12 @@ impl CloudP2PApp {
             egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 100.0));
 
         // Try to load texture if not already loaded
+                // Try to load texture if not already loaded
+        let should_load = {
+            let state = self.state.lock().unwrap();
+            !state.image_textures.contains_key(&image.name)
+        };
+
         let state = self.state.lock().unwrap();
         if let Some(texture) = state.image_textures.get(&image.name) {
             // Draw the actual image texture
@@ -1968,20 +2248,14 @@ impl CloudP2PApp {
                 egui::FontId::proportional(40.0),
                 egui::Color32::from_gray(150),
             );
-
-            // Trigger loading in background
-            drop(state);
-            let ctx = ui.ctx().clone();
-            let image_name = image.name.clone();
-            let image_path = image.path.clone();
-            let self_clone = Arc::new(self.clone());
-
-            std::thread::spawn(move || {
-                self_clone.load_image_texture(&ctx, &image_name, &image_path);
-                ctx.request_repaint();
-            });
         }
+        drop(state);
 
+        // ✅ Load on UI thread instead of spawning background thread
+        if should_load {
+            self.load_image_texture(ui.ctx(), &image.name, &image.path);
+            ui.ctx().request_repaint();
+        }
         // Image info
         let text_y = image_rect.max.y + 5.0;
         let name_pos = egui::pos2(content_rect.min.x, text_y);
@@ -2014,8 +2288,13 @@ impl CloudP2PApp {
         );
 
         // Return whether it was clicked (don't lock here!)
-        response.clicked()
-    }
+        let was_clicked = response.clicked();
+        if was_clicked {
+            // Trigger fetch of shared users for this image
+            self.fetch_shared_users_for_image(&image.name);
+        }
+        was_clicked   
+     }
 
     fn render_discover_tab(&self, ui: &mut egui::Ui) {
         ui.heading("🔍 Discover Images");
@@ -2425,17 +2704,10 @@ impl CloudP2PApp {
                 egui::Color32::from_gray(150),
             );
 
-            // Load texture in background
+            // ✅ Load on UI thread instead of background thread
             drop(state);
-            let ctx = ui.ctx().clone();
-            let image_name = image.name.clone();
-            let image_path = image.path.clone();
-            let self_clone: Arc<CloudP2PApp> = Arc::new(self.clone());
-
-            std::thread::spawn(move || {
-                self_clone.load_image_texture(&ctx, &image_name, &image_path);
-                ctx.request_repaint();
-            });
+            self.load_image_texture(ui.ctx(), &image.name, &image.path);
+            ui.ctx().request_repaint();
         }
 
         // Image info
@@ -2806,6 +3078,7 @@ impl eframe::App for CloudP2PApp {
         self.render_approve_dialog(ctx);
         self.render_request_additional_views_dialog(ctx);
         self.render_delete_confirmation_dialog(ctx);
+        self.render_modify_views_dialog(ctx);
     }
 }
 
@@ -2973,6 +3246,71 @@ fn send_access_request(
             }
         }
     });
+}
+fn send_modify_views_request(
+    owner: String,
+    viewer: String,
+    image_name: String,
+    change_views: i64,
+    middleware_addr: String,
+    state: Arc<Mutex<AppState>>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    // Calculate change_views (new - current is handled server-side, we send absolute)
+    // The database expects change_views, so we need to get current first
+    // For simplicity, we'll send the new value and let middleware handle it
+    
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // We send as ModifyViews but with absolute value
+    // The middleware will calculate the difference
+    let request = serde_json::json!({
+        "ModifyViews": {
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+            "change_views": change_views,  // Note: This should be the NEW total, not the change
+        }
+    });
+
+    match TcpStream::connect(&middleware_addr) {
+        Ok(stream) => {
+            let mut reader = BufReader::new(&stream);
+            let mut writer = stream.try_clone().unwrap();
+
+            let request_json = serde_json::to_string(&request).unwrap();
+            writer.write_all(request_json.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            let mut response_line = String::new();
+            if let Ok(_) = reader.read_line(&mut response_line) {
+                if let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                    let status = response["status"].as_str().unwrap_or("ERROR");
+                    let message = response["message"].as_str().unwrap_or("Unknown");
+
+                    let mut s = state.lock().unwrap();
+                    if status == "OK" {
+                        s.status_message = format!("✓ Views updated for {}", viewer);
+                    } else {
+                        s.status_message = format!("Failed: {}", message);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap();
+            s.status_message = format!("Cannot connect: {}", e);
+        }
+    }
 }
 fn send_delete_image_request(
     image_name: String,
