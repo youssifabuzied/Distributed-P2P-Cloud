@@ -1263,6 +1263,14 @@ impl CloudP2PApp {
 
     fn fetch_shared_images(&self) {
         let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
 
         {
             let mut s = state.lock().unwrap();
@@ -1273,7 +1281,6 @@ impl CloudP2PApp {
         std::thread::spawn(move || {
             let storage_dir = "shared_images";
 
-            // Check if directory exists
             if !std::path::Path::new(storage_dir).exists() {
                 let mut s = state.lock().unwrap();
                 s.shared_images_loading = false;
@@ -1289,12 +1296,10 @@ impl CloudP2PApp {
                         if let Ok(entry) = entry {
                             let path = entry.path();
 
-                            // Skip metadata files
                             if path.to_string_lossy().contains("_metadata.json") {
                                 continue;
                             }
 
-                            // Only process image files
                             if let Some(ext) = path.extension() {
                                 let ext_str = ext.to_string_lossy().to_lowercase();
                                 if ext_str == "png" || ext_str == "jpg" || ext_str == "jpeg" {
@@ -1304,7 +1309,6 @@ impl CloudP2PApp {
                                         .unwrap_or("unknown")
                                         .to_string();
 
-                                    // Read metadata
                                     let metadata_filename = format!(
                                         "{}_metadata.json",
                                         path.file_stem()
@@ -1317,7 +1321,7 @@ impl CloudP2PApp {
                                     if let Ok(metadata_json) =
                                         std::fs::read_to_string(&metadata_path)
                                     {
-                                        if let Ok(metadata) =
+                                        if let Ok(mut metadata) =
                                             serde_json::from_str::<serde_json::Value>(
                                                 &metadata_json,
                                             )
@@ -1326,6 +1330,27 @@ impl CloudP2PApp {
                                                 .as_str()
                                                 .unwrap_or("unknown")
                                                 .to_string();
+
+                                            // ✅ SYNC WITH SERVER
+                                            if let Ok(server_views) = sync_views_with_server(
+                                                &middleware_addr,
+                                                &owner,
+                                                &username,
+                                                &image_name,
+                                            ) {
+                                                metadata["accepted_views"] =
+                                                    serde_json::json!(server_views);
+                                                // Save updated metadata
+                                                if let Ok(updated_json) =
+                                                    serde_json::to_string_pretty(&metadata)
+                                                {
+                                                    let _ = std::fs::write(
+                                                        &metadata_path,
+                                                        updated_json,
+                                                    );
+                                                }
+                                            }
+
                                             let accepted_views =
                                                 metadata["accepted_views"].as_u64().unwrap_or(0);
                                             let views_count =
@@ -1338,7 +1363,7 @@ impl CloudP2PApp {
                                                     name: image_name.clone(),
                                                     size: file_meta.len() as usize,
                                                     path: path.to_string_lossy().to_string(),
-                                                    shared_count: remaining as usize, // Store remaining views
+                                                    shared_count: remaining as usize,
                                                 });
                                             }
                                         }
@@ -3885,6 +3910,72 @@ fn view_shared_image_background(
         "✓ Viewed '{}' ({}/{} views used)",
         image_name, views_count, accepted_views
     );
+}
+
+fn sync_views_with_server(
+    middleware_addr: &str,
+    owner: &str,
+    viewer: &str,
+    image_name: &str,
+) -> Result<u64, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request = serde_json::json!({
+        "GetAcceptedViews": {
+            "request_id": request_id,
+            "owner": owner,
+            "viewer": viewer,
+            "image_name": image_name,
+        }
+    });
+
+    let stream =
+        TcpStream::connect(middleware_addr).map_err(|e| format!("Connection failed: {}", e))?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("Clone failed: {}", e))?;
+
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("Serialization failed: {}", e))?;
+
+    writer
+        .write_all(request_json.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|e| format!("Write newline failed: {}", e))?;
+    writer.flush().map_err(|e| format!("Flush failed: {}", e))?;
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| format!("Read failed: {}", e))?;
+
+    let response = serde_json::from_str::<serde_json::Value>(&response_line.trim())
+        .map_err(|e| format!("Parse failed: {}", e))?;
+
+    if response["status"].as_str() == Some("OK") {
+        if let Some(message) = response["message"].as_str() {
+            // Extract number from message like "Approved: 10 views remaining"
+            for word in message.split_whitespace() {
+                if let Ok(views) = word.parse::<u64>() {
+                    return Ok(views);
+                }
+            }
+        }
+    }
+
+    Err("Failed to extract views from response".to_string())
 }
 
 // =======================================
