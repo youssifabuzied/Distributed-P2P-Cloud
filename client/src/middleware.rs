@@ -364,55 +364,66 @@ impl ClientMiddleware {
     }
 
     // Helper: Fetch viewer's IP from server
+    // Helper: Fetch viewer's IP from server
     fn fetch_viewer_ip_from_server(
         server_urls: &[String],
         request_id: u64,
         viewer: &str,
     ) -> Result<String, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+        Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+            let payload = serde_json::json!({
+                "request_id": request_id,
+            });
+            let url = format!("{}/fetch_users", server_url);
 
-        let server_url = &server_urls[0];
-        let url = format!("{}/fetch_users", server_url);
+            println!(
+                "[ClientMiddleware] [Req #{}] Fetching active users from {} to find viewer IP...",
+                request_id, server_url
+            );
 
-        let payload = serde_json::json!({
-            "request_id": request_id,
-        });
-
-        println!(
-            "[ClientMiddleware] [Req #{}] Fetching active users to find viewer IP...",
-            request_id
-        );
-
-        match client.post(&url).json(&payload).send() {
-            Ok(response) => match response.json::<serde_json::Value>() {
+            match Self::make_json_request_with_timeout(&url, payload) {
                 Ok(json_resp) => {
-                    let message = json_resp["message"].as_str().unwrap_or("");
+                    let status = json_resp["status"].as_str().unwrap_or("error");
+                    if status == "success" {
+                        let message = json_resp["message"].as_str().unwrap_or("");
 
-                    // Parse the message to extract user list
-                    // Format: "  username - ip\n  username - ip\n..."
-                    for line in message.lines() {
-                        let parts: Vec<&str> = line.trim().split(" - ").collect();
-                        if parts.len() == 2 {
-                            let username = parts[0].trim();
-                            let ip = parts[1].trim();
+                        // Parse the message to extract user list
+                        // Format: "  username - ip\n  username - ip\n..."
+                        for line in message.lines() {
+                            let parts: Vec<&str> = line.trim().split(" - ").collect();
+                            if parts.len() == 2 {
+                                let username = parts[0].trim();
+                                let ip = parts[1].trim();
 
-                            if username == viewer {
-                                return Ok(ip.to_string());
+                                if username == viewer {
+                                    println!(
+                                        "[ClientMiddleware] [Req #{}] ✓ Found viewer '{}' with IP: {}",
+                                        request_id, viewer, ip
+                                    );
+                                    return MiddlewareResponse::success(
+                                        request_id,
+                                        &format!("Found viewer IP: {}", ip),
+                                        Some(ip.to_string()),
+                                    );
+                                }
                             }
                         }
+
+                        MiddlewareResponse::error(
+                            request_id,
+                            &format!("Viewer '{}' not found in active users", viewer),
+                        )
+                    } else {
+                        let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                        MiddlewareResponse::error(request_id, msg)
                     }
-
-                    Err(format!("Viewer '{}' not found in active users", viewer))
                 }
-                Err(e) => Err(format!("Failed to parse response: {}", e)),
-            },
-            Err(e) => Err(format!("Failed to contact server: {}", e)),
-        }
+                Err(e) => MiddlewareResponse::error(request_id, &e),
+            }
+        })
+        .output_path
+        .ok_or_else(|| "Failed to retrieve viewer IP from any server".to_string())
     }
-
     // Helper: Send encrypted image to viewer's middleware via TCP
     fn send_encrypted_to_viewer(
         request_id: u64,
@@ -1987,104 +1998,5 @@ impl ClientMiddleware {
         })?;
 
         Ok(())
-    }
-
-    fn send_register_to_server(
-        server_urls: &[String],
-        request_id: u64,
-        username: &str,
-        ip: &str,
-    ) -> MiddlewareResponse {
-        println!(
-            "[ClientMiddleware] [Req #{}] Forwarding registration to server: {} {}",
-            request_id, username, ip
-        );
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-
-        // Try first available server
-        let server_url = &server_urls[0];
-        let url = format!("{}/register", server_url);
-
-        let payload = serde_json::json!({
-            "request_id": request_id,
-            "username": username,
-            "ip": ip,
-        });
-
-        match client.post(&url).json(&payload).send() {
-            Ok(response) => match response.json::<ServerResponse>() {
-                Ok(server_resp) => {
-                    if server_resp.status == "success" {
-                        MiddlewareResponse::success(request_id, &server_resp.message, None)
-                    } else {
-                        MiddlewareResponse::error(request_id, &server_resp.message)
-                    }
-                }
-                Err(e) => MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to parse response: {}", e),
-                ),
-            },
-            Err(e) => {
-                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-            }
-        }
-    }
-    fn send_add_image_to_server(
-        server_urls: &[String],
-        request_id: u64,
-        username: &str,
-        image_name: &str,
-        image_bytes: &[u8],
-    ) -> MiddlewareResponse {
-        println!(
-            "[ClientMiddleware] [Req #{}] Forwarding add image to server: {} {} ({} bytes)",
-            request_id,
-            username,
-            image_name,
-            image_bytes.len()
-        );
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
-
-        // Try first available server
-        let server_url = &server_urls[0];
-        let url = format!("{}/add_image", server_url);
-
-        // Encode image data as base64 for JSON transport
-        let image_bytes_b64 = general_purpose::STANDARD.encode(image_bytes);
-
-        let payload = serde_json::json!({
-            "request_id": request_id,
-            "username": username,
-            "image_name": image_name,
-            "image_bytes": image_bytes_b64,
-        });
-
-        match client.post(&url).json(&payload).send() {
-            Ok(response) => match response.json::<ServerResponse>() {
-                Ok(server_resp) => {
-                    if server_resp.status == "success" {
-                        MiddlewareResponse::success(request_id, &server_resp.message, None)
-                    } else {
-                        MiddlewareResponse::error(request_id, &server_resp.message)
-                    }
-                }
-                Err(e) => MiddlewareResponse::error(
-                    request_id,
-                    &format!("Failed to parse response: {}", e),
-                ),
-            },
-            Err(e) => {
-                MiddlewareResponse::error(request_id, &format!("Failed to contact server: {}", e))
-            }
-        }
     }
 }
