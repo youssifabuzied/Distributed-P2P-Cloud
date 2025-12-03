@@ -861,8 +861,8 @@ impl CloudP2PApp {
                                             .filter(|info| info.image_name == image_name)
                                             .collect();
                                         {
-                                        let mut s = state.lock().unwrap();
-                                        s.selected_image_shared_users = filtered;
+                                            let mut s = state.lock().unwrap();
+                                            s.selected_image_shared_users = filtered;
                                         }
                                     }
                                 }
@@ -986,6 +986,98 @@ impl CloudP2PApp {
                 Err(e) => {
                     let mut s = state.lock().unwrap();
                     s.status_message = format!("Cannot connect to middleware: {}", e);
+                }
+            }
+        });
+    }
+
+    fn start_fetch_my_own_images(state: Arc<Mutex<AppState>>) {
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.status_message = "Loading your images...".to_string();
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "FetchUserImages": {
+                    "request_id": request_id,
+                    "target_username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Ok(_) = reader.read_line(&mut response_line) {
+                        if let Ok(response) =
+                            serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                        {
+                            if response["status"].as_str() == Some("OK") {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    if let Ok(json) =
+                                        serde_json::from_str::<serde_json::Value>(output_path)
+                                    {
+                                        if let Some(images_array) = json["images"].as_array() {
+                                            let mut images = Vec::new();
+                                            for img in images_array {
+                                                let name = img["image_name"]
+                                                    .as_str()
+                                                    .unwrap_or("unknown")
+                                                    .to_string();
+                                                let size =
+                                                    img["size"].as_u64().unwrap_or(0) as usize;
+                                                let path =
+                                                    img["path"].as_str().unwrap_or("").to_string();
+
+                                                images.push(ImageInfo {
+                                                    name,
+                                                    size,
+                                                    path,
+                                                    shared_count: 0, // Will be updated separately
+                                                });
+                                            }
+
+                                            let mut s = state.lock().unwrap();
+                                            s.my_images = images.clone();
+                                            s.status_message =
+                                                format!("✓ Loaded {} images", images.len());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = format!("Failed to load images: {}", e);
                 }
             }
         });
@@ -1524,31 +1616,31 @@ impl CloudP2PApp {
         response.clicked()
     }
 
-        fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
-            // Quick check with minimal lock
-            {
-                let state = self.state.lock().unwrap();
-                if state.image_textures.contains_key(image_name) {
-                    return;
+    fn load_image_texture(&self, ctx: &egui::Context, image_name: &str, image_path: &str) {
+        // Quick check with minimal lock
+        {
+            let state = self.state.lock().unwrap();
+            if state.image_textures.contains_key(image_name) {
+                return;
+            }
+        } // Release lock
+
+        // Decode image OFF the mutex
+        let color_image = match image::io::Reader::open(image_path) {
+            Ok(reader) => match reader.decode() {
+                Ok(dynamic_image) => {
+                    let size = [
+                        dynamic_image.width() as usize,
+                        dynamic_image.height() as usize,
+                    ];
+                    let image_buffer = dynamic_image.to_rgba8();
+                    let raw = image_buffer.into_raw();
+                    Some(egui::ColorImage::from_rgba_unmultiplied(size, &raw))
                 }
-            } // Release lock
-    
-            // Decode image OFF the mutex
-            let color_image = match image::io::Reader::open(image_path) {
-                Ok(reader) => match reader.decode() {
-                    Ok(dynamic_image) => {
-                        let size = [
-                            dynamic_image.width() as usize,
-                            dynamic_image.height() as usize,
-                        ];
-                        let image_buffer = dynamic_image.to_rgba8();
-                        let raw = image_buffer.into_raw();
-                        Some(egui::ColorImage::from_rgba_unmultiplied(size, &raw))
-                    }
-                    Err(_) => None,
-                },
                 Err(_) => None,
-            };
+            },
+            Err(_) => None,
+        };
 
         if let Some(ci) = color_image {
             // Load texture (safe on UI thread)
@@ -1636,6 +1728,7 @@ impl CloudP2PApp {
         }
 
         // Perform registration in background thread
+        let state_clone = Arc::clone(&self.state);
         thread::spawn(move || {
             use std::io::{BufRead, BufReader, Write};
             use std::net::TcpStream;
@@ -1689,19 +1782,24 @@ impl CloudP2PApp {
                             let status = response["status"].as_str().unwrap_or("ERROR");
                             let message = response["message"].as_str().unwrap_or("Unknown");
 
-                            let mut state = state.lock().unwrap();
                             if status == "OK" {
-                                state.connection_status = ConnectionStatus::Connected;
-                                state.status_message = format!("✓ {}", message);
-                                state.heartbeat_active = true;
+                                let mut s = state.lock().unwrap();
+                                s.connection_status = ConnectionStatus::Connected;
+                                s.status_message = format!("✓ {}", message);
+                                s.heartbeat_active = true;
 
                                 // Start heartbeat
                                 start_heartbeat(username.clone(), middleware_addr.clone());
+
+                                let state_clone_2 = Arc::clone(&state_clone);
+                                drop(s); // Release lock before calling fetch
+                                Self::start_fetch_my_own_images(state_clone_2);
+                                Self::start_fetch_my_own_images(state_clone);
                             } else {
-                                state.connection_status =
-                                    ConnectionStatus::Error(message.to_string());
-                                state.registration_error = Some(message.to_string());
-                                state.status_message = format!("✗ {}", message);
+                                let mut s = state.lock().unwrap();
+                                s.connection_status = ConnectionStatus::Error(message.to_string());
+                                s.registration_error = Some(message.to_string());
+                                s.status_message = format!("✗ {}", message);
                             }
                         }
                         Err(e) => {
@@ -2011,7 +2109,6 @@ impl CloudP2PApp {
                                                             ui.label(egui::RichText::new(&shared_info.viewer).strong());
                                                             ui.label("-");
                                                             ui.label(format!("{} views", shared_info.accep_views));
-                                                            
                                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                                 if ui.button("✏️ Modify Views").clicked() {
                                                                     let mut s = self.state.lock().unwrap();
@@ -2115,7 +2212,8 @@ impl CloudP2PApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_submit = !input.trim().is_empty() && input.trim().parse::<i64>().is_ok();
+                        let can_submit =
+                            !input.trim().is_empty() && input.trim().parse::<i64>().is_ok();
 
                         if ui
                             .add_enabled(can_submit, egui::Button::new("Update Views"))
@@ -2171,7 +2269,7 @@ impl CloudP2PApp {
                                 middleware_addr,
                                 state_clone.clone(),
                             );
-                            
+
                             // Refresh the shared users list after modification
                             std::thread::sleep(std::time::Duration::from_secs(2));
                             app_clone.fetch_shared_users_for_image(&selected_image_name);
@@ -2225,7 +2323,7 @@ impl CloudP2PApp {
             egui::Rect::from_min_size(content_rect.min, egui::vec2(content_rect.width(), 100.0));
 
         // Try to load texture if not already loaded
-                // Try to load texture if not already loaded
+        // Try to load texture if not already loaded
         let should_load = {
             let state = self.state.lock().unwrap();
             !state.image_textures.contains_key(&image.name)
@@ -2293,8 +2391,8 @@ impl CloudP2PApp {
             // Trigger fetch of shared users for this image
             self.fetch_shared_users_for_image(&image.name);
         }
-        was_clicked   
-     }
+        was_clicked
+    }
 
     fn render_discover_tab(&self, ui: &mut egui::Ui) {
         ui.heading("🔍 Discover Images");
@@ -3261,7 +3359,7 @@ fn send_modify_views_request(
     // Calculate change_views (new - current is handled server-side, we send absolute)
     // The database expects change_views, so we need to get current first
     // For simplicity, we'll send the new value and let middleware handle it
-    
+
     let request_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3293,7 +3391,9 @@ fn send_modify_views_request(
 
             let mut response_line = String::new();
             if let Ok(_) = reader.read_line(&mut response_line) {
-                if let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                if let Ok(response) =
+                    serde_json::from_str::<serde_json::Value>(&response_line.trim())
+                {
                     let status = response["status"].as_str().unwrap_or("ERROR");
                     let message = response["message"].as_str().unwrap_or("Unknown");
 
