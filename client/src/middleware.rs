@@ -42,6 +42,10 @@ pub enum ClientRequest {
         image_path: String,
         views: HashMap<String, u64>, // Map of peer ID to allowed views
     },
+    GetMyRequests {
+        request_id: u64,
+        username: String,
+    },
     DecryptImage {
         request_id: u64,
         image_path: String,
@@ -145,6 +149,14 @@ pub struct AdditionalViewsRequest {
     pub accep_views: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyRequestInfo {
+    pub image_name: String,
+    pub owner: String,
+    pub status_text: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedImageInfo {
     pub image_name: String,
@@ -535,10 +547,10 @@ impl ClientMiddleware {
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
 
-        println!(
-            "[ClientMiddleware] Raw request received: {}",
-            request_line.trim()
-        );
+        // println!(
+        //     "[ClientMiddleware] Raw request received: {}",
+        //     request_line.trim()
+        // );
 
         if request_line.trim().is_empty() {
             println!("[ClientMiddleware] Empty request - returning");
@@ -615,6 +627,7 @@ impl ClientMiddleware {
                     ClientRequest::AcceptAdditionalViews { .. } => "AcceptAdditionalViews",
                     ClientRequest::GetMySharedImages { .. } => "GetMySharedImages",
                     ClientRequest::RemoveImage { .. } => "RemoveImage",
+                    ClientRequest::GetMyRequests { .. } => "GetMyRequests",
                 };
 
                 println!("[ClientMiddleware] Request type: {}", req_name);
@@ -637,6 +650,7 @@ impl ClientMiddleware {
                     ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
                     ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
                     ClientRequest::RemoveImage { request_id, .. } => *request_id,
+                    ClientRequest::GetMyRequests { request_id, .. } => *request_id,
                 };
 
                 println!("[ClientMiddleware] Request ID: {}", request_id);
@@ -828,6 +842,7 @@ impl ClientMiddleware {
             ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
             ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
             ClientRequest::RemoveImage { request_id, .. } => *request_id,
+            ClientRequest::GetMyRequests { request_id, .. } => *request_id,
             _ => 0,
         };
 
@@ -840,7 +855,52 @@ impl ClientMiddleware {
                 println!("[ClientMiddleware] I am encrypting");
                 Self::send_encrypt_to_multiple_servers(server_urls, request_id, &image_path, views)
             }
+            ClientRequest::GetMyRequests { username, .. } => {
+                Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "username": username,
+                    });
+                    let url = format!("{}/get_my_requests", server_url);
 
+                    match Self::make_json_request_with_timeout(&url, payload) {
+                        Ok(json_resp) => {
+                            let status = json_resp["status"].as_str().unwrap_or("error");
+                            if status == "success" {
+                                if let Some(requests_array) = json_resp["requests"].as_array() {
+                                    let requests: Vec<MyRequestInfo> = requests_array
+                                        .iter()
+                                        .filter_map(|req| {
+                                            Some(MyRequestInfo {
+                                                image_name: req["image_name"].as_str()?.to_string(),
+                                                owner: req["owner"].as_str()?.to_string(),
+                                                status_text: req["status_text"]
+                                                    .as_str()?
+                                                    .to_string(),
+                                                prop_views: req["prop_views"].as_u64()?,
+                                                accep_views: req["accep_views"].as_u64()?,
+                                            })
+                                        })
+                                        .collect();
+                                    let requests_json =
+                                        serde_json::to_string(&requests).unwrap_or_default();
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        "My requests fetched",
+                                        Some(requests_json),
+                                    )
+                                } else {
+                                    MiddlewareResponse::error(request_id, "No requests in response")
+                                }
+                            } else {
+                                let msg = json_resp["message"].as_str().unwrap_or("Unknown error");
+                                MiddlewareResponse::error(request_id, msg)
+                            }
+                        }
+                        Err(e) => MiddlewareResponse::error(request_id, &e),
+                    }
+                })
+            }
             ClientRequest::DecryptImage {
                 request_id,
                 image_path,
@@ -1134,8 +1194,21 @@ impl ClientMiddleware {
                 accep_views,
                 ..
             } => {
-                let response =
-                    Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                let start_time = Instant::now();
+
+                println!(
+                    "[ClientMiddleware] [Req #{}] [⏱️ START] ApproveOrRejectAccess workflow",
+                    request_id
+                );
+
+                // If rejecting (accep_views == -1), just update database
+                if accep_views == -1 {
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [⏱️ REJECT] Rejecting request (accep_views = -1)",
+                        request_id
+                    );
+
+                    return Self::try_servers_sequentially(server_urls, request_id, |server_url| {
                         let payload = serde_json::json!({
                             "request_id": request_id,
                             "owner": owner,
@@ -1147,32 +1220,113 @@ impl ClientMiddleware {
 
                         match Self::make_request_with_timeout(&url, payload) {
                             Ok(resp) if resp.status == "success" => {
+                                println!(
+                                    "[ClientMiddleware] [Req #{}] [⏱️ DONE] Rejection recorded in database",
+                                    request_id
+                                );
                                 MiddlewareResponse::success(request_id, &resp.message, None)
                             }
                             Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
                             Err(e) => MiddlewareResponse::error(request_id, &e),
                         }
                     });
+                }
 
-                // Post-approval workflow if successful
-                if response.status == "OK" && accep_views > 0 {
+                // For approval (accep_views > 0): First send image, then update database
+                println!(
+                    "[ClientMiddleware] [Req #{}] [⏱️ APPROVE] Approving request with {} views",
+                    request_id, accep_views
+                );
+
+                // Step 1: Send encrypted image to viewer
+                let step1_start = Instant::now();
+                println!(
+                    "[ClientMiddleware] [Req #{}] [⏱️ STEP 1] Encrypting and delivering image to viewer...",
+                    request_id
+                );
+
+                let image_delivery_result = ClientMiddleware::handle_post_approval(
+                    server_urls,
+                    request_id,
+                    &owner,
+                    &viewer,
+                    &image_name,
+                    accep_views as u64,
+                );
+
+                let step1_elapsed = step1_start.elapsed().as_millis();
+                println!(
+                    "[ClientMiddleware] [Req #{}] [⏱️ STEP 1 DONE] Image delivery completed in {}ms",
+                    request_id, step1_elapsed
+                );
+
+                // Step 2: Only update database if image delivery succeeded
+                if image_delivery_result.status == "OK" {
+                    let step2_start = Instant::now();
                     println!(
-                        "[ClientMiddleware] [Req #{}] Initiating post-approval workflow...",
+                        "[ClientMiddleware] [Req #{}] [⏱️ STEP 2] Image delivered successfully, updating database...",
                         request_id
                     );
-                    let server_urls_vec = server_urls.to_vec();
-                    return ClientMiddleware::handle_post_approval(
-                        &server_urls_vec,
-                        request_id,
-                        &owner,
-                        &viewer,
-                        &image_name,
-                        accep_views as u64,
-                    );
-                }
-                response
-            }
 
+                    let db_result =
+                        Self::try_servers_sequentially(server_urls, request_id, |server_url| {
+                            let payload = serde_json::json!({
+                                "request_id": request_id,
+                                "owner": owner,
+                                "viewer": viewer,
+                                "image_name": image_name,
+                                "accep_views": accep_views,
+                            });
+                            let url = format!("{}/approve_access", server_url);
+
+                            match Self::make_request_with_timeout(&url, payload) {
+                                Ok(resp) if resp.status == "success" => {
+                                    MiddlewareResponse::success(
+                                        request_id,
+                                        &format!(
+                                            "Image delivered and database updated: {}",
+                                            resp.message
+                                        ),
+                                        None,
+                                    )
+                                }
+                                Ok(resp) => MiddlewareResponse::error(request_id, &resp.message),
+                                Err(e) => MiddlewareResponse::error(request_id, &e),
+                            }
+                        });
+
+                    let step2_elapsed = step2_start.elapsed().as_millis();
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [⏱️ STEP 2 DONE] Database updated in {}ms",
+                        request_id, step2_elapsed
+                    );
+
+                    let total_elapsed = start_time.elapsed().as_millis();
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [✓ COMPLETE] Workflow finished in {}ms (Step1: {}ms + Step2: {}ms)",
+                        request_id, total_elapsed, step1_elapsed, step2_elapsed
+                    );
+
+                    db_result
+                } else {
+                    let total_elapsed = start_time.elapsed().as_millis();
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [✗ FAILED] Image delivery failed at Step 1 ({}ms elapsed)",
+                        request_id, total_elapsed
+                    );
+                    println!(
+                        "[ClientMiddleware] [Req #{}] [⏱️ STEP 2 SKIPPED] NOT updating database due to delivery failure",
+                        request_id
+                    );
+                    MiddlewareResponse::error(
+                        request_id,
+                        &format!(
+                            "Failed to deliver image to viewer: {}",
+                            image_delivery_result.message.unwrap_or_default()
+                        ),
+                    )
+                }
+            }
             ClientRequest::GetAcceptedViews {
                 owner,
                 viewer,
