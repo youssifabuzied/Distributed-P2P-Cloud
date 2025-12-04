@@ -234,13 +234,13 @@ def get_my_requests(username):
         username: Username of the viewer
     
     Returns:
-        list: List of tuples (owner, image_name, prop_views, status)
+        list: List of tuples (owner, image_name, prop_views, status, accep_views)
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT owner, image_name, prop_views, status
+        SELECT owner, image_name, prop_views, status, accep_views
         FROM ImageAccess 
         WHERE viewer = ?
     """, (username,))
@@ -654,7 +654,31 @@ def handle_request():
                 data.get('ip_addr'),
             )
             return jsonify({'status': 'success', 'message': 'Client added'}), 200
-
+        elif operation == 'get_my_requests':
+            requests = get_my_requests(data.get('user_name'))
+            
+            # Map status codes to text
+            status_map = {
+                0: "Rejected",
+                1: "Approved",
+                2: "Pending",
+                3: "Additional Views Requested"
+            }
+            
+            return jsonify({
+                'status': 'success',
+                'requests': [
+                    {
+                        'owner': r[0], 
+                        'image_name': r[1], 
+                        'prop_views': r[2], 
+                        'status': r[3],
+                        'status_text': status_map.get(r[3], "Unknown"),
+                        'accep_views': r[4]
+                    }
+                    for r in requests
+                ]
+            }), 200
         elif operation == 'update_timestamp':
             update_timestamp(
                 data.get('user_name'),

@@ -29,6 +29,10 @@ pub enum ClientRequest {
         image_path: String,
         views: HashMap<String, u64>,
     },
+    GetMyRequests {
+        request_id: u64,
+        username: String,
+    },
     DecryptImage {
         request_id: u64,
         image_path: String,
@@ -139,6 +143,14 @@ pub enum RequestStatus {
 }
 
 // Request Tracker
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MyRequestInfo {
+    pub image_name: String,
+    pub owner: String,
+    pub status_text: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
+}
 
 pub struct RequestTracker {
     requests: Arc<Mutex<HashMap<u64, RequestStatus>>>,
@@ -224,6 +236,7 @@ pub struct Client {
     pub pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     pub additional_views_requests: Arc<Mutex<Vec<AdditionalViewsRequest>>>,
     pub my_shared_images: Arc<Mutex<Vec<SharedImageInfo>>>,
+    pub my_requests: Arc<Mutex<Vec<MyRequestInfo>>>,
 }
 
 impl Client {
@@ -408,7 +421,66 @@ impl Client {
         );
         Ok(id)
     }
+    pub fn get_my_requests(&self) -> Result<u64, Box<dyn Error>> {
+        let request_id = self.tracker.create_request();
+        let request = ClientRequest::GetMyRequests {
+            request_id,
+            username: self.metadata.username.clone(),
+        };
 
+        let tracker = self.tracker.requests.clone();
+        let my_requests = self.my_requests.clone();
+        let middleware_addr = self.middleware_addr.clone();
+
+        self.tracker
+            .update_status(request_id, RequestStatus::InProgress);
+
+        let my_requests_clone = my_requests.clone();
+        thread::spawn(move || {
+            println!(
+                "[Client] [Req #{}] Fetching my requests in background...",
+                request_id
+            );
+
+            match Client::send_request_sync(&middleware_addr, &request) {
+                Ok(response) => {
+                    println!("[Client] [Req #{}] ✓ Completed", request_id);
+
+                    if let Some(output_path) = &response.output_path {
+                        if let Ok(requests) =
+                            serde_json::from_str::<Vec<MyRequestInfo>>(output_path)
+                        {
+                            let mut my_reqs = my_requests_clone.lock().unwrap();
+                            *my_reqs = requests.clone();
+                            println!(
+                                "[Client] [Req #{}] ✓ Stored {} requests locally",
+                                request_id,
+                                requests.len()
+                            );
+                        }
+                    }
+
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Completed(response));
+                }
+                Err(e) => {
+                    eprintln!("[Client] [Req #{}] ✗ Failed: {}", request_id, e);
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .insert(request_id, RequestStatus::Failed(e.to_string()));
+                }
+            }
+        });
+
+        println!(
+            "[Client] Queued get my requests #{} for '{}'",
+            request_id, self.metadata.username
+        );
+        Ok(request_id)
+    }
     pub fn view_image(&self, owner: &str, image_name: &str) -> Result<(), Box<dyn Error>> {
         let storage_dir = "shared_images";
         let image_path = format!("{}/{}", storage_dir, image_name);
@@ -855,6 +927,7 @@ impl Client {
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             additional_views_requests: Arc::new(Mutex::new(Vec::new())),
             my_shared_images: Arc::new(Mutex::new(Vec::new())),
+            my_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -878,6 +951,7 @@ impl Client {
             ClientRequest::AcceptAdditionalViews { request_id, .. } => *request_id,
             ClientRequest::GetMySharedImages { request_id, .. } => *request_id,
             ClientRequest::RemoveImage { request_id, .. } => *request_id,
+            ClientRequest::GetMyRequests { request_id, .. } => *request_id,
         };
 
         let middleware_addr = self.middleware_addr.clone();
@@ -980,7 +1054,37 @@ impl Client {
 
         println!("========================================\n");
     }
+    fn print_my_requests(requests: &[MyRequestInfo]) {
+        println!("\n========================================");
+        println!("My Access Requests");
+        println!("========================================");
 
+        if requests.is_empty() {
+            println!("No access requests sent");
+        } else {
+            println!(
+                "{:<20} {:<20} {:<15} {:<12} {:<12}",
+                "Image", "Owner", "Status", "Proposed", "Accepted"
+            );
+            println!("{}", "-".repeat(79));
+            for req in requests {
+                println!(
+                    "{:<20} {:<20} {:<15} {:<12} {:<12}",
+                    req.image_name,
+                    req.owner,
+                    req.status_text,
+                    req.prop_views,
+                    if req.status_text == "Approved" {
+                        req.accep_views.to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                );
+            }
+        }
+
+        println!("========================================\n");
+    }
     // ✅ NEW: Helper function to print additional views requests JSON
     fn print_additional_views_requests(requests: &[AdditionalViewsRequest]) {
         println!("\n========================================");
@@ -1211,6 +1315,7 @@ impl Client {
         println!("  exit                     - Exit the client");
         println!("  view_my_shared_images            - View which users are viewing your images");
         println!("  remove_image <image_name>        - Remove an image you own");
+        println!("  get_my_requests                  - View requests I've sent to others");
         println!("========================================");
 
         loop {
@@ -1241,6 +1346,28 @@ impl Client {
                     self.start_heartbeat();
                     println!("Heartbeat started (every 20 seconds)");
                 }
+                "get_my_requests" => match self.get_my_requests() {
+                    Ok(id) => {
+                        println!("Request #{id} queued (fetching my requests)");
+
+                        println!("[Client] Waiting for response...");
+                        std::thread::sleep(Duration::from_secs(10));
+
+                        match self.tracker.get_status(id) {
+                            Some(RequestStatus::Completed(_)) => {
+                                let my_reqs = self.my_requests.lock().unwrap();
+                                Self::print_my_requests(&my_reqs);
+                            }
+                            Some(RequestStatus::Failed(err)) => {
+                                eprintln!("Failed to fetch my requests: {}", err);
+                            }
+                            _ => {
+                                println!("Request still in progress - please wait and try again");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error: {e}"),
+                },
                 "add_image" if tokens.len() == 2 => {
                     let image_path = tokens[1];
 

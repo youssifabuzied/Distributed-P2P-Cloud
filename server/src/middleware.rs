@@ -443,6 +443,7 @@ impl ServerMiddleware {
             .route("/get_my_shared_images", post(get_my_shared_images_handler))
             .route("/remove_image", post(remove_image_handler))
             .layer(DefaultBodyLimit::max(1024 * 1024 * 100))
+            .route("/get_my_requests", post(get_my_requests_handler))
             .layer(TraceLayer::new_for_http())
             .with_state(state);
 
@@ -1210,6 +1211,47 @@ async fn register_handler(
             "request_id": request_id,
             "status": "error",
             "message": format!("Registration failed: {}", e),
+        }))),
+    }
+}
+
+async fn get_my_requests_handler(
+    State(_middleware): State<Arc<ServerMiddleware>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let request_id = payload["request_id"].as_u64().unwrap_or(0);
+    let username = payload["username"].as_str().unwrap_or("");
+
+    println!(
+        "[Server Middleware] [Req #{}] Fetching my requests for: {}",
+        request_id, username
+    );
+
+    match directory_service::get_my_requests(username).await {
+        Ok(requests) => {
+            let requests_json: Vec<_> = requests
+                .iter()
+                .map(|req| {
+                    serde_json::json!({
+                        "image_name": req.image_name,
+                        "owner": req.owner,
+                        "status_text": req.status_text,
+                        "prop_views": req.prop_views,
+                        "accep_views": req.accep_views
+                    })
+                })
+                .collect();
+
+            Ok(Json(serde_json::json!({
+                "request_id": request_id,
+                "status": "success",
+                "requests": requests_json,
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "request_id": request_id,
+            "status": "error",
+            "message": format!("Failed to fetch my requests: {}", e),
         }))),
     }
 }

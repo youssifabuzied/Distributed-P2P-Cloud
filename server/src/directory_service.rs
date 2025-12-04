@@ -32,6 +32,15 @@ pub struct PendingAccessRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyRequestInfo {
+    pub image_name: String,
+    pub owner: String,
+    pub status_text: String,
+    pub prop_views: u64,
+    pub accep_views: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedImageInfo {
     pub image_name: String,
     pub viewer: String,
@@ -507,4 +516,35 @@ pub async fn remove_image(
     );
 
     write_to_all_databases("remove_image", &payload).await
+}
+pub async fn get_my_requests(
+    username: &str,
+) -> Result<Vec<MyRequestInfo>, Box<dyn Error + Send + Sync>> {
+    let payload = json!({
+        "operation": "get_my_requests",
+        "user_name": username,
+    });
+
+    read_from_one_database("get_my_requests", &payload, |body| {
+        let mut requests = Vec::new();
+        if let Some(reqs) = body["requests"].as_array() {
+            for r in reqs {
+                requests.push(MyRequestInfo {
+                    image_name: r["image_name"]
+                        .as_str()
+                        .ok_or("Missing image_name")?
+                        .to_string(),
+                    owner: r["owner"].as_str().ok_or("Missing owner")?.to_string(),
+                    status_text: r["status_text"]
+                        .as_str()
+                        .ok_or("Missing status_text")?
+                        .to_string(),
+                    prop_views: r["prop_views"].as_u64().ok_or("Missing prop_views")?,
+                    accep_views: r["accep_views"].as_u64().ok_or("Missing accep_views")?,
+                });
+            }
+        }
+        Ok(requests)
+    })
+    .await
 }
