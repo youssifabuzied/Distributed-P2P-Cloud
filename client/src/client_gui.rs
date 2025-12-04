@@ -7,6 +7,7 @@ mod middleware;
 use middleware::ClientMiddleware;
 
 use crate::client::AdditionalViewsRequest;
+use crate::client::MyRequestInfo;
 use crate::client::PendingRequest;
 use crate::client::SharedImageInfo;
 use eframe::egui;
@@ -62,6 +63,7 @@ enum ActiveTab {
     Discover,
     Requests,
     SharedWithMe,
+    MySentRequests, // ADD THIS
 }
 
 #[derive(Clone)]
@@ -141,6 +143,10 @@ struct AppState {
     modify_views_input: String,
     modify_views_error: Option<String>,
     selected_image_shared_users: Vec<SharedImageInfo>, // Already exists, ensure it's there
+
+    my_sent_requests: Vec<MyRequestInfo>,
+    my_sent_requests_loading: bool,
+    my_sent_requests_error: Option<String>,
 }
 
 impl Default for AppState {
@@ -200,6 +206,9 @@ impl Default for AppState {
             modify_views_input: String::new(),
             modify_views_error: None,
             selected_image_shared_users: Vec::new(),
+            my_sent_requests: Vec::new(),
+            my_sent_requests_loading: false,
+            my_sent_requests_error: None,
         }
     }
 }
@@ -804,6 +813,94 @@ impl CloudP2PApp {
                 }
             }
         }
+    }
+    fn fetch_my_sent_requests(&self) {
+        let state = Arc::clone(&self.state);
+        let middleware_addr = {
+            let s = state.lock().unwrap();
+            s.middleware_addr.clone()
+        };
+        let username = {
+            let s = state.lock().unwrap();
+            s.username.clone()
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.my_sent_requests_loading = true;
+            s.my_sent_requests_error = None;
+        }
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpStream;
+
+            let request_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let request = serde_json::json!({
+                "GetMyRequests": {
+                    "request_id": request_id,
+                    "username": username,
+                }
+            });
+
+            match TcpStream::connect(&middleware_addr) {
+                Ok(stream) => {
+                    let mut reader = BufReader::new(&stream);
+                    let mut writer = stream.try_clone().unwrap();
+
+                    let request_json = serde_json::to_string(&request).unwrap();
+                    writer.write_all(request_json.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+
+                    let mut response_line = String::new();
+                    if let Err(e) = reader.read_line(&mut response_line) {
+                        let mut s = state.lock().unwrap();
+                        s.my_sent_requests_loading = false;
+                        s.my_sent_requests_error = Some(format!("Failed to read response: {}", e));
+                        return;
+                    }
+
+                    match serde_json::from_str::<serde_json::Value>(&response_line.trim()) {
+                        Ok(response) => {
+                            let status = response["status"].as_str().unwrap_or("ERROR");
+                            if status == "OK" {
+                                if let Some(output_path) = response["output_path"].as_str() {
+                                    if let Ok(requests) =
+                                        serde_json::from_str::<Vec<MyRequestInfo>>(output_path)
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.my_sent_requests = requests;
+                                        s.my_sent_requests_loading = false;
+                                    }
+                                }
+                            } else {
+                                let mut s = state.lock().unwrap();
+                                s.my_sent_requests_loading = false;
+                                s.my_sent_requests_error =
+                                    Some("Failed to fetch requests".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            let mut s = state.lock().unwrap();
+                            s.my_sent_requests_loading = false;
+                            s.my_sent_requests_error = Some(format!("Parse error: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap();
+                    s.my_sent_requests_loading = false;
+                    s.my_sent_requests_error = Some(format!("Connection error: {}", e));
+                }
+            }
+        });
     }
     fn fetch_shared_users_for_image(&self, image_name: &str) {
         let state = Arc::clone(&self.state);
@@ -2005,6 +2102,11 @@ impl CloudP2PApp {
                 ActiveTab::SharedWithMe,
                 "📥 Shared With Me",
             ); // ADD THIS
+            ui.selectable_value(
+                &mut guard.active_tab,
+                ActiveTab::MySentRequests,
+                "📤 My Sent Requests",
+            ); // ADD THIS
         });
         drop(guard);
 
@@ -2019,9 +2121,113 @@ impl CloudP2PApp {
             ActiveTab::Discover => self.render_discover_tab(ui),
             ActiveTab::Requests => self.render_requests_tab(ui),
             ActiveTab::SharedWithMe => self.render_shared_with_me_tab(ui), // ADD THIS
+            ActiveTab::MySentRequests => self.render_my_sent_requests_tab(ui), // ADD THIS
         }
     }
+    fn render_my_sent_requests_tab(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("📤 My Sent Requests");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🔄 Refresh").clicked() {
+                    self.fetch_my_sent_requests();
+                }
+            });
+        });
 
+        ui.add_space(10.0);
+
+        let state = self.state.lock().unwrap().clone();
+
+        if state.my_sent_requests_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading requests...");
+            });
+            return;
+        }
+
+        if let Some(error) = &state.my_sent_requests_error {
+            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
+            ui.add_space(10.0);
+        }
+
+        if state.my_sent_requests.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.label("📭 No requests sent yet");
+                ui.add_space(10.0);
+                ui.label("Request access to images from the Discover tab");
+            });
+        } else {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for req in &state.my_sent_requests {
+                    egui::Frame::none()
+                        .fill(ui.visuals().faint_bg_color)
+                        .inner_margin(10.0)
+                        .rounding(5.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(&req.image_name).strong());
+                                    ui.label(format!("Owner: {}", req.owner));
+                                    ui.label(format!("Proposed views: {}", req.prop_views));
+
+                                    let status_color = match req.status_text.as_str() {
+                                        "Approved" => egui::Color32::from_rgb(100, 200, 100),
+                                        "Rejected" => egui::Color32::from_rgb(200, 100, 100),
+                                        _ => egui::Color32::from_rgb(200, 200, 100),
+                                    };
+
+                                    ui.colored_label(
+                                        status_color,
+                                        format!("Status: {}", req.status_text),
+                                    );
+
+                                    if req.status_text == "Approved" {
+                                        ui.label(format!("Accepted views: {}", req.accep_views));
+                                    }
+                                });
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let is_rejected = req.status_text == "Rejected";
+
+                                        if ui
+                                            .add_enabled(
+                                                is_rejected,
+                                                egui::Button::new("🔄 Resend"),
+                                            )
+                                            .clicked()
+                                        {
+                                            let owner = req.owner.clone();
+                                            let image_name = req.image_name.clone();
+                                            let prop_views = req.prop_views;
+                                            let viewer = state.username.clone();
+                                            let middleware_addr = state.middleware_addr.clone();
+                                            let state_clone = Arc::clone(&self.state);
+
+                                            std::thread::spawn(move || {
+                                                send_access_request(
+                                                    owner,
+                                                    viewer,
+                                                    image_name,
+                                                    prop_views.to_string(),
+                                                    middleware_addr,
+                                                    state_clone,
+                                                );
+                                            });
+                                        }
+                                    },
+                                );
+                            });
+                        });
+
+                    ui.add_space(5.0);
+                }
+            });
+        }
+    }
     fn render_my_images_tab(&self, ui: &mut egui::Ui, state: &AppState) {
         ui.horizontal(|ui| {
             ui.heading("My Uploaded Images");
