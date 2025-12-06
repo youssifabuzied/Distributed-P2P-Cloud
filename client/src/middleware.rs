@@ -437,6 +437,7 @@ impl ClientMiddleware {
         .ok_or_else(|| "Failed to retrieve viewer IP from any server".to_string())
     }
     // Helper: Send encrypted image to viewer's middleware via TCP
+    // Helper: Send encrypted image to viewer's middleware via TCP
     fn send_encrypted_to_viewer(
         request_id: u64,
         viewer_ip: &str,
@@ -448,47 +449,94 @@ impl ClientMiddleware {
         use std::io::Write;
         use std::net::TcpStream;
 
-        // Connect to viewer's client middleware (port 9000)
         let viewer_addr = format!("{}:9000", viewer_ip);
+        const MAX_RETRIES: u32 = 20;
+        let mut attempt = 0;
 
-        println!(
-            "[ClientMiddleware] [Req #{}] Connecting to viewer middleware at {}...",
-            request_id, viewer_addr
-        );
+        loop {
+            attempt += 1;
 
-        let mut stream = TcpStream::connect(&viewer_addr)
-            .map_err(|e| format!("Failed to connect to viewer middleware: {}", e))?;
+            println!(
+                "[ClientMiddleware] [Req #{}] Attempt {}/{} - Connecting to viewer middleware at {}...",
+                request_id, attempt, MAX_RETRIES, viewer_addr
+            );
 
-        // Create a delivery request message
-        let delivery_request = serde_json::json!({
-            "type": "ReceiveEncryptedImage",
-            "request_id": request_id,
-            "owner": owner,
-            "image_name": image_name,
-            "encrypted_data": general_purpose::STANDARD.encode(encrypted_data),
-            "accepted_views": accepted_views,
-        });
+            // Try to connect and send
+            let result = (|| -> Result<(), String> {
+                let mut stream = TcpStream::connect(&viewer_addr)
+                    .map_err(|e| format!("Failed to connect to viewer middleware: {}", e))?;
 
-        let request_json = serde_json::to_string(&delivery_request)
-            .map_err(|e| format!("Failed to serialize request: {}", e))?;
+                // Create a delivery request message
+                let delivery_request = serde_json::json!({
+                    "type": "ReceiveEncryptedImage",
+                    "request_id": request_id,
+                    "owner": owner,
+                    "image_name": image_name,
+                    "encrypted_data": general_purpose::STANDARD.encode(encrypted_data),
+                    "accepted_views": accepted_views,
+                });
 
-        // Send the request
-        stream
-            .write_all(request_json.as_bytes())
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-        stream
-            .write_all(b"\n")
-            .map_err(|e| format!("Failed to send newline: {}", e))?;
-        stream
-            .flush()
-            .map_err(|e| format!("Failed to flush stream: {}", e))?;
+                let request_json = serde_json::to_string(&delivery_request)
+                    .map_err(|e| format!("Failed to serialize request: {}", e))?;
 
-        println!(
-            "[ClientMiddleware] [Req #{}] ✓ Sent encrypted image to viewer",
-            request_id
-        );
+                // Send the request
+                stream
+                    .write_all(request_json.as_bytes())
+                    .map_err(|e| format!("Failed to send request: {}", e))?;
+                stream
+                    .write_all(b"\n")
+                    .map_err(|e| format!("Failed to send newline: {}", e))?;
+                stream
+                    .flush()
+                    .map_err(|e| format!("Failed to flush stream: {}", e))?;
 
-        Ok(())
+                println!(
+                    "[ClientMiddleware] [Req #{}] ✓ Sent encrypted image to viewer on attempt {}",
+                    request_id, attempt
+                );
+
+                Ok(())
+            })();
+
+            match result {
+                Ok(_) => {
+                    // Success!
+                    if attempt > 1 {
+                        println!(
+                            "[ClientMiddleware] [Req #{}] ✓ Successfully delivered after {} attempts",
+                            request_id, attempt
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ClientMiddleware] [Req #{}] ✗ Attempt {}/{} failed: {}",
+                        request_id, attempt, MAX_RETRIES, e
+                    );
+
+                    if attempt >= MAX_RETRIES {
+                        // Max retries reached
+                        eprintln!(
+                            "[ClientMiddleware] [Req #{}] ✗ Failed to deliver after {} attempts",
+                            request_id, MAX_RETRIES
+                        );
+                        return Err(format!(
+                            "Failed to deliver encrypted image after {} attempts. Last error: {}",
+                            MAX_RETRIES, e
+                        ));
+                    }
+
+                    // Wait before retry (exponential backoff)
+                    let wait_time = std::cmp::min(attempt * 2, 10); // Max 10 seconds
+                    println!(
+                        "[ClientMiddleware] [Req #{}] Waiting {} seconds before retry...",
+                        request_id, wait_time
+                    );
+                    thread::sleep(Duration::from_secs(wait_time as u64));
+                }
+            }
+        }
     }
 
     pub fn start(&self) -> Result<(), Box<dyn Error>> {

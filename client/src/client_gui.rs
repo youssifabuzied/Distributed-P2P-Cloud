@@ -77,6 +77,7 @@ struct AppState {
     // Status
     connection_status: ConnectionStatus,
     heartbeat_active: bool,
+    heartbeat_stop_signal: Arc<Mutex<bool>>,
 
     // Add these fields to AppState
     add_image_path: String,
@@ -158,6 +159,7 @@ impl Default for AppState {
             middleware_addr: "127.0.0.1:9000".to_string(),
             connection_status: ConnectionStatus::Disconnected,
             heartbeat_active: false,
+            heartbeat_stop_signal: Arc::new(Mutex::new(false)),
             add_image_path: String::new(),
             add_image_error: None,
             registration_error: None,
@@ -1827,7 +1829,40 @@ impl CloudP2PApp {
         let mut state = self.state.lock().unwrap();
         state.status_message = "Middleware started".to_string();
     }
+    fn sign_out(&self) {
+        let mut state = self.state.lock().unwrap();
 
+        // Signal heartbeat thread to stop
+        {
+            let mut stop_signal = state.heartbeat_stop_signal.lock().unwrap();
+            *stop_signal = true;
+        }
+
+        // Reset connection status
+        state.connection_status = ConnectionStatus::Disconnected;
+        state.heartbeat_active = false;
+        state.status_message = "Signed out".to_string();
+
+        // Clear all user data
+        state.my_images.clear();
+        state.discovered_users.clear();
+        state.user_images.clear();
+        state.shared_images.clear();
+        state.pending_access_requests.clear();
+        state.additional_views_requests.clear();
+        state.my_sent_requests.clear();
+        state.selected_image = None;
+        state.selected_user = None;
+        state.image_textures.clear();
+
+        // Reset to default tab
+        state.active_tab = ActiveTab::MyImages;
+
+        // Create a new stop signal for next session
+        state.heartbeat_stop_signal = Arc::new(Mutex::new(false));
+
+        println!("[GUI] User signed out - heartbeat stopped");
+    }
     fn register_client(&self) {
         let state = Arc::clone(&self.state);
 
@@ -1911,8 +1946,12 @@ impl CloudP2PApp {
                                 s.heartbeat_active = true;
 
                                 // Start heartbeat
-                                start_heartbeat(username.clone(), middleware_addr.clone());
-
+                                let stop_signal = Arc::clone(&s.heartbeat_stop_signal);
+                                start_heartbeat(
+                                    username.clone(),
+                                    middleware_addr.clone(),
+                                    stop_signal,
+                                );
                                 let state_clone_2 = Arc::clone(&state_clone);
                                 drop(s); // Release lock before calling fetch
                                 Self::start_fetch_my_own_images(state_clone_2);
@@ -3348,13 +3387,22 @@ impl eframe::App for CloudP2PApp {
         let state = self.state.lock().unwrap().clone();
 
         // Top panel - Title bar
+        // Top panel - Title bar
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
                 ui.heading("🌐 Cloud P2P Image Sharing");
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| match state.connection_status {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Sign Out button (only show when connected)
+                    if matches!(state.connection_status, ConnectionStatus::Connected) {
+                        if ui.button("🚪 Sign Out").clicked() {
+                            self.sign_out();
+                        }
+                        ui.separator();
+                    }
+
+                    // Connection status indicator
+                    match state.connection_status {
                         ConnectionStatus::Connected => {
                             ui.colored_label(egui::Color32::GREEN, "● Connected");
                         }
@@ -3367,8 +3415,8 @@ impl eframe::App for CloudP2PApp {
                         ConnectionStatus::Error(_) => {
                             ui.colored_label(egui::Color32::RED, "✗ Error");
                         }
-                    },
-                );
+                    }
+                });
             });
             ui.add_space(5.0);
         });
@@ -3460,11 +3508,28 @@ fn configure_fonts(ctx: &egui::Context) {
 
     ctx.set_style(style);
 }
-
-fn start_heartbeat(username: String, middleware_addr: String) {
+fn start_heartbeat(username: String, middleware_addr: String, stop_signal: Arc<Mutex<bool>>) {
     thread::spawn(move || {
         loop {
+            // Check if we should stop
+            {
+                let should_stop = stop_signal.lock().unwrap();
+                if *should_stop {
+                    println!("[GUI] Heartbeat stopped for user: {}", username);
+                    break;
+                }
+            }
+
             thread::sleep(Duration::from_secs(20));
+
+            // Check again after sleep
+            {
+                let should_stop = stop_signal.lock().unwrap();
+                if *should_stop {
+                    println!("[GUI] Heartbeat stopped for user: {}", username);
+                    break;
+                }
+            }
 
             let request = serde_json::json!({
                 "Heartbeat": {
